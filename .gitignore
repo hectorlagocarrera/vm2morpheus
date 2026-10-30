@@ -1,0 +1,8 @@
+__pycache__/
+*.egg-info/
+.venv/
+dist/
+build/
+*.spec
+vm2morpheus-work/
+.pytest_cache/

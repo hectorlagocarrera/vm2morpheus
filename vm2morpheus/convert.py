@@ -1,0 +1,66 @@
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+PCT = re.compile(rb"\((\d+(?:\.\d+)?)/100%\)")
+
+
+def find_tool(name: str) -> str | None:
+    if getattr(sys, "frozen", False):  # packaged .exe: qemu-img sits in a "qemu" folder next to it
+        exe = Path(sys.executable).parent / "qemu" / (name + (".exe" if os.name == "nt" else ""))
+        if exe.exists():
+            return str(exe)
+    found = shutil.which(name)
+    if found:
+        return found
+    for d in (os.environ.get("ProgramFiles", ""), os.environ.get("ProgramFiles(x86)", "")):  # QEMU on Windows
+        exe = Path(d, "qemu", name + ".exe")
+        if d and exe.exists():
+            return str(exe)
+    return None
+
+
+def require_tool(name: str) -> str:
+    path = find_tool(name)
+    if not path:
+        raise RuntimeError(f"{name} not found in PATH (install qemu-utils / virt-v2v)")
+    return path
+
+
+def convert_disk(src: Path, dst: Path, fmt: str = "qcow2", progress=None) -> Path:
+    """qemu-img convert; the input format is auto-detected (vhdx, vmdk, vhd, raw ...)."""
+    qemu_img = require_tool("qemu-img")
+    proc = subprocess.Popen([qemu_img, "convert", "-p", "-O", fmt, str(src), str(dst)],
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    buf = b""
+    while chunk := proc.stdout.read(64):
+        buf = (buf + chunk)[-64:]
+        m = PCT.findall(buf)
+        if m and progress:
+            progress(float(m[-1]), 100)
+    err = proc.stderr.read().decode(errors="replace")
+    if proc.wait() != 0:
+        raise RuntimeError(f"qemu-img convert failed for {src.name}: {err.strip()}")
+    return dst
+
+
+def inject_drivers(disk: Path, vm_name: str, memory_mb: int, cpu: int, uefi: bool, fmt: str = "qcow2"):
+    """Best effort: virt-v2v-in-place installs virtio drivers and fixes boot config inside the guest.
+
+    Needs virt-v2v (>= 2.0) and, for Windows guests, the virtio-win package. Experimental.
+    """
+    require_tool("virt-v2v-in-place")
+    os_el = "<os firmware='efi'><type arch='x86_64'>hvm</type></os>" if uefi else "<os><type arch='x86_64'>hvm</type></os>"
+    xml = (f"<domain type='kvm'><name>{vm_name}</name><memory unit='MiB'>{memory_mb}</memory>"
+           f"<vcpu>{cpu}</vcpu>{os_el}<devices><disk type='file' device='disk'>"
+           f"<driver name='qemu' type='{fmt}'/><source file='{disk}'/>"
+           f"<target dev='sda' bus='sata'/></disk></devices></domain>")
+    xml_path = disk.with_suffix(".xml")
+    xml_path.write_text(xml)
+    r = subprocess.run(["virt-v2v-in-place", "-i", "libvirtxml", str(xml_path)],
+                       capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"virt-v2v-in-place failed: {r.stderr.strip()[-800:]}")

@@ -1,0 +1,29 @@
+name: build-windows-exe
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with: { python-version: "3.12" }
+      - run: pip install -e ".[all]" pyinstaller
+      - run: >
+          pyinstaller --onefile --name vm2morpheus
+          --collect-all pyVmomi --collect-all smbprotocol --collect-all winrm
+          --hidden-import smbclient exe_entry.py
+      - name: Bundle qemu-img next to the exe
+        shell: pwsh
+        run: |
+          choco install qemu -y --no-progress
+          $q = "C:\Program Files\qemu"
+          New-Item -ItemType Directory dist\qemu | Out-Null
+          Copy-Item "$q\qemu-img.exe" dist\qemu\
+          Copy-Item "$q\*.dll" dist\qemu\
+          Copy-Item README.md, config.example.yaml dist\
+          Compress-Archive -Path dist\* -DestinationPath vm2morpheus-windows.zip
+      - uses: actions/upload-artifact@v4
+        with: { name: vm2morpheus-windows, path: vm2morpheus-windows.zip }

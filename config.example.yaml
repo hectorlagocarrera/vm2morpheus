@@ -1,0 +1,26 @@
+source:
+  type: hyperv            # hyperv | vmware
+  host: 10.0.0.5
+  username: Administrator # DOMAIN\user also works
+  password: env:SOURCE_PASSWORD
+  os_family: windows      # Hyper-V cannot report it; VMware detects it
+  # verify_ssl: false
+
+morpheus:
+  url: https://10.0.0.20
+  token: env:MORPHEUS_TOKEN
+  verify_ssl: false
+  image_type: qcow2       # UNVERIFIED: confirm the valid imageType for VME/KVM on your appliance
+  # os_type: <osType id or code>
+  # storage_provider_id: 1
+  # Optional: without it the tool stops after uploading the image.
+  # Placeholders: {image_id} {image_name} {vm_name} {cpu} {memory_mb} {memory_bytes}
+  # Copy the payload from a manual instance created in the UI / `morpheus instances add --dry-run`.
+  instance: {}
+
+options:
+  workdir: /var/tmp/vm2morpheus
+  output_format: qcow2
+  shutdown_source: false
+  inject_drivers: false
+  keep_files: false
