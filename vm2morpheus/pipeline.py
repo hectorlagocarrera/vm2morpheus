@@ -149,7 +149,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                 payload = payload_from_reference(ref, vm.name,
                                                  int(refcfg["image_id"]) if refcfg.get("image_id") else None,
                                                  st.d["images"][0]["id"], root_gb, extra_gb,
-                                                 omit_volumes=in_bundle)
+                                                 root_only=in_bundle, uefi=vm.firmware == "uefi")
             except MorpheusError:
                 dump = workdir / "reference-instance.json"
                 dump.write_text(json.dumps(redact(ref), indent=2, ensure_ascii=False), encoding="utf-8")

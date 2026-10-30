@@ -223,7 +223,7 @@ def test_two_disks_are_bundled_with_metadata_json(tmp_path):
         {"capacity": 4 << 20, "guestDeviceName": "sdb", "position": 1, "name": "data", "file": "vm1-sdb"}]
     assert z.read("vm1-sda")[:4] == b"QFI\xfb" and z.read("vm1-sdb")[:4] == b"QFI\xfb"
     inst = dict(FakeMorpheus.log)["instance"]
-    assert "volumes" not in inst  # volumes come from the image metadata
+    assert [v["rootVolume"] for v in inst["volumes"]] == [True]  # extra disks come from the image metadata
 
 
 def test_reference_payload_autodetects_image_value():
@@ -238,3 +238,19 @@ def test_redact_hides_credentials():
     from vm2morpheus.gui import redact
     assert redact({"a": {"adminPassword": "x", "n": 1}, "l": [{"apiToken": "t"}]}) == {
         "a": {"adminPassword": "***", "n": 1}, "l": [{"apiToken": "***"}]}
+
+
+def test_reference_like_real_hvm_instance():
+    from vm2morpheus.morpheus import payload_from_reference
+    ref = {"cloud": {"id": 1}, "group": {"id": 1}, "instanceType": {"code": "mvm"}, "layout": {"id": 32},
+           "plan": {"id": 23},
+           "config": {"imageId": None, "uefi": False, "resourcePoolId": "pool-1", "kvmHostId": None,
+                      "backup": {"createBackup": False}},
+           "volumes": [{"name": "root", "rootVolume": True, "size": 80, "storageType": 1, "datastoreId": "auto"}],
+           "interfaces": [{"id": "network-1", "network": {"id": 1}}]}
+    p = payload_from_reference(ref, "w2k16", None, 55, root_gb=110, extra_gb=[100], root_only=False, uefi=True)
+    assert p["config"]["imageId"] == 55 and p["config"]["kvmHostId"] is None and p["config"]["uefi"] is True
+    assert p["volumes"][0] == {"id": -1, "name": "root", "rootVolume": True, "size": 110,
+                               "storageType": 1, "datastoreId": "auto"}
+    assert p["volumes"][1]["storageType"] == 1 and p["networkInterfaces"] == [{"network": {"id": "network-1"}}]
+    assert p["instance"]["instanceType"] == {"code": "mvm"}
