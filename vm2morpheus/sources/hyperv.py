@@ -47,7 +47,8 @@ class HyperVSource(Source):
         self._ps("$PSVersionTable.PSVersion.Major")
 
     def _ps(self, script: str) -> str:
-        r = self.session.run_ps(script)
+        # progress records come back as CLIXML on stderr and make pywinrm emit a bogus warning
+        r = self.session.run_ps("$ProgressPreference='SilentlyContinue'\n" + script)
         if r.status_code != 0:
             raise RuntimeError(f"PowerShell failed on {self.host}: {r.std_err.decode(errors='replace')}")
         return r.std_out.decode(errors="replace").strip()
@@ -57,13 +58,14 @@ class HyperVSource(Source):
         out = self._ps(f"""
 $ErrorActionPreference='Stop'
 $vm = Get-VM -Name {n}
-$disks = @(Get-VMHardDiskDrive -VM $vm | ForEach-Object {{ $v = Get-VHD -Path $_.Path; [pscustomobject]@{{Path=$_.Path; Size=[int64]$v.Size}} }})
+$disks = @(Get-VMHardDiskDrive -VM $vm | ForEach-Object {{ $v = Get-VHD -Path $_.Path; [pscustomobject]@{{Path=$_.Path; Size=[int64]$v.Size; FileSize=[int64]$v.FileSize}} }})
 $nets = @(Get-VMNetworkAdapter -VM $vm | ForEach-Object {{ $_.SwitchName }})
 $snaps = @(Get-VMSnapshot -VM $vm).Count
 [pscustomobject]@{{Name=$vm.Name; Cpu=[int](Get-VMProcessor -VM $vm).Count; MemoryMB=[int64]($vm.MemoryStartup/1MB); Generation=[int]$vm.Generation; State=$vm.State.ToString(); Disks=$disks; Nets=$nets; Snapshots=[int]$snaps}} | ConvertTo-Json -Depth 4 -Compress
 """)
         d = json.loads(out)
-        disks = [DiskInfo(name=PureWindowsPath(x["Path"]).name, size_bytes=int(x["Size"]), path=x["Path"])
+        disks = [DiskInfo(name=PureWindowsPath(x["Path"]).name, size_bytes=int(x["Size"]), path=x["Path"],
+                          used_bytes=int(x["FileSize"]) if x.get("FileSize") else None)
                  for x in as_list(d.get("Disks"))]
         return VMInfo(
             name=d["Name"], cpu=d["Cpu"], memory_mb=d["MemoryMB"],

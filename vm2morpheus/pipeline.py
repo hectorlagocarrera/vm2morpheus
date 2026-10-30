@@ -41,10 +41,16 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         problems.append("VM has no disks")
     if vm.power_state == "on" and not opts.get("shutdown_source"):
         problems.append("VM is running; pass --shutdown to power it off (consistent copy)")
-    workdir = Path(opts.get("workdir", "/var/tmp/vm2morpheus")) / vm.name
-    free = shutil.disk_usage(workdir.parent if workdir.parent.exists() else Path("/")).free
-    if free < total * 2:
-        log(f"warning: {human(free)} free in workdir, up to {human(total * 2)} may be needed")
+    workdir = Path(opts.get("workdir", "/var/tmp/vm2morpheus")).resolve() / vm.name
+    probe = workdir
+    while not probe.exists():
+        probe = probe.parent
+    free = shutil.disk_usage(probe).free
+    # the downloaded disk files plus a converted copy; qcow2 only stores used blocks, so used size is a safe bound
+    needed = 2 * sum(d.used_bytes or d.size_bytes for d in vm.disks)
+    if free < needed:
+        problems.append(f"not enough free space in {probe}: {human(free)} free, about {human(needed)} needed; "
+                        "set another work folder (e.g. D:\\migracion) on a bigger disk")
     if dry_run:
         for p in problems:
             log(f"  would fail: {p}")

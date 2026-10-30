@@ -6,6 +6,7 @@ class DiskInfo:
     name: str
     size_bytes: int
     path: str
+    used_bytes: int | None = None  # actual file size on the source, when known
 
 
 @dataclass
