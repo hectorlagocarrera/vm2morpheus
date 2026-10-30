@@ -127,8 +127,12 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         if refcfg:
             ref = morpheus.get_instance(refcfg["instance_id"])
             root_gb = -(-vm.disks[0].size_bytes // 2**30)
+            extra_gb = [-(-d.size_bytes // 2**30) for d in vm.disks[1:]]
             payload = payload_from_reference(ref, vm.name, int(refcfg["image_id"]),
-                                             st.d["images"][0]["id"], root_gb)
+                                             st.d["images"][0]["id"], root_gb, extra_gb)
+            if extra_gb:
+                log(f"note: {len(extra_gb)} extra disk(s) are added as BLANK volumes; their data was uploaded "
+                    "as separate images but is not attached")
             log("creating Morpheus instance (cloned from the reference instance) ...")
             inst = morpheus.create_instance(payload)
             st.mark("instance", instance={"id": inst.get("id"), "name": inst.get("name")})

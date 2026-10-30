@@ -127,7 +127,7 @@ def render_template(obj, values: dict):
 
 
 def payload_from_reference(ref: dict, name: str, old_image_id: int, new_image_id: int,
-                           root_gb: int | None = None) -> dict:
+                           root_gb: int | None = None, extra_gb: list[int] | None = None) -> dict:
     """Build POST /api/instances from an instance created by hand in the UI, swapping its image.
 
     Only values under keys that mention "image" are swapped (so an unrelated number that happens to
@@ -168,6 +168,12 @@ def payload_from_reference(ref: dict, name: str, old_image_id: int, new_image_id
             nv["storageType"] = st["id"]
         if nv["rootVolume"] and root_gb:
             nv["size"] = max(int(nv["size"] or 0), root_gb)  # the root disk must hold the migrated image
+        volumes.append(nv)
+    root = next((v for v in volumes if v["rootVolume"]), None)
+    for i, gb in enumerate(extra_gb or [], start=1):  # blank data disks sized like the source's extra disks
+        nv = {"id": -1, "name": f"data{i}", "rootVolume": False, "size": gb}
+        if root and "storageType" in root:
+            nv["storageType"] = root["storageType"]
         volumes.append(nv)
     if volumes:
         payload["volumes"] = volumes

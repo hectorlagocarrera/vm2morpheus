@@ -176,3 +176,13 @@ def test_instance_cloned_from_reference_swaps_only_image(tmp_path):
     assert sent["instance"]["layout"] == {"id": 4} and sent["zoneId"] == 1
     assert sent["networkInterfaces"] == [{"network": {"id": "11"}}]
     assert sent["volumes"][0]["size"] == 20 and sent["volumes"][0]["storageType"] == 9
+
+
+def test_reference_payload_adds_blank_extra_volumes():
+    from vm2morpheus.morpheus import payload_from_reference
+    ref = {"cloud": {"id": 1}, "group": {"id": 2}, "instanceType": {"code": "hvm"}, "layout": {"id": 4},
+           "plan": {"id": 6}, "config": {"imageId": 3},
+           "volumes": [{"name": "root", "rootVolume": True, "size": 20, "type": {"id": 9}}]}
+    p = payload_from_reference(ref, "vm1", 3, 7, root_gb=110, extra_gb=[100])
+    assert p["volumes"][0]["size"] == 110
+    assert p["volumes"][1] == {"id": -1, "name": "data1", "rootVolume": False, "size": 100, "storageType": 9}
