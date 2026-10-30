@@ -1,4 +1,5 @@
 import ssl
+import sys
 import time
 from pathlib import Path
 
@@ -8,6 +9,18 @@ from ..models import DiskInfo, VMInfo
 from .base import Source
 
 CHUNK = 4 * 1024 * 1024
+
+
+def note_unverified_tls(verify: bool, host: str, stream=None) -> bool:
+    """ESXi/vCenter normally use a self-signed certificate, so verification is off unless the user asks for it.
+    Say so once, in Spanish, instead of letting urllib3 print its English warning for every request."""
+    if verify:
+        return False
+    import urllib3
+    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    print(f"Aviso: no se verifica el certificado TLS de {host} (suele ser autofirmado). "
+          "Marca 'Verificar el certificado del origen' si el tuyo es válido.", file=stream or sys.stderr)
+    return True
 
 
 def explain_error(e: Exception) -> Exception:
@@ -49,6 +62,7 @@ class VMwareSource(Source):
         ctx = ssl.create_default_context() if self.verify else ssl._create_unverified_context()
         self.si = SmartConnect(host=self.host, user=self.user, pwd=self.password,
                                port=self.port, sslContext=ctx)
+        note_unverified_tls(self.verify, self.host)
         self.api_type = self.si.content.about.apiType  # "VirtualCenter" or "HostAgent" (standalone ESXi)
 
     def close(self) -> None:

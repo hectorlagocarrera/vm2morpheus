@@ -1022,3 +1022,19 @@ def test_no_message_box_when_there_is_a_console(monkeypatch):
 def test_the_windows_build_keeps_the_console_and_skips_pywebview():
     wf = open(".github/workflows/build-exe.yml", encoding="utf-8").read()
     assert "--noconsole" not in wf and "--collect-all webview" not in wf and "pythonnet" not in wf
+
+
+def test_unverified_tls_notice_is_in_spanish_and_silences_urllib3():
+    import io
+    import warnings
+    from vm2morpheus.gui import source_cfg
+    from vm2morpheus.sources.vmware import note_unverified_tls
+    out = io.StringIO()
+    assert note_unverified_tls(False, "esxi1.lab", out) is True
+    assert "no se verifica el certificado TLS de esxi1.lab" in out.getvalue()
+    assert note_unverified_tls(True, "esxi1.lab", out) is False  # verifying: nothing to announce
+    import urllib3
+    assert any(f[0] == "ignore" and f[2] is urllib3.exceptions.InsecureRequestWarning for f in warnings.filters)
+    base = {"source_type": "esxi", "source_host": "h", "source_user": "u", "source_password": "p"}
+    assert source_cfg(dict(base))["verify_ssl"] is False
+    assert source_cfg({**base, "verify_source": True})["verify_ssl"] is True
