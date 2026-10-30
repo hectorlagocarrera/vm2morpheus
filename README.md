@@ -49,3 +49,10 @@ administrator rights, so some antivirus products flag it heuristically. To check
 compare its SHA-256 with `SHA256.txt` (shipped in the zip) and with the "Bundle qemu-img ... SHA-256" step of the
 workflow log. A code-signing certificate, or an allow-list entry in the corporate antivirus by hash/path, is the
 real fix; submitting the file as a false positive to the vendor helps too.
+
+
+## Console and browser
+
+The packaged program keeps its console window (it shows the log and closing it stops the app) and opens the
+interface in your default browser. An embedded window (`vm2morpheus gui --ventana`, needs `pip install pywebview`)
+and a hidden console are not used in the .exe: both made antivirus engines more suspicious.

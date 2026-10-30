@@ -251,9 +251,9 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "not found"}, 404)
 
 
-def serve(port: int = 8765, open_browser: bool = True, embedded: bool = True):
-    """Run the GUI. With embedded=True it opens its own window (closing it exits); if that is not possible,
-    or embedded=False, the page opens in the default browser and the app exits when the tab goes away."""
+def serve(port: int = 8765, open_browser: bool = True, embedded: bool = False):
+    """Run the GUI in the default browser (the app exits when the tab goes away). With embedded=True it opens its
+    own window instead (needs pywebview + WebView2; not part of the packaged exe) and falls back to the browser."""
     url = f"http://127.0.0.1:{port}"
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)

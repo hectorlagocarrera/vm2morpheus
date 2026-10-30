@@ -14,12 +14,12 @@ jobs:
       # Build PyInstaller's bootloader from source (the windows runner has MSVC). The prebuilt bootloader is shared
       # by thousands of programs, and antivirus machine-learning engines flag its fingerprint.
       - run: pip install --no-binary pyinstaller pyinstaller
-      # One folder instead of --onefile: the single-file build unpacks itself into %TEMP% at every start, which
+      # Console window kept and no embedded browser (pywebview/.NET): a hidden window plus .NET interop made antivirus
+      # engines more suspicious. One folder instead of --onefile: the single-file build unpacks itself into %TEMP% at every start, which
       # is what antivirus heuristics dislike most.
       - run: >
-          pyinstaller --noconsole --name vm2morpheus
+          pyinstaller --name vm2morpheus
           --collect-all pyVmomi --collect-all smbprotocol --collect-all winrm
-          --collect-all webview --collect-all pythonnet --collect-all clr_loader
           --hidden-import smbclient exe_entry.py
       - name: Bundle qemu-img next to the exe and record SHA-256 hashes
         shell: pwsh

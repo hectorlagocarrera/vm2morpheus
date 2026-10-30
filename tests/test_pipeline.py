@@ -715,12 +715,12 @@ def test_launcher_reports_unexpected_errors(monkeypatch):
     def boom():
         raise ValueError("kaput")
 
-    assert launcher.run(boom) == 1 and "kaput" in shown[0]
+    assert launcher.run(boom, show_box=True) == 1 and "kaput" in shown[0]
 
     def bye():
         raise SystemExit("mensaje de salida")
 
-    assert launcher.run(bye) == 1 and shown[-1] == "mensaje de salida"
+    assert launcher.run(bye, show_box=True) == 1 and shown[-1] == "mensaje de salida"
     assert launcher.run(lambda: 0) == 0
 
 
@@ -997,3 +997,28 @@ def test_no_undefined_names_anywhere_in_the_package():
         pyflakes_api.check(f.read_text(encoding="utf-8"), str(f), reporter)
     undefined = [l for l in out.getvalue().splitlines() if "undefined name" in l]
     assert undefined == []
+
+
+def test_default_is_the_browser_and_window_is_opt_in():
+    import inspect
+    from vm2morpheus import gui
+    from vm2morpheus.cli import build_parser
+    assert inspect.signature(gui.serve).parameters["embedded"].default is False
+    assert build_parser().parse_args(["gui"]).ventana is False
+    assert build_parser().parse_args(["gui", "--ventana"]).ventana is True
+
+
+def test_no_message_box_when_there_is_a_console(monkeypatch):
+    from vm2morpheus import launcher
+    shown = []
+    monkeypatch.setattr(launcher, "show_error", shown.append)
+
+    def boom():
+        raise ValueError("kaput")
+
+    assert launcher.run(boom, show_box=False) == 1 and shown == []  # the traceback goes to the console instead
+
+
+def test_the_windows_build_keeps_the_console_and_skips_pywebview():
+    wf = open(".github/workflows/build-exe.yml", encoding="utf-8").read()
+    assert "--noconsole" not in wf and "--collect-all webview" not in wf and "pythonnet" not in wf

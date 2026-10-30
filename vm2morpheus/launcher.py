@@ -40,18 +40,23 @@ def show_info(text: str) -> None:
     print(text, file=sys.stderr)
 
 
-def run(main) -> int:
+def run(main, show_box: bool | None = None) -> int:
+    """show_box: pop a message box on errors; by default only when there is no console to print to."""
+    if show_box is None:
+        show_box = sys.stdout is None or sys.stderr is None
     setup_streams()
     try:
         return main() or 0
     except SystemExit as e:
         if isinstance(e.code, str):  # sys.exit("message"): nobody would see it without a console
             print(e.code, file=sys.stderr)
-            show_error(e.code)
+            if show_box:
+                show_error(e.code)
             return 1
         raise
     except Exception:
         detail = traceback.format_exc()
         print(detail, file=sys.stderr)
-        show_error(f"Error inesperado:\n\n{detail[-1200:]}\n\nDetalle completo en {LOG}")
+        if show_box:
+            show_error(f"Error inesperado:\n\n{detail[-1200:]}\n\nDetalle completo en {LOG}")
         return 1

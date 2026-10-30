@@ -25,7 +25,7 @@ def build_parser():
     p.add_argument("--shutdown", action="store_true", help="apagar la VM de origen si está encendida")
     p.add_argument("--inject-drivers", action="store_true", help="inyectar drivers VirtIO (Windows: DISM; Linux: virt-v2v-in-place)")
     p.add_argument("--dry-run", action="store_true")
-    p.add_argument("--browser", action="store_true", help="abrir la interfaz en el navegador en vez de en una ventana propia")
+    p.add_argument("--ventana", action="store_true", help="abrir la interfaz en una ventana propia en vez del navegador (necesita pywebview)")
     return p
 
 
@@ -58,7 +58,7 @@ def main(argv=None):
     print(f"vm2morpheus {__version__}", file=sys.stderr)
     if args.command == "gui":
         from .gui import serve
-        serve(embedded=not args.browser)
+        serve(embedded=args.ventana)
         return 0
     cfg = load_config(args)
     m = cfg["morpheus"]
