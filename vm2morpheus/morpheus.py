@@ -104,6 +104,51 @@ class MorpheusClient:
             time.sleep(poll)
 
     # --- instances -------------------------------------------------------
+    def layouts(self, instance_type_code: str = "mvm") -> list[tuple[int, str]]:
+        """Layouts of an instance type as (id, name). Tries the library endpoints, then falls back to the
+        layouts used by existing instances of that type (a Morpheus without any of them returns [])."""
+        found: dict[int, str] = {}
+        try:
+            types = self._req("GET", "/api/library/instance-types", params={"code": instance_type_code, "max": 50})
+            for t in types.get("instanceTypes", []):
+                if t.get("code") != instance_type_code:
+                    continue
+                for l in t.get("instanceTypeLayouts") or t.get("layouts") or []:
+                    found[l["id"]] = l.get("name", "")
+                if not found and t.get("id") is not None:
+                    try:
+                        sub = self._req("GET", f"/api/library/instance-types/{t['id']}/layouts", params={"max": 100})
+                        for l in sub.get("instanceTypeLayouts") or sub.get("layouts") or []:
+                            found[l["id"]] = l.get("name", "")
+                    except MorpheusError:
+                        pass
+        except MorpheusError:
+            pass
+        if not found:
+            try:
+                for i in self._req("GET", "/api/instances", params={"max": 200}).get("instances", []):
+                    if (i.get("instanceType") or {}).get("code") == instance_type_code and i.get("layout"):
+                        found[i["layout"]["id"]] = i["layout"].get("name", "")
+            except MorpheusError:
+                pass
+        return sorted(found.items(), key=lambda kv: kv[1].lower())
+
+    def find_layout(self, instance_type_code: str = "mvm", prefer: str = "single") -> tuple[int, str]:
+        options = self.layouts(instance_type_code)
+        pick = next((o for o in options if prefer in o[1].lower()), options[0] if len(options) == 1 else None)
+        if not pick:
+            names = ", ".join(f"{n} (id {i})" for i, n in options) or "ninguno"
+            raise MorpheusError(f"No se pudo elegir el layout de {instance_type_code} automáticamente "
+                                f"(encontrados: {names}). Elígelo a mano en la interfaz.")
+        return pick
+
+    def resource_pools(self, cloud_id: int) -> list[tuple[str, str]]:
+        try:
+            data = self._req("GET", f"/api/zones/{cloud_id}/resource-pools", params={"max": 100})
+        except MorpheusError:
+            return []
+        return [(f"pool-{p['id']}", p.get("name", "")) for p in data.get("resourcePools", []) if p.get("active", True)]
+
     def get_instance(self, instance_id: int) -> dict:
         return self._req("GET", f"/api/instances/{instance_id}")["instance"]
 

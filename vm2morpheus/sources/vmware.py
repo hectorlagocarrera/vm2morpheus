@@ -10,6 +10,13 @@ from .base import Source
 CHUNK = 4 * 1024 * 1024
 
 
+def lease_url(url: str, api_type: str, esxi_host: str | None, connect_host: str) -> str:
+    """NFC export URLs carry a '*' where the host name goes. Connected to a standalone ESXi that is the host we
+    connected to; connected to vCenter the data comes straight from the ESXi host that runs the VM."""
+    host = esxi_host if api_type == "VirtualCenter" and esxi_host else connect_host
+    return url.replace("*", host)
+
+
 class VMwareSource(Source):
     """Reads a VM from vCenter or a standalone ESXi through the vSphere API.
 
@@ -24,6 +31,7 @@ class VMwareSource(Source):
         self.port = int(cfg.get("port", 443))
         self.verify = bool(cfg.get("verify_ssl", False))
         self.si = None
+        self.api_type = ""
         self._vms = {}
 
     def connect(self) -> None:
@@ -31,6 +39,7 @@ class VMwareSource(Source):
         ctx = ssl.create_default_context() if self.verify else ssl._create_unverified_context()
         self.si = SmartConnect(host=self.host, user=self.user, pwd=self.password,
                                port=self.port, sslContext=ctx)
+        self.api_type = self.si.content.about.apiType  # "VirtualCenter" or "HostAgent" (standalone ESXi)
 
     def close(self) -> None:
         if self.si:
@@ -44,13 +53,20 @@ class VMwareSource(Source):
         content = self.si.RetrieveContent()
         view = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
         try:
-            for v in view.view:
-                if v.name == name:
-                    self._vms[name] = v
-                    return v
+            matches = [v for v in view.view if v.name == name]
         finally:
             view.Destroy()
-        raise RuntimeError(f"No se encontró la VM {name!r} en {self.host}")
+        if not matches:
+            raise RuntimeError(f"No se encontró la VM {name!r} en {self.host}")
+        if len(matches) > 1:  # vCenter allows the same name in different folders / datacenters
+            hosts = ", ".join(sorted({str(getattr(v.runtime.host, "name", "?")) for v in matches}))
+            raise RuntimeError(f"Hay {len(matches)} VMs llamadas {name!r} (en los hosts: {hosts}). "
+                               "Renombra una o usa un nombre único para poder elegirla sin ambigüedad.")
+        self._vms[name] = matches[0]
+        return matches[0]
+
+    def kind(self) -> str:
+        return "vCenter" if self.api_type == "VirtualCenter" else "ESXi"
 
     def list_vms(self) -> list[dict]:
         from pyVmomi import vim
@@ -58,7 +74,8 @@ class VMwareSource(Source):
         view = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
         try:
             vms = [{"name": v.name, "state": "on" if v.runtime.powerState == "poweredOn" else "off",
-                    "cpu": v.config.hardware.numCPU, "memory_mb": v.config.hardware.memoryMB}
+                    "cpu": v.config.hardware.numCPU, "memory_mb": v.config.hardware.memoryMB,
+                    "host": str(getattr(v.runtime.host, "name", "") or "")}
                    for v in view.view if v.config and not v.config.template]
         finally:
             view.Destroy()
@@ -116,9 +133,10 @@ class VMwareSource(Source):
         out = []
         try:
             cookie = self.si._stub.cookie
+            esxi_host = str(getattr(mo.runtime.host, "name", "") or "")
             disk_urls = [d for d in lease.info.deviceUrl if d.disk]
             for i, du in enumerate(disk_urls):
-                url = du.url.replace("*", self.host)
+                url = lease_url(du.url, self.api_type, esxi_host, self.host)
                 local = dest / f"{vm.name}-disk{i}.vmdk"
                 total = vm.disks[i].size_bytes if i < len(vm.disks) else None
                 cb = progress(f"descargar {local.name}")

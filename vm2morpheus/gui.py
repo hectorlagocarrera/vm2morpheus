@@ -9,6 +9,7 @@ from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import __version__, settings
+from .logo import LOGO_PNG
 from .morpheus import MorpheusClient
 from .pipeline import migrate
 from .sources import make_source
@@ -52,9 +53,9 @@ def synthetic_reference(f: dict) -> dict:
         "cloud": {"id": int(f["cloud_id"])},
         "group": {"id": int(f["group_id"])},
         "instanceType": {"code": f.get("instance_type") or "mvm"},
-        "layout": {"id": int(f["layout_id"])},
+        "layout": {"id": int(f["layout_id"]) if f.get("layout_id") else None},  # None = detected at run time
         "plan": {"id": int(f["plan_id"])},
-        "config": {"imageId": None, "resourcePoolId": f.get("resource_pool") or "pool-1",
+        "config": {"imageId": None, "resourcePoolId": f.get("resource_pool") or None,
                    "poolProviderType": "mvm", "layoutSize": 1, "createUser": False, "uefi": False},
         "volumes": [{"name": "root", "rootVolume": True, "size": 1, "storageType": 1, "datastoreId": "auto"}],
         "interfaces": [{"id": f"network-{net}", "network": {"id": int(net)}}] if net else [],
@@ -84,7 +85,7 @@ def make_cfgs(f: dict):
     if f.get("ref_instance_id"):
         m["reference_instance"] = {"instance_id": int(f["ref_instance_id"]),
                                    "image_id": int(f["ref_image_id"]) if f.get("ref_image_id") else None}
-    elif f.get("layout_id"):
+    elif f.get("cloud_id") and f.get("group_id") and f.get("plan_id"):
         m["reference_instance"] = {"synthetic": synthetic_reference(f)}
     opts = {"workdir": resolve_workdir(f), "shutdown_source": bool(f.get("shutdown")),
             "boot_sata": bool(f.get("boot_sata")), "inject_drivers": bool(f.get("inject_drivers")),
@@ -152,6 +153,13 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
             self.wfile.write(b)
+        elif self.path == "/logo.png":
+            self.send_response(200)
+            self.send_header("Content-Type", "image/png")
+            self.send_header("Content-Length", str(len(LOGO_PNG)))
+            self.send_header("Cache-Control", "max-age=86400")
+            self.end_headers()
+            self.wfile.write(LOGO_PNG)
         elif self.path.startswith("/browse"):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             try:
@@ -176,19 +184,8 @@ class Handler(BaseHTTPRequestHandler):
                 c = MorpheusClient(f["morpheus_url"], f["morpheus_token"], verify=bool(f.get("verify_ssl")))
                 zone = f.get("cloud_id")
                 plans = c._req("GET", "/api/service-plans", params={"max": 200, **({"zoneId": zone} if zone else {})})
-                def best_effort(fn):
-                    try:
-                        return fn()
-                    except Exception:
-                        return []  # endpoint not available in this version: the user can type the value
-
-                layouts = best_effort(lambda: [
-                    (l["id"], l.get("name", ""))
-                    for t in c._req("GET", "/api/library/instance-types", params={"code": "mvm"}).get("instanceTypes", [])
-                    for l in t.get("instanceTypeLayouts", [])])
-                pools = best_effort(lambda: [
-                    (f"pool-{p['id']}", p.get("name", "")) for p in
-                    c._req("GET", f"/api/zones/{zone}/resource-pools").get("resourcePools", [])] if zone else [])
+                layouts = c.layouts("mvm")
+                pools = c.resource_pools(int(zone)) if zone else []
                 return self._json({
                     "layouts": layouts, "pools": pools,
                     "clouds": [(z["id"], z["name"]) for z in c.clouds()],
@@ -206,7 +203,8 @@ class Handler(BaseHTTPRequestHandler):
                 s = make_source(source_cfg(f))
                 s.connect()
                 try:
-                    return self._json({"vms": s.list_vms()})
+                    kind = s.kind() if hasattr(s, "kind") else "Hyper-V"
+                    return self._json({"vms": s.list_vms(), "kind": kind})
                 finally:
                     s.close()
             if self.path == "/cancel":
@@ -252,9 +250,11 @@ def serve(port: int = 8765, open_browser: bool = True):
 
 PAGE = r"""<!doctype html><html lang="es"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>vm2morpheus</title>
+<link rel="icon" href="/logo.png">
 <style>
 body{font:15px system-ui,sans-serif;margin:0;background:#f4f6f8;color:#1b2430}
 main{max-width:920px;margin:0 auto;padding:16px}
+.brand{padding:4px 0 10px} .brand img{height:56px;max-width:100%}
 h1{font-size:22px} fieldset{background:#fff;border:1px solid #d5dbe2;border-radius:8px;margin:0 0 14px;padding:12px 16px}
 legend{font-weight:600;padding:0 6px} label{display:block;margin:8px 0 2px;font-size:13px;color:#4a5665}
 input,select{width:100%;padding:7px;border:1px solid #b9c2cc;border-radius:5px;box-sizing:border-box}
@@ -273,11 +273,12 @@ button.danger{background:#c0392b}
 button.sec{background:#e5e9ee;color:#1b2430} pre{background:#0f172a;color:#d6e2f0;padding:12px;border-radius:8px;min-height:140px;max-height:420px;overflow:auto;white-space:pre-wrap}
 small{color:#5d6b7b}
 </style><main>
+<div class="brand"><img src="/logo.png" alt="Redes · 25 años innovando el futuro"></div>
 <h1>vm2morpheus <small>Hyper-V / VMware → Morpheus (KVM) · v__VERSION__</small></h1>
 <fieldset><legend>1. Origen</legend><div class="row">
-<div><label>Tipo</label><select id="source_type"><option value="hyperv">Hyper-V</option><option value="vmware">VMware (vCenter/ESXi)</option></select></div>
+<div><label>Tipo</label><select id="source_type"><option value="hyperv">Hyper-V</option><option value="vmware">VMware vCenter o ESXi</option></select></div>
 <div><label>Host / IP</label><input id="source_host"></div>
-<div><label>Usuario</label><input id="source_user"></div>
+<div><label>Usuario</label><input id="source_user" placeholder="vCenter: usuario@vsphere.local"></div>
 <div><label>Contraseña</label><input id="source_password" type="password"></div>
 <div><label>Nombre de la VM</label><input id="vm"></div>
 <div><label>VM del origen <small>(pulsa "Listar VMs")</small></label><select id="vm_select" onchange="if(this.value)document.getElementById('vm').value=this.value"><option value="">(sin listar)</option></select></div>
@@ -297,7 +298,7 @@ small{color:#5d6b7b}
 <details open><summary><small>Sin instancia de referencia: crear desde cero (rellena nube, grupo, plan, red y layout)</small></summary>
 <div class="row"><div><label>Nube</label><select id="cloud_id"></select></div><div><label>Grupo</label><select id="group_id"></select></div>
 <div><label>Plan</label><select id="plan_id"></select></div><div><label>Red</label><select id="network_id"></select></div>
-<div><label>Instance type (código)</label><input id="instance_type" value="mvm"></div><div><label>Layout ID <small>(HVM: "Single HVM")</small></label><input id="layout_id" list="layouts"><datalist id="layouts"></datalist></div><div><label>Resource pool</label><input id="resource_pool" list="pools" placeholder="pool-1"><datalist id="pools"></datalist></div></div></details></fieldset>
+<div><label>Instance type (código)</label><input id="instance_type" value="mvm"></div><div><label>Layout <small>(automático: Single HVM)</small></label><select id="layout_id"><option value="">(automático)</option></select></div><div><label>Resource pool <small>(automático)</small></label><select id="resource_pool"><option value="">(automático)</option></select></div></div></details></fieldset>
 <fieldset><legend>4. Opciones</legend><div class="chk">
 <label><input type="checkbox" id="shutdown"> Apagar la VM de origen</label>
 <label><input type="checkbox" id="multi_disk_bundle" checked> Varios discos en una sola imagen (zip + metadata.json)</label>
@@ -321,14 +322,14 @@ const show=t=>document.getElementById("log").textContent=t;
 async function post(p,b){const r=await fetch(p,{method:"POST",body:JSON.stringify(b)});const j=await r.json();if(j.error)throw new Error(j.error);return j}
 async function persist(){try{await post("/settings",form())}catch(e){}}
 let saved={};
-async function listvms(){try{await persist();const j=await post("/listvms",form());const s=document.getElementById("vm_select");s.innerHTML='<option value="">(elige una VM)</option>'+j.vms.map(v=>`<option value="${v.name}">${v.name} — ${v.state=="on"?"encendida":"apagada"}, ${v.cpu} vCPU, ${(v.memory_mb/1024).toFixed(1)} GiB</option>`).join("");show(j.vms.length+" VM(s) encontradas. Elige una en el desplegable.")}catch(e){show("ERROR: "+e.message)}}
+async function listvms(){try{await persist();const j=await post("/listvms",form());const s=document.getElementById("vm_select");s.innerHTML='<option value="">(elige una VM)</option>'+j.vms.map(v=>`<option value="${v.name}">${v.name} — ${v.state=="on"?"encendida":"apagada"}, ${v.cpu} vCPU, ${(v.memory_mb/1024).toFixed(1)} GiB${v.host?" · host "+v.host:""}</option>`).join("");show("Conectado a "+j.kind+": "+j.vms.length+" VM(s) encontradas. Elige una en el desplegable.")}catch(e){show("ERROR: "+e.message)}}
 async function inspect_(){try{await persist();show(JSON.stringify(await post("/inspect",form()),null,2))}catch(e){show("ERROR: "+e.message)}}
 async function refinfo(){try{show(JSON.stringify(await post("/refinfo",form()),null,2))}catch(e){show("ERROR: "+e.message)}}
 async function lookups(){try{await persist();const j=await post("/lookups",form());
  for(const [k,id] of [["clouds","cloud_id"],["groups","group_id"],["plans","plan_id"],["networks","network_id"],["instances","ref_instance_id"]]){
   const s=document.getElementById(id);s.innerHTML=(id=="network_id"||id=="ref_instance_id"?'<option value="">(ninguna)</option>':'')+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id]}
-  for(const [k,id] of [["layouts","layouts"],["pools","pools"]]){document.getElementById(id).innerHTML=j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("")}
- show("Datos cargados."+(j.layouts.length?"":" (layouts no detectados: escribe el ID a mano)"))}catch(e){show("ERROR: "+e.message)}}
+  for(const [k,id] of [["layouts","layout_id"],["pools","resource_pool"]]){const s=document.getElementById(id);s.innerHTML='<option value="">(automático)</option>'+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id]}
+ show("Datos cargados.")}catch(e){show("ERROR: "+e.message)}}
 const SEP=String.fromCharCode(92);
 let pickerState={path:"",parent:null};
 const gib=b=>b==null?"?":(b/1073741824).toFixed(1)+" GiB";

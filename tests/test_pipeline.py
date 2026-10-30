@@ -18,6 +18,7 @@ class FakeMorpheus(BaseHTTPRequestHandler):
     log = []
     uploads = {}
     reject_sata = False
+    no_library = False
 
     def _send(self, obj, code=200):
         b = json.dumps(obj).encode()
@@ -48,6 +49,19 @@ class FakeMorpheus(BaseHTTPRequestHandler):
         self._send({"success": False, "msg": "nope"}, 404)
 
     def do_GET(self):
+        if self.path.startswith("/api/library/instance-types"):
+            if self.no_library:
+                return self._send({"success": False, "msg": "nope"}, 404)
+            if self.path.startswith("/api/library/instance-types/10/layouts"):
+                return self._send({"success": True, "instanceTypeLayouts": [
+                    {"id": 33, "name": "Cluster HVM"}, {"id": 32, "name": "Single HVM"}]})
+            return self._send({"success": True, "instanceTypes": [{"id": 10, "code": "mvm"}]})
+        if self.path.startswith("/api/zones/1/resource-pools"):
+            return self._send({"success": True, "resourcePools": [{"id": 1, "name": "ClusterLab01", "active": True}]})
+        if self.path.startswith("/api/instances?"):
+            return self._send({"success": True, "instances": [
+                {"instanceType": {"code": "mvm"}, "layout": {"id": 32, "name": "Single HVM"}},
+                {"instanceType": {"code": "ubuntu"}, "layout": {"id": 99, "name": "Other"}}]})
         if self.path == "/api/instances/5":
             return self._send({"success": True, "instance": {
                 "cloud": {"id": 1}, "group": {"id": 2}, "instanceType": {"code": "hvm"}, "layout": {"id": 4},
@@ -602,3 +616,56 @@ def test_browse_endpoint_over_http(tmp_path):
     data = json.loads(urllib.request.urlopen(url).read())
     srv.shutdown()
     assert data["dirs"] == ["datos"]
+
+
+def _client(srv):
+    return MorpheusClient(f"http://127.0.0.1:{srv.server_port}", "tok")
+
+
+def test_layout_and_pool_detection(tmp_path):
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    c = _client(srv)
+    assert c.layouts("mvm") == [(33, "Cluster HVM"), (32, "Single HVM")]
+    assert c.find_layout("mvm") == (32, "Single HVM")
+    assert c.resource_pools(1) == [("pool-1", "ClusterLab01")]
+    FakeMorpheus.no_library = True  # older/limited API: fall back to the layouts of existing HVM instances
+    try:
+        assert c.layouts("mvm") == [(32, "Single HVM")]
+        assert c.find_layout("mvm") == (32, "Single HVM")
+    finally:
+        FakeMorpheus.no_library = False
+        srv.shutdown()
+
+
+def test_ambiguous_layout_is_an_error_not_a_guess():
+    from vm2morpheus.morpheus import MorpheusClient, MorpheusError
+    c = MorpheusClient("http://x", "t")
+    c.layouts = lambda code: [(1, "Cluster A"), (2, "Cluster B")]
+    with pytest.raises(MorpheusError, match="Elígelo a mano"):
+        c.find_layout("mvm")
+
+
+def test_pipeline_detects_layout_and_pool_when_left_automatic(tmp_path):
+    from vm2morpheus.gui import synthetic_reference
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    FakeMorpheus.log.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    ref = synthetic_reference({"cloud_id": "1", "group_id": "1", "plan_id": "23"})  # no layout, no pool
+    msgs = []
+    migrate(FakeSource(disk), _client(srv), "vm1", {"workdir": str(tmp_path / "w14"), "shutdown_source": True},
+            {"image_type": "qcow2", "reference_instance": {"synthetic": ref}}, log=msgs.append)
+    srv.shutdown()
+    sent = dict(FakeMorpheus.log)["instance"]
+    assert sent["instance"]["layout"] == {"id": 32} and sent["config"]["resourcePoolId"] == "pool-1"
+    assert any("Layout detectado automáticamente: Single HVM (id 32)" in m for m in msgs)
+
+
+def test_vmware_nfc_url_host_depends_on_vcenter_or_esxi():
+    from vm2morpheus.sources.vmware import lease_url
+    url = "https://*/nfc/52d1/disk-0.vmdk"
+    assert lease_url(url, "VirtualCenter", "esxi01.lab", "vcenter.lab") == "https://esxi01.lab/nfc/52d1/disk-0.vmdk"
+    assert lease_url(url, "HostAgent", "esxi01.lab", "esxi01.lab") == "https://esxi01.lab/nfc/52d1/disk-0.vmdk"
+    assert lease_url(url, "VirtualCenter", "", "vcenter.lab") == "https://vcenter.lab/nfc/52d1/disk-0.vmdk"

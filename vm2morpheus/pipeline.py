@@ -242,7 +242,19 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         template = mcfg.get("instance")
         refcfg = mcfg.get("reference_instance")
         if refcfg:
-            ref = refcfg["synthetic"] if "synthetic" in refcfg else morpheus.get_instance(refcfg["instance_id"])
+            if "synthetic" in refcfg:
+                ref = refcfg["synthetic"]
+                if ref["layout"]["id"] is None:
+                    layout_id, layout_name = morpheus.find_layout(ref["instanceType"]["code"])
+                    ref["layout"]["id"] = layout_id
+                    log(f"Layout detectado automáticamente: {layout_name} (id {layout_id})")
+                if ref["config"].get("resourcePoolId") is None:
+                    pools = morpheus.resource_pools(ref["cloud"]["id"])
+                    ref["config"]["resourcePoolId"] = pools[0][0] if pools else "pool-1"
+                    log("Resource pool " + (f"detectado automáticamente: {pools[0][1]} ({pools[0][0]})"
+                                            if pools else "no detectable: se usa pool-1"))
+            else:
+                ref = morpheus.get_instance(refcfg["instance_id"])
             root_gb = -(-vm.disks[0].size_bytes // 2**30)
             in_bundle = st.d.get("bundle", False)  # one image carrying every disk (names match metadata.json)
             extra_gb = [-(-d.size_bytes // 2**30) for d in vm.disks[1:]]
