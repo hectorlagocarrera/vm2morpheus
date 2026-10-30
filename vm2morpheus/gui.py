@@ -7,7 +7,7 @@ import webbrowser
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import __version__
+from . import __version__, settings
 from .morpheus import MorpheusClient
 from .pipeline import migrate
 from .sources import make_source
@@ -60,15 +60,24 @@ def synthetic_reference(f: dict) -> dict:
     }
 
 
+def _need(f: dict, key: str, label: str) -> None:
+    f[key] = (f.get(key) or "").strip()
+    if not f[key]:
+        raise ValueError(f"Falta {label}")
+
+
+def source_cfg(f: dict) -> dict:
+    _need(f, "source_host", "el host de origen")
+    _need(f, "source_user", "el usuario del origen")
+    return {"type": f["source_type"], "host": f["source_host"], "username": f["source_user"],
+            "password": f["source_password"], "os_family": f.get("os_family", "other"),
+            "verify_ssl": False, "direct_read": bool(f.get("direct_read"))}
+
+
 def make_cfgs(f: dict):
-    for key, label in (("vm", "el nombre de la VM"), ("source_host", "el host de origen"),
-                       ("morpheus_url", "la URL de Morpheus")):
-        f[key] = (f.get(key) or "").strip()
-        if not f[key] and (key != "morpheus_url" or f.get("_needs_morpheus", True)):
-            raise ValueError(f"Falta {label}")
-    src = {"type": f["source_type"], "host": f["source_host"], "username": f["source_user"],
-           "password": f["source_password"], "os_family": f.get("os_family", "other"),
-           "verify_ssl": False, "direct_read": bool(f.get("direct_read"))}
+    _need(f, "vm", "el nombre de la VM")
+    _need(f, "morpheus_url", "la URL de Morpheus")
+    src = source_cfg(f)
     m = {"url": f["morpheus_url"], "token": f["morpheus_token"], "verify_ssl": bool(f.get("verify_ssl")),
          "image_type": f.get("image_type") or "qcow2"}
     if f.get("ref_instance_id"):
@@ -121,6 +130,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
             self.wfile.write(b)
+        elif self.path == "/settings":
+            self._json(settings.load())
         elif self.path.startswith("/job/"):
             job = JOBS.get(self.path[5:])
             if not job:
@@ -163,9 +174,19 @@ class Handler(BaseHTTPRequestHandler):
                 if not f.get("ref_instance_id"):
                     raise ValueError("Elige primero la instancia de referencia")
                 return self._json(redact(c.get_instance(int(f["ref_instance_id"]))))
+            if self.path == "/listvms":
+                s = make_source(source_cfg(f))
+                s.connect()
+                try:
+                    return self._json({"vms": s.list_vms()})
+                finally:
+                    s.close()
+            if self.path == "/settings":
+                settings.save(f)
+                return self._json({"ok": True})
             if self.path == "/inspect":
-                src_cfg, _, _ = make_cfgs(f)
-                s = make_source(src_cfg)
+                _need(f, "vm", "el nombre de la VM")
+                s = make_source(source_cfg(f))
                 s.connect()
                 try:
                     return self._json(asdict(s.get_vm(f["vm"])))
@@ -216,8 +237,9 @@ small{color:#5d6b7b}
 <div><label>Usuario</label><input id="source_user"></div>
 <div><label>Contraseña</label><input id="source_password" type="password"></div>
 <div><label>Nombre de la VM</label><input id="vm"></div>
+<div><label>VM del origen <small>(pulsa "Listar VMs")</small></label><select id="vm_select" onchange="if(this.value)document.getElementById('vm').value=this.value"><option value="">(sin listar)</option></select></div>
 <div><label>Sistema operativo (Hyper-V)</label><select id="os_family"><option value="windows">Windows</option><option value="linux">Linux</option><option value="other">Otro</option></select></div>
-</div><button class="sec" onclick="inspect_()">Inspeccionar VM</button></fieldset>
+</div><button class="sec" onclick="listvms()">Listar VMs del origen</button><button class="sec" onclick="inspect_()">Inspeccionar VM</button></fieldset>
 <fieldset><legend>2. Destino Morpheus</legend><div class="row">
 <div><label>URL (https://ip)</label><input id="morpheus_url"></div>
 <div><label>Token API</label><input id="morpheus_token" type="password"></div>
@@ -237,6 +259,7 @@ small{color:#5d6b7b}
 <label><input type="checkbox" id="shutdown"> Apagar la VM de origen</label>
 <label><input type="checkbox" id="multi_disk_bundle" checked> Varios discos en una sola imagen (zip + metadata.json)</label>
 <label><input type="checkbox" id="recreate_instance"> Recrear solo la instancia (borra antes la anterior en Morpheus)</label>
+<label><input type="checkbox" id="remember_secrets"> Recordar contraseñas y token (se guardan en texto plano en este equipo)</label>
 <label><input type="checkbox" id="direct_read"> Conversión directa, sin copiar el disco antes (Hyper-V, solo Windows)</label>
 <label><input type="checkbox" id="inject_drivers"> Inyectar drivers VirtIO (experimental)</label></div>
 <label>Carpeta de trabajo (necesita ~2× el tamaño de los discos)</label><input id="workdir" value="vm2morpheus-work"></fieldset>
@@ -244,17 +267,24 @@ small{color:#5d6b7b}
 <pre id="log">Listo.</pre></main>
 <script>
 const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","ref_instance_id","ref_image_id","workdir"];
-const chks=["verify_ssl","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers"];
+const chks=["verify_ssl","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers"];
 const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);return o};
 const show=t=>document.getElementById("log").textContent=t;
 async function post(p,b){const r=await fetch(p,{method:"POST",body:JSON.stringify(b)});const j=await r.json();if(j.error)throw new Error(j.error);return j}
-async function inspect_(){try{show(JSON.stringify(await post("/inspect",form()),null,2))}catch(e){show("ERROR: "+e.message)}}
+async function persist(){try{await post("/settings",form())}catch(e){}}
+let saved={};
+async function listvms(){try{await persist();const j=await post("/listvms",form());const s=document.getElementById("vm_select");s.innerHTML='<option value="">(elige una VM)</option>'+j.vms.map(v=>`<option value="${v.name}">${v.name} — ${v.state=="on"?"encendida":"apagada"}, ${v.cpu} vCPU, ${(v.memory_mb/1024).toFixed(1)} GiB</option>`).join("");show(j.vms.length+" VM(s) encontradas. Elige una en el desplegable.")}catch(e){show("ERROR: "+e.message)}}
+async function inspect_(){try{await persist();show(JSON.stringify(await post("/inspect",form()),null,2))}catch(e){show("ERROR: "+e.message)}}
 async function refinfo(){try{show(JSON.stringify(await post("/refinfo",form()),null,2))}catch(e){show("ERROR: "+e.message)}}
-async function lookups(){try{const j=await post("/lookups",form());
+async function lookups(){try{await persist();const j=await post("/lookups",form());
  for(const [k,id] of [["clouds","cloud_id"],["groups","group_id"],["plans","plan_id"],["networks","network_id"],["instances","ref_instance_id"]]){
-  const s=document.getElementById(id);s.innerHTML=(id=="network_id"||id=="ref_instance_id"?'<option value="">(ninguna)</option>':'')+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("")}
+  const s=document.getElementById(id);s.innerHTML=(id=="network_id"||id=="ref_instance_id"?'<option value="">(ninguna)</option>':'')+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id]}
   for(const [k,id] of [["layouts","layouts"],["pools","pools"]]){document.getElementById(id).innerHTML=j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("")}
  show("Datos cargados."+(j.layouts.length?"":" (layouts no detectados: escribe el ID a mano)"))}catch(e){show("ERROR: "+e.message)}}
-async function run(p){try{const {job}=await post(p,form());show("Trabajo "+job+" en marcha...");
+async function run(p){try{await persist();const {job}=await post(p,form());show("Trabajo "+job+" en marcha...");
  const t=setInterval(async()=>{const r=await (await fetch("/job/"+job)).json();show(r.log||"...");if(r.status!=="running")clearInterval(t)},1000)}catch(e){show("ERROR: "+e.message)}}
+(async()=>{try{saved=await (await fetch("/settings")).json();
+ ids.forEach(i=>{if(saved[i]!==undefined&&document.getElementById(i).tagName==="INPUT"||saved[i]!==undefined&&["source_type","os_family"].includes(i))document.getElementById(i).value=saved[i]});
+ chks.forEach(i=>{if(saved[i]!==undefined)document.getElementById(i).checked=!!saved[i]});
+ if(saved.morpheus_url&&saved.morpheus_token)lookups()}catch(e){}})();
 </script></html>"""

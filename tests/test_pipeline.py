@@ -62,6 +62,8 @@ class FakeSource(Source):
 
     def connect(self): pass
 
+    def list_vms(self): return []
+
     def get_vm(self, name):
         return VMInfo(name, 2, 2048, "uefi", "linux", "off" if self.off else "on",
                       [DiskInfo("d.vmdk", 8 << 20, "x")])
@@ -260,3 +262,27 @@ def test_reference_like_real_hvm_instance():
                                "storageType": 1, "datastoreId": "auto"}
     assert p["volumes"][1]["storageType"] == 1 and p["networkInterfaces"] == [{"network": {"id": "network-1"}}]
     assert p["instance"]["instanceType"] == {"code": "mvm"}
+
+
+def test_settings_drop_secrets_unless_opted_in(tmp_path, monkeypatch):
+    from vm2morpheus import settings
+    monkeypatch.setattr(settings, "PATH", tmp_path / "s" / "settings.json")
+    form = {"source_host": "10.0.0.5", "source_password": "pw", "morpheus_token": "tok", "vm": "w2k16"}
+    settings.save(form)
+    assert settings.load() == {"source_host": "10.0.0.5", "vm": "w2k16"}
+    settings.save({**form, "remember_secrets": True})
+    assert settings.load()["morpheus_token"] == "tok"
+    monkeypatch.setattr(settings, "PATH", tmp_path / "missing.json")
+    assert settings.load() == {}
+
+
+def test_hyperv_list_vms_handles_single_and_many_results():
+    from vm2morpheus.sources.hyperv import HyperVSource
+    h = HyperVSource({"host": "h", "username": "u", "password": "p"})
+    h._ps = lambda script: json.dumps({"Name": "w2k16", "State": "Off", "Cpu": 1, "MemoryMB": 4024})
+    assert h.list_vms() == [{"name": "w2k16", "state": "off", "cpu": 1, "memory_mb": 4024}]
+    h._ps = lambda script: json.dumps([{"Name": "b", "State": "Running", "Cpu": 2, "MemoryMB": 1},
+                                       {"Name": "A", "State": "Off", "Cpu": 1, "MemoryMB": 2}])
+    assert [v["name"] for v in h.list_vms()] == ["A", "b"]
+    h._ps = lambda script: ""
+    assert h.list_vms() == []

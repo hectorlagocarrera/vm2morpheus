@@ -14,6 +14,10 @@ class Source(ABC):
     def connect(self) -> None: ...
 
     @abstractmethod
+    def list_vms(self) -> list[dict]:
+        """Every VM on the source as {name, state, cpu, memory_mb}, sorted by name."""
+
+    @abstractmethod
     def get_vm(self, name: str) -> VMInfo: ...
 
     @abstractmethod

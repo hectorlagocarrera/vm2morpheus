@@ -62,6 +62,13 @@ class HyperVSource(Source):
             raise RuntimeError(f"PowerShell failed on {self.host}: {r.std_err.decode(errors='replace')}")
         return r.std_out.decode(errors="replace").strip()
 
+    def list_vms(self) -> list[dict]:
+        out = self._ps("Get-VM | ForEach-Object { [pscustomobject]@{Name=$_.Name; State=$_.State.ToString(); "
+                       "Cpu=[int]$_.ProcessorCount; MemoryMB=[int64]($_.MemoryStartup/1MB)} } | ConvertTo-Json -Compress")
+        vms = [{"name": d["Name"], "state": "on" if d["State"] == "Running" else "off",
+                "cpu": d["Cpu"], "memory_mb": d["MemoryMB"]} for d in as_list(json.loads(out) if out else None)]
+        return sorted(vms, key=lambda v: v["name"].lower())
+
     def get_vm(self, name: str) -> VMInfo:
         n = ps_quote(name)
         out = self._ps(f"""

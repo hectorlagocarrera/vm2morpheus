@@ -52,6 +52,18 @@ class VMwareSource(Source):
             view.Destroy()
         raise RuntimeError(f"VM {name!r} not found on {self.host}")
 
+    def list_vms(self) -> list[dict]:
+        from pyVmomi import vim
+        content = self.si.RetrieveContent()
+        view = content.viewManager.CreateContainerView(content.rootFolder, [vim.VirtualMachine], True)
+        try:
+            vms = [{"name": v.name, "state": "on" if v.runtime.powerState == "poweredOn" else "off",
+                    "cpu": v.config.hardware.numCPU, "memory_mb": v.config.hardware.memoryMB}
+                   for v in view.view if v.config and not v.config.template]
+        finally:
+            view.Destroy()
+        return sorted(vms, key=lambda v: v["name"].lower())
+
     def get_vm(self, name: str) -> VMInfo:
         from pyVmomi import vim
         vm = self._find(name)
