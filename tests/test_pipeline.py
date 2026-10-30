@@ -543,3 +543,36 @@ def test_resume_and_dryrun_messages_are_readable(tmp_path):
     text = "\n".join(msgs)
     assert "Ya hecho: descarga de discos, conversión a qcow2. Falta: subida a Morpheus." in text
     assert "fetch" not in text and "drivers" not in text
+
+
+def test_tracker_weights_and_transitions():
+    from vm2morpheus.tracker import Tracker
+    events = []
+    t = Tracker(["fetch", "convert", "upload"], ["fetch"], events.append)
+    assert events[0]["overall"] == pytest.approx(0.30 / 0.85) and events[0]["step"] is None
+    t.begin("convert")
+    t.update("convert", 0.5)
+    assert events[-1]["index"] == 2 and events[-1]["total_steps"] == 3
+    assert events[-1]["overall"] == pytest.approx((0.30 + 0.25 * 0.5) / 0.85)
+    t.update("upload", 0.9)  # not the current step: ignored
+    assert events[-1]["fraction"] == 0.5
+    t.finish("convert")
+    t.complete()
+    assert events[-1]["overall"] == 1.0 and events[-1]["label"] == ""
+
+
+def test_pipeline_reports_monotonic_progress_ending_at_100(tmp_path):
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    client = MorpheusClient(f"http://127.0.0.1:{srv.server_port}", "tok")
+    events = []
+    migrate(FakeSource(disk), client, "vm1", {"workdir": str(tmp_path / "w13"), "shutdown_source": True},
+            {"image_type": "qcow2", "reference_instance": {"instance_id": 5, "image_id": 3}},
+            log=lambda *_: None, on_progress=events.append)
+    srv.shutdown()
+    overall = [e["overall"] for e in events]
+    assert overall == sorted(overall) and overall[-1] == 1.0
+    assert [s for s in ("fetch", "convert", "upload", "instance") if any(e["step"] == s for e in events)] == [
+        "fetch", "convert", "upload", "instance"]

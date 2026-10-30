@@ -14,14 +14,8 @@ def _is_windows() -> bool:
     return os.name == "nt"
 
 
-STEPS = ["fetch", "convert", "drivers", "upload", "instance"]
-STEP_LABELS = {
-    "fetch": "descarga de discos",
-    "convert": "conversión a qcow2",
-    "drivers": "inyección de drivers",
-    "upload": "subida a Morpheus",
-    "instance": "creación de la VM",
-}
+from .pipeline_steps import STEP_LABELS, STEPS
+from .tracker import Tracker
 
 
 def relevant_steps(opts: dict, mcfg: dict, injected: bool = False) -> list[str]:
@@ -59,7 +53,7 @@ class State:
 
 
 def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, mcfg: dict,
-            dry_run=False, log=print, cancel=None) -> dict:
+            dry_run=False, log=print, cancel=None, on_progress=None) -> dict:
     def check():
         if cancel is not None and cancel.is_set():
             raise CancelledError("cancelled")
@@ -128,6 +122,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             "'Recrear solo la instancia'.")
 
     bundle = bool(opts.get("multi_disk_bundle", True)) and len(vm.disks) > 1
+    tracker = Tracker(steps, done, on_progress)
 
     check()
     if not st.done("fetch"):
@@ -135,12 +130,23 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             log("Apagando la VM de origen ...")
             source.power_off(vm.name)
         log("Descargando discos ...")
-        files = source.fetch_disks(vm, workdir, lambda label: Progress(label, cancel=cancel))
+        tracker.begin("fetch")
+        n_disks = len(vm.disks)
+        counter = iter(range(n_disks + 1))
+
+        def fetch_bar(label):
+            i = next(counter)
+            tracker.update("fetch", i / n_disks)
+            return Progress(label, cancel=cancel, on_progress=lambda f, i=i: tracker.update("fetch", (i + f) / n_disks))
+
+        files = source.fetch_disks(vm, workdir, fetch_bar)
         st.mark("fetch", fetched=[str(f) for f in files])
+        tracker.finish("fetch")
 
     check()
     if not st.done("convert"):
         log(f"Convirtiendo a {fmt} ...")
+        tracker.begin("convert")
         out = []
         source.ensure_access([Path(p) for p in st.d["fetched"]])
         if windows_inject and not st.d.get("injected"):
@@ -154,21 +160,27 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                 if _inside(boot, workdir):
                     boot.unlink(missing_ok=True)
                 st.d["fetched"][0] = str(vhdx)
+            tracker.begin("drivers")
             bar = Progress("ISO de virtio-win", cancel=cancel)
             iso = ensure_virtio_iso(opts.get("virtio_iso"), bar)
             log("Inyectando drivers VirtIO en el disco de Windows (DISM) ...")
             added = inject_virtio_windows(Path(st.d["fetched"][0]), iso, log)
             log(f"Drivers añadidos: {', '.join(added)}")
             st.set(injected=True, fetched=st.d["fetched"])
+            tracker.finish("drivers")
+            tracker.begin("convert")
         for i, src in enumerate(map(Path, st.d["fetched"])):
             dst = workdir / (disk_file_name(vm.name, i) if bundle else f"{src.stem}.{fmt}")
-            bar = Progress(f"convertir {src.name}", percent=True, cancel=cancel)
+            n_conv = len(st.d["fetched"])
+            bar = Progress(f"convertir {src.name}", percent=True, cancel=cancel,
+                           on_progress=lambda f, i=i: tracker.update("convert", (i + f) / n_conv))
             convert_disk(src, dst, fmt, bar, cancel)
             bar.finish()
             out.append(str(dst))
             if not opts.get("keep_files") and _inside(src, workdir):  # never delete the source VM's own disks
                 src.unlink(missing_ok=True)
         st.mark("convert", converted=out)
+        tracker.finish("convert")
 
     check()
     if not st.done("drivers"):
@@ -177,16 +189,20 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             inject_drivers(Path(st.d["converted"][0]), vm.name, vm.memory_mb, vm.cpu,
                            vm.firmware == "uefi", fmt)
         st.mark("drivers")
+    tracker.finish("drivers")
 
     check()
     if not st.done("upload"):
-        def publish(path: Path, name: str) -> dict:
+        tracker.begin("upload")
+
+        def publish(path: Path, name: str, idx: int = 0, n: int = 1) -> dict:
             log(f"Creando la imagen {name!r} en Morpheus ...")
             img = morpheus.create_virtual_image(
                 name, mcfg.get("image_type", fmt), os_type=mcfg.get("os_type"),
                 uefi=vm.firmware == "uefi", storage_provider_id=mcfg.get("storage_provider_id"),
                 extra=mcfg.get("image_extra"))
-            bar = Progress(f"subir {path.name}", cancel=cancel)
+            bar = Progress(f"subir {path.name}", cancel=cancel,
+                           on_progress=lambda f: tracker.update("upload", (idx + f) / n))
             try:
                 morpheus.upload_image(img["id"], path, bar)
             except CancelledError:
@@ -213,14 +229,16 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                     f.unlink(missing_ok=True)
         else:
             for i, f in enumerate(converted):
-                images.append(publish(f, vm.name if i == 0 else f"{vm.name}-disk{i}"))
+                images.append(publish(f, vm.name if i == 0 else f"{vm.name}-disk{i}", i, len(converted)))
                 if not opts.get("keep_files"):
                     f.unlink(missing_ok=True)
         st.mark("upload", images=images, bundle=bundle)
+        tracker.finish("upload")
 
     check()
     result = {"images": st.d["images"]}
     if not st.done("instance"):
+        tracker.begin("instance")
         template = mcfg.get("instance")
         refcfg = mcfg.get("reference_instance")
         if refcfg:
@@ -271,7 +289,9 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         else:
             log("No hay plantilla de instancia configurada: se termina tras subir la imagen")
             st.mark("instance")
+        tracker.finish("instance")
     result["instance"] = st.d.get("instance")
+    tracker.complete()
     log("Terminado.")
     return result
 

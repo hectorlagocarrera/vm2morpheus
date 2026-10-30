@@ -118,7 +118,7 @@ def run_job(job_id: str, f: dict, dry: bool):
             try:
                 client = MorpheusClient(m["url"], m["token"], verify=m["verify_ssl"])
                 migrate(source, client, f["vm"], opts, m, dry_run=dry, log=lambda s: jl.lines.append(str(s)),
-                        cancel=job["cancel"])
+                        cancel=job["cancel"], on_progress=lambda p: job.__setitem__("progress", p))
             finally:
                 source.close()
             job["status"] = "done"
@@ -158,7 +158,7 @@ class Handler(BaseHTTPRequestHandler):
             if not job:
                 return self._json({"error": "unknown job"}, 404)
             jl = job.get("jl")
-            self._json({"status": job["status"], "log": jl.text() if jl else ""})
+            self._json({"status": job["status"], "log": jl.text() if jl else "", "progress": job.get("progress")})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -254,6 +254,11 @@ input,select{width:100%;padding:7px;border:1px solid #b9c2cc;border-radius:5px;b
 .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0 14px}
 .chk label{display:inline-block;margin-right:16px;color:#1b2430;font-size:14px} .chk input{width:auto}
 button{padding:9px 16px;margin:4px 8px 4px 0;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer;font-size:14px}
+#barwrap{display:none;margin:10px 0}
+#barline{background:#dfe5ec;border-radius:6px;height:20px;overflow:hidden}
+#bar{height:100%;width:0;background:#2563eb;transition:width .4s}
+#bar.ok{background:#1e8e4e} #bar.err{background:#c0392b} #bar.stop{background:#7b8794}
+#barlabel{font-size:13px;margin-top:4px;color:#4a5665}
 button.danger{background:#c0392b}
 button.sec{background:#e5e9ee;color:#1b2430} pre{background:#0f172a;color:#d6e2f0;padding:12px;border-radius:8px;min-height:140px;max-height:420px;overflow:auto;white-space:pre-wrap}
 small{color:#5d6b7b}
@@ -294,6 +299,7 @@ small{color:#5d6b7b}
 <label>ISO de virtio-win <small>(vacío = se descarga sola, ~700 MB, y se guarda en caché)</small></label><input id="virtio_iso" placeholder="C:\ISOs\virtio-win.iso">
 <label>Carpeta de trabajo <small>(necesita ~2× el tamaño real de los discos; vacío = automática)</small></label><input id="workdir" placeholder="vacío = automático (disco local con más espacio libre)"></fieldset>
 <button onclick="run('/dryrun')" class="sec">Simulación</button><button onclick="run('/migrate')">Migrar</button><button id="cancelbtn" class="danger" style="display:none" onclick="cancelJob()">Cancelar migración</button>
+<div id="barwrap"><div id="barline"><div id="bar"></div></div><div id="barlabel"></div></div>
 <pre id="log">Listo.</pre></main>
 <script>
 const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","virtio_iso","ref_instance_id","ref_image_id","workdir"];
@@ -312,10 +318,18 @@ async function lookups(){try{await persist();const j=await post("/lookups",form(
   for(const [k,id] of [["layouts","layouts"],["pools","pools"]]){document.getElementById(id).innerHTML=j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("")}
  show("Datos cargados."+(j.layouts.length?"":" (layouts no detectados: escribe el ID a mano)"))}catch(e){show("ERROR: "+e.message)}}
 let currentJob=null;
+function drawBar(r){const w=document.getElementById("barwrap"),b=document.getElementById("bar"),l=document.getElementById("barlabel");
+ const p=r.progress;if(!p&&r.status==="running"){return}w.style.display="block";
+ let pct=Math.round(((p&&p.overall)||0)*100);if(r.status==="done")pct=100;
+ b.style.width=pct+"%";b.className=r.status==="done"?"ok":r.status==="error"?"err":r.status==="cancelled"?"stop":"";
+ let txt=pct+"% completado";
+ if(r.status==="running"&&p&&p.step)txt=`Paso ${p.index} de ${p.total_steps}: ${p.label} (${Math.round(p.fraction*100)}%) · Total ${pct}%`;
+ else if(r.status==="done")txt="Terminado · 100%";else if(r.status==="error")txt=`Error · ${pct}% completado`;else if(r.status==="cancelled")txt=`Cancelado · ${pct}% completado`;
+ l.textContent=txt}
 async function cancelJob(){if(!currentJob)return;document.getElementById("cancelbtn").disabled=true;try{await post("/cancel",{job:currentJob})}catch(e){show("ERROR: "+e.message)}}
 async function run(p){try{await persist();const {job}=await post(p,form());currentJob=job;show("Trabajo "+job+" en marcha...");
- const btn=document.getElementById("cancelbtn");btn.style.display="inline-block";btn.disabled=false;
- const t=setInterval(async()=>{const r=await (await fetch("/job/"+job)).json();show(r.log||"...");if(r.status!=="running"){clearInterval(t);btn.style.display="none";currentJob=null}},1000)}catch(e){show("ERROR: "+e.message)}}
+ const btn=document.getElementById("cancelbtn");btn.style.display="inline-block";btn.disabled=false;document.getElementById("barwrap").style.display="none";
+ const t=setInterval(async()=>{const r=await (await fetch("/job/"+job)).json();show(r.log||"...");drawBar(r);if(r.status!=="running"){clearInterval(t);btn.style.display="none";currentJob=null}},1000)}catch(e){show("ERROR: "+e.message)}}
 (async()=>{try{saved=await (await fetch("/settings")).json();
  ids.forEach(i=>{if(saved[i]!==undefined&&document.getElementById(i).tagName==="INPUT"||saved[i]!==undefined&&["source_type","os_family"].includes(i))document.getElementById(i).value=saved[i]});
  chks.forEach(i=>{if(saved[i]!==undefined)document.getElementById(i).checked=!!saved[i]});
