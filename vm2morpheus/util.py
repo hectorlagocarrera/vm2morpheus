@@ -53,11 +53,14 @@ class Progress:
         self.percent = percent
         self.stream = stream or sys.stderr
         self._last = 0.0
+        self._start = None
 
     def __call__(self, done: float, total: float | None = None):
         if self.cancel is not None and self.cancel.is_set():
             raise CancelledError("cancelled")
         now = time.monotonic()
+        if self._start is None:
+            self._start = now
         if now - self._last < 0.5 and not (total and done >= total):
             return
         self._last = now
@@ -66,10 +69,14 @@ class Progress:
         if total and self.percent:
             self.stream.write(f"\r  {self.label}: {done / total:6.1%}   ")
         elif total:
-            self.stream.write(f"\r  {self.label}: {done / total:6.1%} ({human(done)} / {human(total)})   ")
+            self.stream.write(f"\r  {self.label}: {done / total:6.1%} ({human(done)} / {human(total)}){self._speed(done, now)}   ")
         else:
-            self.stream.write(f"\r  {self.label}: {human(done)}   ")
+            self.stream.write(f"\r  {self.label}: {human(done)}{self._speed(done, now)}   ")
         self.stream.flush()
+
+    def _speed(self, done: float, now: float) -> str:
+        elapsed = now - (self._start if self._start is not None else now)
+        return f" · {human(done / elapsed)}/s" if elapsed >= 1 else ""
 
     def finish(self):
         self.stream.write("\n")

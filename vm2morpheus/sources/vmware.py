@@ -8,7 +8,22 @@ import requests
 from ..models import DiskInfo, VMInfo
 from .base import Source
 
-CHUNK = 4 * 1024 * 1024
+CHUNK = 8 * 1024 * 1024
+
+
+class LeaseKeepAlive:
+    """The export lease only needs a progress ping every few seconds to stay alive (it expires after minutes of
+    silence). Pinging after every chunk meant one extra SOAP round trip per 4 MiB, which throttled the download."""
+
+    def __init__(self, lease, interval: float = 20.0, clock=time.monotonic):
+        self.lease, self.interval, self.clock = lease, interval, clock
+        self.last = clock()
+
+    def tick(self, percent: int) -> None:
+        now = self.clock()
+        if now - self.last >= self.interval:
+            self.lease.HttpNfcLeaseProgress(percent)
+            self.last = now
 
 
 def note_unverified_tls(verify: bool, host: str, stream=None) -> bool:
@@ -176,6 +191,7 @@ class VMwareSource(Source):
             esxi_host = str(getattr(mo.runtime.host, "name", "") or "")
             disk_urls = [d for d in lease.info.deviceUrl if d.disk]
             wanted = {d.index for d in vm.disks}
+            keep_alive = LeaseKeepAlive(lease)
             for i, du in enumerate(disk_urls):
                 if i not in wanted:  # the user left this disk out
                     continue
@@ -190,7 +206,7 @@ class VMwareSource(Source):
                             f.write(chunk)
                             done += len(chunk)
                             cb(done, None)
-                            lease.HttpNfcLeaseProgress(min(99, int(100 * (i + 0.5) / len(disk_urls))))
+                            keep_alive.tick(min(99, int(100 * (i + 0.5) / len(disk_urls))))
                 out.append(local)
             lease.HttpNfcLeaseComplete()
         except Exception:

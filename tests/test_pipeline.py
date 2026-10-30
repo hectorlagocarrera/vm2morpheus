@@ -1038,3 +1038,38 @@ def test_unverified_tls_notice_is_in_spanish_and_silences_urllib3():
     base = {"source_type": "esxi", "source_host": "h", "source_user": "u", "source_password": "p"}
     assert source_cfg(dict(base))["verify_ssl"] is False
     assert source_cfg({**base, "verify_source": True})["verify_ssl"] is True
+
+
+def test_lease_keepalive_pings_rarely_not_per_chunk():
+    from vm2morpheus.sources.vmware import LeaseKeepAlive
+
+    class Lease:
+        def __init__(self):
+            self.pings = []
+
+        def HttpNfcLeaseProgress(self, pct):
+            self.pings.append(pct)
+
+    t = {"now": 100.0}
+    lease = Lease()
+    ka = LeaseKeepAlive(lease, interval=20, clock=lambda: t["now"])
+    for _ in range(500):  # 500 chunks within the same few seconds
+        t["now"] += 0.01
+        ka.tick(10)
+    assert lease.pings == []  # the old code made 500 SOAP calls here
+    t["now"] += 25
+    ka.tick(40)
+    ka.tick(41)
+    assert lease.pings == [40]
+
+
+def test_progress_shows_the_transfer_speed(monkeypatch):
+    import io
+    from vm2morpheus import util
+    clock = iter([10.0, 20.0])
+    monkeypatch.setattr(util.time, "monotonic", lambda: next(clock))
+    out = io.StringIO()
+    bar = util.Progress("descargar x", out)
+    bar(0)
+    bar(200 * 1024 * 1024)  # 200 MiB in 10 s
+    assert "20.0 MiB/s" in out.getvalue()
