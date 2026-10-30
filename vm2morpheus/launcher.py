@@ -30,6 +30,16 @@ def show_error(text: str) -> None:
     print(text, file=sys.stderr)
 
 
+def show_info(text: str) -> None:
+    if sys.platform == "win32":
+        try:
+            ctypes.windll.user32.MessageBoxW(0, text, "vm2morpheus", 0x40)
+            return
+        except Exception:
+            pass
+    print(text, file=sys.stderr)
+
+
 def run(main) -> int:
     setup_streams()
     try:

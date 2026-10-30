@@ -795,3 +795,55 @@ def test_only_selected_disks_are_migrated(tmp_path):
     with pytest.raises(RuntimeError, match="ningún disco"):
         migrate(Three(d0), _client(HTTPServer(("127.0.0.1", 0), FakeMorpheus)), "vm1",
                 {"workdir": str(tmp_path / "w16"), "disk_indexes": []}, {}, log=lambda *_: None)
+
+
+def test_registry_key_paths_have_single_backslashes():
+    import re
+    from vm2morpheus import window
+    src = open(window.__file__, encoding="utf-8").read()
+    assert "\\\\\\\\" not in re.sub(r'sep = "\\\\\\\\"', "", src)  # no doubled backslash left in a registry path
+    assert window.webview2_installed() is False  # not Windows here
+
+
+def test_serve_embedded_returns_when_the_window_closes(monkeypatch):
+    import socket
+    from vm2morpheus import gui, window
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    seen = {}
+
+    def fake_window(url, busy, title="vm2morpheus"):
+        seen["url"], seen["embedded_flag"] = url, gui.STATE["embedded"]
+        return True  # the user opened and then closed the window
+
+    monkeypatch.setattr(window, "open_window", fake_window)
+    gui.serve(port, open_browser=True, embedded=True)
+    assert seen["url"].endswith(str(port)) and seen["embedded_flag"] is True
+
+
+def test_serve_falls_back_to_the_browser_without_a_window(monkeypatch, capsys):
+    import socket
+    from vm2morpheus import gui, window
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    opened = []
+
+    def fake_browser(url):
+        opened.append(url)
+        threading.Timer(0.3, gui.STATE["server"].shutdown).start()  # end the loop so the test can finish
+
+    monkeypatch.setattr(window, "open_window", lambda url, busy, title="x": False)
+    monkeypatch.setattr(gui.webbrowser, "open", fake_browser)
+    gui.serve(port, open_browser=True, embedded=True)
+    assert opened and gui.STATE["embedded"] is False
+    assert "se usa el navegador" in capsys.readouterr().out
+
+
+def test_page_hides_the_quit_button_only_when_embedded():
+    from vm2morpheus import gui
+    gui.STATE["embedded"] = True
+    assert "const EMBEDDED=true;" in gui.render_page()
+    gui.STATE["embedded"] = False
+    assert "const EMBEDDED=false;" in gui.render_page() and "__EMBEDDED__" not in gui.render_page()

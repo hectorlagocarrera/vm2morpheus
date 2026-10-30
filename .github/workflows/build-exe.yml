@@ -14,6 +14,7 @@ jobs:
       - run: >
           pyinstaller --onefile --noconsole --name vm2morpheus
           --collect-all pyVmomi --collect-all smbprotocol --collect-all winrm
+          --collect-all webview --collect-all pythonnet --collect-all clr_loader
           --hidden-import smbclient exe_entry.py
       - name: Bundle qemu-img next to the exe
         shell: pwsh

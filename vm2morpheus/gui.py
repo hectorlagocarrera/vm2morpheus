@@ -156,7 +156,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/":
-            b = PAGE.replace("__VERSION__", __version__).encode()
+            b = render_page().encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(b)))
@@ -251,20 +251,37 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "not found"}, 404)
 
 
-def serve(port: int = 8765, open_browser: bool = True):
+def serve(port: int = 8765, open_browser: bool = True, embedded: bool = True):
+    """Run the GUI. With embedded=True it opens its own window (closing it exits); if that is not possible,
+    or embedded=False, the page opens in the default browser and the app exits when the tab goes away."""
     url = f"http://127.0.0.1:{port}"
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    except OSError:  # a second double-click: reuse the instance that is already running
+    except OSError:  # a second launch: do not start another server
         print(f"Ya hay una instancia en marcha en {url}: se abre en el navegador")
         if open_browser:
-            webbrowser.open(url)
+            if embedded:
+                from .launcher import show_info
+                show_info("vm2morpheus ya está abierto: búscalo en la barra de tareas.")
+            else:
+                webbrowser.open(url)
         return
     STATE["server"] = srv
+    STATE["embedded"] = False
     print(f"Interfaz de vm2morpheus en {url}  (Ctrl+C para parar)")
+    thread = threading.Thread(target=srv.serve_forever, daemon=True)
+    thread.start()
+    if open_browser and embedded:
+        from .window import open_window
+        STATE["embedded"] = True  # tells the page to hide its own "Salir" button
+        if open_window(url, RUN_LOCK.locked):
+            srv.shutdown()
+            return
+        STATE["embedded"] = False
+        print("No se pudo abrir la ventana integrada (falta WebView2 o pywebview): se usa el navegador")
 
     def watchdog():
-        while True:
+        while thread.is_alive():
             time.sleep(10)
             if idle_too_long(STATE["last_ping"], time.monotonic(), RUN_LOCK.locked()):
                 srv.shutdown()
@@ -274,9 +291,14 @@ def serve(port: int = 8765, open_browser: bool = True):
     if open_browser:
         webbrowser.open(url)
     try:
-        srv.serve_forever()
+        while thread.is_alive():
+            thread.join(0.5)
     except KeyboardInterrupt:
-        pass
+        srv.shutdown()
+
+
+def render_page() -> str:
+    return PAGE.replace("__VERSION__", __version__).replace("__EMBEDDED__", "true" if STATE.get("embedded") else "false")
 
 
 PAGE = r"""<!doctype html><html lang="es"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -350,6 +372,7 @@ small{color:#5d6b7b}
 <script>
 const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","virtio_iso","ref_instance_id","ref_image_id","workdir"];
 const chks=["verify_ssl","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
+const EMBEDDED=__EMBEDDED__;
 let analyzedVm=null;
 const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);if(analyzedVm&&analyzedVm===document.getElementById("vm").value.trim()&&document.querySelector(".diskchk"))o.disk_indexes=[...document.querySelectorAll(".diskchk")].filter(c=>c.checked).map(c=>Number(c.value));else o.disk_indexes=null;return o};
 const show=t=>document.getElementById("log").textContent=t;
@@ -373,6 +396,7 @@ async function inspect_(){await analyze(true);if(analyzedVm)show("VM analizada: 
 async function quit(){if(currentJob&&!confirm("Hay una migración en curso. ¿Salir igualmente?"))return;
  try{await post("/shutdown",{})}catch(e){}
  document.body.innerHTML="<main><h1>Programa cerrado</h1><p>Ya puedes cerrar esta pestaña.</p></main>"}
+if(EMBEDDED){const q=document.querySelector(".quit");if(q)q.style.display="none"}
 setInterval(()=>fetch("/ping").catch(()=>{}),5000);fetch("/ping").catch(()=>{});
 async function refinfo(){try{show(JSON.stringify(await post("/refinfo",form()),null,2))}catch(e){show("ERROR: "+e.message)}}
 async function lookups(){try{await persist();const j=await post("/lookups",form());
