@@ -6,7 +6,7 @@ import time
 from pathlib import Path, PureWindowsPath
 
 from ..models import DiskInfo, VMInfo
-from ..util import no_window
+from .. import winnet
 from .base import ProgressCb, Source
 
 CHUNK = 8 * 1024 * 1024
@@ -114,15 +114,12 @@ $snaps = @(Get-VMSnapshot -VM $vm).Count
             share = "\\".join(str(path).split("\\")[:4])  # \\host\X$
             if share in self._shares:
                 continue
-            r = subprocess.run(["net", "use", share, f"/user:{self.user}", self.password],
-                               capture_output=True, text=True, **no_window())
-            if r.returncode != 0:
-                raise RuntimeError(f"No se puede abrir {share}: {(r.stdout + r.stderr).strip()}")
+            winnet.add_connection(share, self.user, self.password)
             self._shares.add(share)
 
     def close(self) -> None:
         for share in self._shares:
-            subprocess.run(["net", "use", share, "/delete", "/y"], capture_output=True, **no_window())
+            winnet.cancel_connection(share)
         self._shares.clear()
 
     def fetch_disks(self, vm: VMInfo, dest: Path, progress) -> list[Path]:

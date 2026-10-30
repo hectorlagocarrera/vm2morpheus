@@ -847,3 +847,24 @@ def test_page_hides_the_quit_button_only_when_embedded():
     assert "const EMBEDDED=true;" in gui.render_page()
     gui.STATE["embedded"] = False
     assert "const EMBEDDED=false;" in gui.render_page() and "__EMBEDDED__" not in gui.render_page()
+
+
+def test_smb_session_uses_the_win32_api_once_per_share(monkeypatch):
+    from pathlib import Path
+    from vm2morpheus import winnet
+    from vm2morpheus.sources.hyperv import HyperVSource
+    calls, closed = [], []
+    monkeypatch.setattr(winnet, "add_connection", lambda share, user, pw: calls.append((share, user, pw)))
+    monkeypatch.setattr(winnet, "cancel_connection", closed.append)
+    h = HyperVSource({"host": "10.0.0.5", "username": "u", "password": "p"})
+    h.direct, h.local = True, False
+    h.ensure_access([Path(r"\\10.0.0.5\D$\VMs\a.vhdx"), Path(r"\\10.0.0.5\D$\VMs\b.vhdx")])
+    assert calls == [(r"\\10.0.0.5\D$", "u", "p")]  # no command line, one session for both disks
+    h.close()
+    assert closed == [r"\\10.0.0.5\D$"]
+
+
+def test_powershell_is_not_started_with_execution_policy_bypass():
+    import inspect
+    from vm2morpheus import drivers_windows
+    assert "Bypass" not in inspect.getsource(drivers_windows.run_powershell)

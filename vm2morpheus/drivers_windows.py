@@ -49,7 +49,7 @@ def ps_quote(s: str) -> str:
 
 
 def run_powershell(script: str) -> str:
-    r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
+    r = subprocess.run(["powershell", "-NoProfile", "-NonInteractive", "-Command", script],
                        capture_output=True, text=True, **no_window())
     if r.returncode != 0:
         raise RuntimeError(f"Falló PowerShell: {(r.stderr or r.stdout).strip()[-600:]}")
