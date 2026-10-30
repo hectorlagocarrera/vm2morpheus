@@ -234,7 +234,7 @@ class Handler(BaseHTTPRequestHandler):
 def serve(port: int = 8765, open_browser: bool = True):
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}"
-    print(f"vm2morpheus GUI on {url}  (Ctrl+C to stop)")
+    print(f"Interfaz de vm2morpheus en {url}  (Ctrl+C para parar)")
     if open_browser:
         webbrowser.open(url)
     try:

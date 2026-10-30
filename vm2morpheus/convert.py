@@ -29,7 +29,7 @@ def find_tool(name: str) -> str | None:
 def require_tool(name: str) -> str:
     path = find_tool(name)
     if not path:
-        raise RuntimeError(f"{name} not found in PATH (install qemu-utils / virt-v2v)")
+        raise RuntimeError(f"No se encuentra {name} en el PATH (instala qemu-utils / virt-v2v)")
     return path
 
 
@@ -63,7 +63,7 @@ def convert_disk(src: Path, dst: Path, fmt: str = "qcow2", progress=None, cancel
         dst.unlink(missing_ok=True)
         raise CancelledError("cancelled")
     if code != 0:
-        raise RuntimeError(f"qemu-img convert failed for {src.name}: {err.strip()}")
+        raise RuntimeError(f"Falló qemu-img al convertir {src.name}: {err.strip()}")
     return dst
 
 
@@ -83,4 +83,4 @@ def inject_drivers(disk: Path, vm_name: str, memory_mb: int, cpu: int, uefi: boo
     r = subprocess.run(["virt-v2v-in-place", "-i", "libvirtxml", str(xml_path)],
                        capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"virt-v2v-in-place failed: {r.stderr.strip()[-800:]}")
+        raise RuntimeError(f"Falló virt-v2v-in-place: {r.stderr.strip()[-800:]}")

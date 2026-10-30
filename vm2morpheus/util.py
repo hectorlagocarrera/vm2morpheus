@@ -33,7 +33,7 @@ def resolve_secret(value):
     if isinstance(value, str) and value.startswith("env:"):
         name = value[4:]
         if name not in os.environ:
-            raise SystemExit(f"environment variable {name} is not set")
+            raise SystemExit(f"La variable de entorno {name} no está definida")
         return os.environ[name]
     return value
 

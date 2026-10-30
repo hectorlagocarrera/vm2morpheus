@@ -11,4 +11,4 @@ def make_source(cfg: dict) -> Source:
     if kind == "vmware":
         from .vmware import VMwareSource
         return VMwareSource(cfg)
-    raise SystemExit(f"unknown source type {kind!r} (expected 'hyperv' or 'vmware')")
+    raise SystemExit(f"Tipo de origen desconocido {kind!r} (se esperaba 'hyperv' o 'vmware')")

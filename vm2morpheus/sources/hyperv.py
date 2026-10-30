@@ -40,7 +40,7 @@ class HyperVSource(Source):
         # qemu-img reads the VHDX in place (SMB or local disk): no intermediate copy. Windows only.
         self.direct = bool(cfg.get("direct_read", False)) and os.name == "nt"
         if cfg.get("direct_read") and not self.direct:
-            print("direct_read is only supported on Windows; copying disks instead", file=sys.stderr)
+            print("La lectura directa solo funciona en Windows: se copiarán los discos", file=sys.stderr)
         self.session = None
         self._shares: set[str] = set()
 
@@ -59,7 +59,7 @@ class HyperVSource(Source):
         # progress records come back as CLIXML on stderr and make pywinrm emit a bogus warning
         r = self.session.run_ps("$ProgressPreference='SilentlyContinue'\n" + script)
         if r.status_code != 0:
-            raise RuntimeError(f"PowerShell failed on {self.host}: {r.std_err.decode(errors='replace')}")
+            raise RuntimeError(f"Falló PowerShell en {self.host}: {r.std_err.decode(errors='replace')}")
         return r.std_out.decode(errors="replace").strip()
 
     def list_vms(self) -> list[dict]:
@@ -99,7 +99,7 @@ $snaps = @(Get-VMSnapshot -VM $vm).Count
             if self._ps(f"(Get-VM -Name {n}).State.ToString()") == "Off":
                 return
             time.sleep(5)
-        raise RuntimeError(f"VM {name} did not power off in 5 minutes")
+        raise RuntimeError(f"La VM {name} no se apagó en 5 minutos")
 
     def _unc(self, win_path: str) -> str:
         p = PureWindowsPath(win_path)
@@ -116,7 +116,7 @@ $snaps = @(Get-VMSnapshot -VM $vm).Count
             r = subprocess.run(["net", "use", share, f"/user:{self.user}", self.password],
                                capture_output=True, text=True)
             if r.returncode != 0:
-                raise RuntimeError(f"cannot open {share}: {(r.stdout + r.stderr).strip()}")
+                raise RuntimeError(f"No se puede abrir {share}: {(r.stdout + r.stderr).strip()}")
             self._shares.add(share)
 
     def close(self) -> None:
@@ -129,8 +129,8 @@ $snaps = @(Get-VMSnapshot -VM $vm).Count
             out = []
             for disk in vm.disks:
                 if disk.path.lower().endswith(".avhdx"):
-                    raise RuntimeError(f"{disk.path} is a checkpoint (differencing) disk; "
-                                       "delete or merge the VM's checkpoints first")
+                    raise RuntimeError(f"{disk.path} es un disco de checkpoint (diferencial); "
+                                       "elimina o fusiona antes los checkpoints de la VM")
                 out.append(Path(disk.path if self.local else self._unc(disk.path)))
             self.ensure_access(out)
             return out
@@ -139,14 +139,14 @@ $snaps = @(Get-VMSnapshot -VM $vm).Count
         out = []
         for disk in vm.disks:
             if disk.path.lower().endswith(".avhdx"):
-                raise RuntimeError(f"{disk.path} is a checkpoint (differencing) disk; "
-                                   "delete or merge the VM's checkpoints first")
+                raise RuntimeError(f"{disk.path} es un disco de checkpoint (diferencial); "
+                                   "elimina o fusiona antes los checkpoints de la VM")
             p = PureWindowsPath(disk.path)
             drive = p.drive.rstrip(":")
             unc = "\\\\" + self.host + "\\" + drive + "$\\" + "\\".join(p.parts[1:])
             local = dest / disk.name
             total = smbclient.stat(unc).st_size
-            cb: ProgressCb = progress(f"download {disk.name}")
+            cb: ProgressCb = progress(f"descargar {disk.name}")
             done = 0
             with smbclient.open_file(unc, mode="rb") as src, open(local, "wb") as dst:
                 while chunk := src.read(CHUNK):

@@ -320,7 +320,7 @@ def test_sata_rejected_by_morpheus_retries_without_it(tmp_path):
     finally:
         FakeMorpheus.reject_sata = False
     assert "controllerMountPoint" not in inst["volumes"][0]
-    assert any("retrying without it" in m for m in msgs)
+    assert any("se reintenta sin SATA" in m for m in msgs)
 
 
 def test_sata_can_be_turned_off(tmp_path):
@@ -515,7 +515,7 @@ def test_driver_injection_without_admin_fails_before_any_work(tmp_path, monkeypa
             vm.os_family, vm.power_state = "windows", "off"
             return vm
 
-    with pytest.raises(RuntimeError, match="administrator"):
+    with pytest.raises(RuntimeError, match="administrador"):
         migrate(Win(tmp_path / "x"), MorpheusClient("http://x", "t"), "vm1",
                 {"workdir": str(tmp_path / "w11"), "inject_drivers": True}, {}, log=lambda *_: None)
     assert not (tmp_path / "w11" / "vm1").exists()  # nothing was created or downloaded

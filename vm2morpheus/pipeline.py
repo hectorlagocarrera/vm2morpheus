@@ -48,21 +48,22 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     windows_inject = bool(opts.get("inject_drivers")) and _is_windows() and vm.os_family == "windows"
     if windows_inject and source.direct:
         source.direct = False  # drivers are written into the disk, so it must be a private copy, never the original
-        log("driver injection needs a local copy of the disk: direct read is turned off")
+        log("La inyección de drivers necesita una copia local del disco: se desactiva la lectura directa")
     total = sum(d.size_bytes for d in vm.disks)
     log(f"VM {vm.name}: {vm.cpu} vCPU, {vm.memory_mb} MiB, {vm.firmware.upper()}, "
-        f"{vm.os_family}, {vm.power_state}, {len(vm.disks)} disk(s), {human(total)} provisioned")
+        f"{vm.os_family}, {'encendida' if vm.power_state == 'on' else 'apagada'}, {len(vm.disks)} disco(s), "
+        f"{human(total)} provisionados")
 
     problems = []
     if vm.has_snapshots:
-        problems.append("VM has snapshots/checkpoints; consolidate them first")
+        problems.append("La VM tiene snapshots o checkpoints: consolídalos primero")
     if not vm.disks:
-        problems.append("VM has no disks")
+        problems.append("La VM no tiene discos")
     if windows_inject and not is_admin():
-        problems.append("driver injection needs administrator rights: close the program and start it with "
-                        "right click > Run as administrator (or untick the drivers option)")
+        problems.append("La inyección de drivers necesita permisos de administrador: cierra el programa y ábrelo con "
+                        "clic derecho > Ejecutar como administrador (o desmarca la opción de drivers)")
     if vm.power_state == "on" and not opts.get("shutdown_source"):
-        problems.append("VM is running; pass --shutdown to power it off (consistent copy)")
+        problems.append("La VM está encendida: marca 'Apagar la VM de origen' (--shutdown) para hacer una copia consistente")
     workdir = Path(opts.get("workdir", "/var/tmp/vm2morpheus")).resolve() / vm.name
     probe = workdir
     while not probe.exists():
@@ -71,21 +72,21 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     # the downloaded disk files plus a converted copy; qcow2 only stores used blocks, so used size is a safe bound
     needed = (1 if source.direct else 2) * sum(d.used_bytes or d.size_bytes for d in vm.disks)
     if free < needed:
-        problems.append(f"not enough free space in {probe}: {human(free)} free, about {human(needed)} needed; "
-                        "set another work folder (e.g. D:\\migracion) on a bigger disk")
+        problems.append(f"No hay espacio suficiente en {probe}: {human(free)} libres, hacen falta unos {human(needed)}; "
+                        "elige otra carpeta de trabajo (p. ej. D:\\migracion) en un disco más grande")
     if dry_run:
         for p in problems:
-            log(f"  would fail: {p}")
-        log("dry-run: steps = " + " -> ".join(STEPS) + f" (target format {fmt})")
+            log(f"  fallaría: {p}")
+        log("Simulación: pasos = " + " -> ".join(STEPS) + f" (formato de destino {fmt})")
         return {"dry_run": True, "problems": problems}
     if problems:
         raise RuntimeError("; ".join(problems))
 
-    log(f"work folder: {workdir}")
+    log(f"Carpeta de trabajo: {workdir}")
     workdir.mkdir(parents=True, exist_ok=True)
     st = State(workdir / "state.json")
     if st.done("upload") and not all(morpheus.image_exists(i["id"]) for i in st.d.get("images", [])):
-        log("the saved progress says the image was uploaded, but it is not in this Morpheus: starting from scratch")
+        log("El progreso guardado dice que la imagen se subió, pero no está en este Morpheus: se empieza de cero")
         st.path.unlink(missing_ok=True)
         st = State(st.path)
     if opts.get("recreate_instance") and st.done("instance"):
@@ -94,48 +95,48 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         st.path.write_text(json.dumps(st.d, indent=2))
     skipped = [x for x in STEPS if st.done(x)]
     if skipped:
-        log(f"resuming from {st.path}: already done: {', '.join(skipped)}")
+        log(f"Se reanuda desde {st.path}; ya hecho: {', '.join(skipped)}")
         if len(skipped) == len(STEPS):
-            log("everything was already completed in a previous run. Images in Morpheus: "
+            log("Todo se completó en una ejecución anterior. Imágenes en Morpheus: "
                 + ", ".join(f"{i['name']} (id {i['id']})" for i in st.d.get("images", [])))
-            log(f"to migrate this VM again from scratch, delete {st.path}")
+            log(f"Para migrar esta VM de nuevo desde cero, borra {st.path}")
 
     bundle = bool(opts.get("multi_disk_bundle", True)) and len(vm.disks) > 1
 
     check()
     if not st.done("fetch"):
         if vm.power_state == "on":
-            log("powering off source VM ...")
+            log("Apagando la VM de origen ...")
             source.power_off(vm.name)
-        log("fetching disks ...")
+        log("Descargando discos ...")
         files = source.fetch_disks(vm, workdir, lambda label: Progress(label, cancel=cancel))
         st.mark("fetch", fetched=[str(f) for f in files])
 
     check()
     if not st.done("convert"):
-        log(f"converting to {fmt} ...")
+        log(f"Convirtiendo a {fmt} ...")
         out = []
         source.ensure_access([Path(p) for p in st.d["fetched"]])
         if windows_inject and not st.d.get("injected"):
             boot = Path(st.d["fetched"][0])
             if boot.suffix.lower() not in (".vhd", ".vhdx"):  # Windows can only mount VHD/VHDX
-                log(f"converting {boot.name} to VHDX so Windows can mount it ...")
+                log(f"Convirtiendo {boot.name} a VHDX para que Windows pueda montarlo ...")
                 vhdx = boot.with_suffix(".vhdx")
-                bar = Progress(f"convert {boot.name}", percent=True, cancel=cancel)
+                bar = Progress(f"convertir {boot.name}", percent=True, cancel=cancel)
                 convert_disk(boot, vhdx, "vhdx", bar, cancel)
                 bar.finish()
                 if _inside(boot, workdir):
                     boot.unlink(missing_ok=True)
                 st.d["fetched"][0] = str(vhdx)
-            bar = Progress("virtio-win ISO", cancel=cancel)
+            bar = Progress("ISO de virtio-win", cancel=cancel)
             iso = ensure_virtio_iso(opts.get("virtio_iso"), bar)
-            log("injecting VirtIO drivers into the Windows disk (DISM) ...")
+            log("Inyectando drivers VirtIO en el disco de Windows (DISM) ...")
             added = inject_virtio_windows(Path(st.d["fetched"][0]), iso, log)
-            log(f"drivers added: {', '.join(added)}")
+            log(f"Drivers añadidos: {', '.join(added)}")
             st.set(injected=True, fetched=st.d["fetched"])
         for i, src in enumerate(map(Path, st.d["fetched"])):
             dst = workdir / (disk_file_name(vm.name, i) if bundle else f"{src.stem}.{fmt}")
-            bar = Progress(f"convert {src.name}", percent=True, cancel=cancel)
+            bar = Progress(f"convertir {src.name}", percent=True, cancel=cancel)
             convert_disk(src, dst, fmt, bar, cancel)
             bar.finish()
             out.append(str(dst))
@@ -146,7 +147,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     check()
     if not st.done("drivers"):
         if opts.get("inject_drivers") and not _is_windows():
-            log("injecting virtio drivers (virt-v2v-in-place) ...")
+            log("Inyectando drivers VirtIO (virt-v2v-in-place) ...")
             inject_drivers(Path(st.d["converted"][0]), vm.name, vm.memory_mb, vm.cpu,
                            vm.firmware == "uefi", fmt)
         st.mark("drivers")
@@ -154,20 +155,20 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     check()
     if not st.done("upload"):
         def publish(path: Path, name: str) -> dict:
-            log(f"creating Morpheus image {name!r} ...")
+            log(f"Creando la imagen {name!r} en Morpheus ...")
             img = morpheus.create_virtual_image(
                 name, mcfg.get("image_type", fmt), os_type=mcfg.get("os_type"),
                 uefi=vm.firmware == "uefi", storage_provider_id=mcfg.get("storage_provider_id"),
                 extra=mcfg.get("image_extra"))
-            bar = Progress(f"upload {path.name}", cancel=cancel)
+            bar = Progress(f"subir {path.name}", cancel=cancel)
             try:
                 morpheus.upload_image(img["id"], path, bar)
             except CancelledError:
                 try:
                     morpheus.delete_image(img["id"])  # do not leave a half-uploaded image behind
-                    log(f"removed the incomplete image {name!r} from Morpheus")
+                    log(f"Se eliminó de Morpheus la imagen incompleta {name!r}")
                 except Exception:
-                    log(f"could not remove the incomplete image {name!r} (id {img['id']}); delete it by hand")
+                    log(f"No se pudo eliminar la imagen incompleta {name!r} (id {img['id']}); bórrala a mano")
                 raise
             bar.finish()
             morpheus.wait_image_ready(img["id"])
@@ -176,7 +177,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         converted = [Path(p) for p in st.d["converted"]]
         images = []
         if bundle:
-            log(f"packing {len(converted)} disks into one multi-disk image (zip + metadata.json) ...")
+            log(f"Empaquetando {len(converted)} discos en una sola imagen multidisco (zip + metadata.json) ...")
             zip_path = workdir / f"{vm.name}.zip"
             build_bundle(vm.name, [(f, d.size_bytes) for f, d in zip(converted, vm.disks)], zip_path)
             images.append(publish(zip_path, vm.name))
@@ -212,40 +213,40 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                 except MorpheusError:
                     dump = workdir / "reference-instance.json"
                     dump.write_text(json.dumps(redact(ref), indent=2, ensure_ascii=False), encoding="utf-8")
-                    log(f"saved the reference instance (credentials hidden) to {dump}")
+                    log(f"Instancia de referencia guardada (credenciales ocultas) en {dump}")
                     raise
 
             if extra_gb and not in_bundle:
-                log(f"note: {len(extra_gb)} extra disk(s) are added as BLANK volumes; their data was uploaded "
-                    "as separate images but is not attached")
+                log(f"Nota: {len(extra_gb)} disco(s) extra se añaden como volúmenes EN BLANCO; sus datos se subieron "
+                    "como imágenes aparte, pero no están conectados")
             elif extra_gb:
-                log(f"adding {len(extra_gb)} data volume(s) matching the multi-disk image")
+                log(f"Añadiendo {len(extra_gb)} volumen(es) de datos acorde con la imagen multidisco")
             if not st.d.get("injected"):
-                log("note: no guest drivers were installed. " + (
-                    "The boot disk is requested on a SATA controller so Windows can boot without VirtIO drivers"
-                    if want_sata else "a Windows guest needs VirtIO drivers to boot from VirtIO"))
-            log("creating Morpheus instance (cloned from the reference instance) ...")
+                log("Nota: no se instalaron drivers en la VM. " + (
+                    "El disco de arranque se pide en un controlador SATA para que Windows arranque sin drivers VirtIO"
+                    if want_sata else "un Windows necesita drivers VirtIO para arrancar desde VirtIO"))
+            log("Creando la instancia en Morpheus ...")
             try:
                 inst = morpheus.create_instance(build(want_sata))
             except MorpheusError as e:
                 if not want_sata or " 400:" not in str(e):
                     raise
-                log(f"Morpheus rejected the SATA controller request ({e}); retrying without it. "
-                    "Change the boot disk to SATA by hand if Windows does not boot.")
+                log(f"Morpheus rechazó la petición del controlador SATA ({e}); se reintenta sin SATA. "
+                    "Cambia el disco de arranque a SATA a mano si Windows no arranca.")
                 inst = morpheus.create_instance(build(False))
             st.mark("instance", instance={"id": inst.get("id"), "name": inst.get("name")})
         elif template:
             vals = {"image_id": st.d["images"][0]["id"], "image_name": st.d["images"][0]["name"],
                     "vm_name": vm.name, "cpu": vm.cpu, "memory_mb": vm.memory_mb,
                     "memory_bytes": vm.memory_mb * 1024 * 1024}
-            log("creating Morpheus instance ...")
+            log("Creando la instancia en Morpheus ...")
             inst = morpheus.create_instance(render_template(template, vals))
             st.mark("instance", instance={"id": inst.get("id"), "name": inst.get("name")})
         else:
-            log("no 'morpheus.instance' template configured: stopping after image upload")
+            log("No hay plantilla de instancia configurada: se termina tras subir la imagen")
             st.mark("instance")
     result["instance"] = st.d.get("instance")
-    log("done.")
+    log("Terminado.")
     return result
 
 

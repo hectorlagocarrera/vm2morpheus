@@ -50,7 +50,7 @@ class VMwareSource(Source):
                     return v
         finally:
             view.Destroy()
-        raise RuntimeError(f"VM {name!r} not found on {self.host}")
+        raise RuntimeError(f"No se encontró la VM {name!r} en {self.host}")
 
     def list_vms(self) -> list[dict]:
         from pyVmomi import vim
@@ -103,7 +103,7 @@ class VMwareSource(Source):
                 except Exception:
                     pass
             time.sleep(5)
-        raise RuntimeError(f"VM {name} did not power off in 5 minutes")
+        raise RuntimeError(f"La VM {name} no se apagó en 5 minutos")
 
     def fetch_disks(self, vm: VMInfo, dest: Path, progress) -> list[Path]:
         from pyVmomi import vim
@@ -112,7 +112,7 @@ class VMwareSource(Source):
         while lease.state == vim.HttpNfcLease.State.initializing:
             time.sleep(1)
         if lease.state == vim.HttpNfcLease.State.error:
-            raise RuntimeError(f"export lease failed: {lease.error}")
+            raise RuntimeError(f"Falló la exportación de la VM: {lease.error}")
         out = []
         try:
             cookie = self.si._stub.cookie
@@ -121,7 +121,7 @@ class VMwareSource(Source):
                 url = du.url.replace("*", self.host)
                 local = dest / f"{vm.name}-disk{i}.vmdk"
                 total = vm.disks[i].size_bytes if i < len(vm.disks) else None
-                cb = progress(f"download {local.name}")
+                cb = progress(f"descargar {local.name}")
                 done = 0
                 with requests.get(url, stream=True, verify=self.verify, headers={"Cookie": cookie}) as r:
                     r.raise_for_status()

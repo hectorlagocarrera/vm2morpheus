@@ -50,18 +50,18 @@ def run_powershell(script: str) -> str:
     r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
                        capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"PowerShell failed: {(r.stderr or r.stdout).strip()[-600:]}")
+        raise RuntimeError(f"Falló PowerShell: {(r.stderr or r.stdout).strip()[-600:]}")
     return r.stdout.strip()
 
 
 def run_dism(args: list[str]) -> None:
     r = subprocess.run(["dism", *args], capture_output=True, text=True)
     if r.returncode != 0:
-        raise RuntimeError(f"DISM failed ({r.returncode}): {(r.stdout + r.stderr).strip()[-600:]}")
+        raise RuntimeError(f"Falló DISM ({r.returncode}): {(r.stdout + r.stderr).strip()[-600:]}")
 
 
 ADMIN = ("if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent())"
-         ".IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'run vm2morpheus as Administrator' }")
+         ".IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'ejecuta vm2morpheus como administrador' }")
 
 
 def _mount_script(image: str, iso: str) -> str:
@@ -78,7 +78,7 @@ foreach ($p in Get-Partition -DiskNumber $disk.Number) {{
   if (-not $p.DriveLetter) {{ try {{ $p | Add-PartitionAccessPath -AssignDriveLetter }} catch {{}} ; $p = Get-Partition -DiskNumber $disk.Number -PartitionNumber $p.PartitionNumber }}
   if ($p.DriveLetter -and (Test-Path ($p.DriveLetter + ':\\Windows\\System32\\config\\SOFTWARE'))) {{ $win = $p.DriveLetter + ':\\'; break }}
 }}
-if (-not $win) {{ throw 'no Windows installation found on the disk' }}
+if (-not $win) {{ throw 'no se encontró ninguna instalación de Windows en el disco' }}
 reg load HKLM\\VM2M_SOFT ($win + 'Windows\\System32\\config\\SOFTWARE') | Out-Null
 $cv = Get-ItemProperty 'HKLM:\\VM2M_SOFT\\Microsoft\\Windows NT\\CurrentVersion'
 $build = [int]$cv.CurrentBuildNumber; $type = [string]$cv.InstallationType
@@ -96,7 +96,7 @@ def ensure_virtio_iso(path: str | None, progress=None) -> str:
     """Use the given ISO, or download the stable virtio-win ISO once and cache it."""
     if path:
         if not Path(path).is_file():
-            raise RuntimeError(f"virtio-win ISO not found: {path}")
+            raise RuntimeError(f"No se encuentra el ISO de virtio-win: {path}")
         return path
     if CACHED_ISO.is_file():
         return str(CACHED_ISO)
@@ -118,14 +118,14 @@ def ensure_virtio_iso(path: str | None, progress=None) -> str:
 def inject_virtio_windows(disk: Path, iso: str, log=print, ps=run_powershell, dism=run_dism) -> list[str]:
     """Add the VirtIO drivers found on the ISO to the Windows installed on `disk`. Returns the driver names added."""
     if os.name != "nt" and ps is run_powershell:
-        raise RuntimeError("driver injection with DISM only works on Windows")
+        raise RuntimeError("La inyección de drivers con DISM solo funciona en Windows")
     image = str(Path(disk).resolve())
     try:
         info = json.loads(ps(_mount_script(image, iso)))
         folder = os_folder(int(info["build"]), info["type"])
         if not folder:
-            raise RuntimeError(f"unsupported Windows build {info['build']} ({info['type']}) for VirtIO drivers")
-        log(f"Windows build {info['build']} ({info['type']}): using virtio-win folder {folder!r}")
+            raise RuntimeError(f"Versión de Windows no soportada para los drivers VirtIO: build {info['build']} ({info['type']})")
+        log(f"Windows build {info['build']} ({info['type']}): se usa la carpeta {folder!r} de virtio-win")
         added = []
         for name in DRIVERS:
             d = Path(info["iso"]) / name / folder / "amd64"
@@ -133,7 +133,7 @@ def inject_virtio_windows(disk: Path, iso: str, log=print, ps=run_powershell, di
                 dism([f"/Image:{info['win']}", "/Add-Driver", f"/Driver:{d}", "/Recurse"])
                 added.append(name)
         if "viostor" not in added:
-            raise RuntimeError(f"viostor driver not found on the ISO for {folder}; wrong or incomplete virtio-win ISO")
+            raise RuntimeError(f"No se encuentra el driver viostor en el ISO para {folder}: ISO de virtio-win incorrecto o incompleto")
         return added
     finally:
         ps(_dismount_script(image, iso))

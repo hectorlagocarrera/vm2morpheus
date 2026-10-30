@@ -98,9 +98,9 @@ class MorpheusClient:
             if status in ("active", "ready"):
                 return img
             if status in ("failed", "error"):
-                raise MorpheusError(f"image {image_id} entered status {img.get('status')!r}")
+                raise MorpheusError(f"La imagen {image_id} pasó al estado {img.get('status')!r}")
             if time.monotonic() > deadline:
-                raise MorpheusError(f"image {image_id} not ready after {timeout}s (status {status!r})")
+                raise MorpheusError(f"La imagen {image_id} no está lista tras {timeout}s (estado {status!r})")
             time.sleep(poll)
 
     # --- instances -------------------------------------------------------
@@ -159,8 +159,8 @@ def payload_from_reference(ref: dict, name: str, old_image_id: int | None, new_i
     if uefi is not None and "uefi" in config:
         config["uefi"] = uefi
     if not swapped:
-        raise MorpheusError(f"image id {old_image_id or '(any)'} not found in the reference instance config; "
-                            "check the reference instance / image ID")
+        raise MorpheusError(f"No se encontró el id de imagen {old_image_id or '(cualquiera)'} en la configuración de la "
+                            "instancia de referencia; revisa la instancia o el ID de la imagen")
     payload = {
         "zoneId": ref["cloud"]["id"],
         "instance": {
