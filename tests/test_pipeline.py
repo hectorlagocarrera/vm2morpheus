@@ -501,3 +501,20 @@ def test_pick_workdir_and_auto_workdir_is_remembered(tmp_path, monkeypatch):
     settings.save({"vm": "x"})  # the form is saved on every action; the auto folder must survive it
     assert gui.resolve_workdir({"workdir": ""}) == first
     assert gui.resolve_workdir({"workdir": "D:\\\\mine"}) == "D:\\\\mine"
+
+
+def test_driver_injection_without_admin_fails_before_any_work(tmp_path, monkeypatch):
+    from vm2morpheus import pipeline
+    monkeypatch.setattr(pipeline, "_is_windows", lambda: True)
+    monkeypatch.setattr(pipeline, "is_admin", lambda: False)
+
+    class Win(FakeSource):
+        def get_vm(self, name):
+            vm = super().get_vm(name)
+            vm.os_family, vm.power_state = "windows", "off"
+            return vm
+
+    with pytest.raises(RuntimeError, match="administrator"):
+        migrate(Win(tmp_path / "x"), MorpheusClient("http://x", "t"), "vm1",
+                {"workdir": str(tmp_path / "w11"), "inject_drivers": True}, {}, log=lambda *_: None)
+    assert not (tmp_path / "w11" / "vm1").exists()  # nothing was created or downloaded

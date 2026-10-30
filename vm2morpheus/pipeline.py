@@ -5,7 +5,7 @@ from pathlib import Path
 
 from .bundle import build_bundle, disk_file_name
 from .convert import convert_disk, inject_drivers
-from .drivers_windows import ensure_virtio_iso, inject_virtio_windows
+from .drivers_windows import ensure_virtio_iso, inject_virtio_windows, is_admin
 from .morpheus import MorpheusClient, MorpheusError, payload_from_reference, render_template
 from .sources.base import Source
 from .util import CancelledError, Progress, human, redact
@@ -58,6 +58,9 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         problems.append("VM has snapshots/checkpoints; consolidate them first")
     if not vm.disks:
         problems.append("VM has no disks")
+    if windows_inject and not is_admin():
+        problems.append("driver injection needs administrator rights: close the program and start it with "
+                        "right click > Run as administrator (or untick the drivers option)")
     if vm.power_state == "on" and not opts.get("shutdown_source"):
         problems.append("VM is running; pass --shutdown to power it off (consistent copy)")
     workdir = Path(opts.get("workdir", "/var/tmp/vm2morpheus")).resolve() / vm.name

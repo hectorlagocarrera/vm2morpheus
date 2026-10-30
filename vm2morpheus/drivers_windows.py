@@ -34,6 +34,14 @@ def os_folder(build: int, installation_type: str) -> str | None:
     return "w11" if build >= 22000 else None
 
 
+def is_admin() -> bool:
+    try:
+        import ctypes
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except (AttributeError, OSError):
+        return False
+
+
 def ps_quote(s: str) -> str:
     return "'" + str(s).replace("'", "''") + "'"
 
