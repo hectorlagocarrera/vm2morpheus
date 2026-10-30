@@ -136,3 +136,19 @@ def test_direct_source_disk_is_never_deleted(tmp_path):
     srv.shutdown()
     assert disk.exists()
     assert FakeMorpheus.uploads[7][:4] == b"QFI\xfb"
+
+
+def test_stale_state_is_discarded_when_image_missing_in_morpheus(tmp_path):
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    wd = tmp_path / "w" / "vm1"
+    wd.mkdir(parents=True)
+    (wd / "state.json").write_text(json.dumps({"done": ["fetch", "convert", "drivers", "upload", "instance"],
+                                               "images": [{"id": 99, "name": "vm1"}]}))
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    client = MorpheusClient(f"http://127.0.0.1:{srv.server_port}", "tok")
+    res = migrate(FakeSource(disk), client, "vm1", {"workdir": str(tmp_path / "w"), "shutdown_source": True},
+                  {"image_type": "qcow2"}, log=lambda *_: None)
+    srv.shutdown()
+    assert res["images"] == [{"id": 7, "name": "vm1"}]

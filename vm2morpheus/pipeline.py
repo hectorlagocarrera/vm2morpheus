@@ -61,6 +61,10 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
 
     workdir.mkdir(parents=True, exist_ok=True)
     st = State(workdir / "state.json")
+    if st.done("upload") and not all(morpheus.image_exists(i["id"]) for i in st.d.get("images", [])):
+        log("the saved progress says the image was uploaded, but it is not in this Morpheus: starting from scratch")
+        st.path.unlink(missing_ok=True)
+        st = State(st.path)
     skipped = [x for x in STEPS if st.done(x)]
     if skipped:
         log(f"resuming from {st.path}: already done: {', '.join(skipped)}")

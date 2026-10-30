@@ -78,6 +78,15 @@ class MorpheusClient:
         finally:
             reader.close()
 
+    def image_exists(self, image_id: int) -> bool:
+        try:
+            self._req("GET", f"/api/virtual-images/{image_id}")
+            return True
+        except MorpheusError as e:
+            if " 404:" in str(e):
+                return False
+            raise
+
     def wait_image_ready(self, image_id: int, timeout: int = 3600, poll: float = 5.0) -> dict:
         deadline = time.monotonic() + timeout
         while True:
