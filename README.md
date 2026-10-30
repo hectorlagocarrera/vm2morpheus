@@ -40,3 +40,12 @@ Tested: pipeline, convert (real qemu-img), upload and instance creation against 
 - no live/incremental P2V: physical machines must be captured first (Disk2vhd / dd) and passed as a disk.
 
 Requires `qemu-img` (qemu-utils). Optional extras: `pip install -e '.[all]'`.
+
+
+## Antivirus
+
+The Windows build is an unsigned PyInstaller program that mounts disks, runs PowerShell/DISM and needs
+administrator rights, so some antivirus products flag it heuristically. To check it is the file GitHub built,
+compare its SHA-256 with `SHA256.txt` (shipped in the zip) and with the "Bundle qemu-img ... SHA-256" step of the
+workflow log. A code-signing certificate, or an allow-list entry in the corporate antivirus by hash/path, is the
+real fix; submitting the file as a false positive to the vendor helps too.

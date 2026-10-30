@@ -11,20 +11,27 @@ jobs:
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
       - run: pip install -e ".[all]" pyinstaller
+      # One folder instead of --onefile: the single-file build unpacks itself into %TEMP% at every start, which
+      # is what antivirus heuristics dislike most.
       - run: >
-          pyinstaller --onefile --noconsole --name vm2morpheus
+          pyinstaller --noconsole --name vm2morpheus
           --collect-all pyVmomi --collect-all smbprotocol --collect-all winrm
           --collect-all webview --collect-all pythonnet --collect-all clr_loader
           --hidden-import smbclient exe_entry.py
-      - name: Bundle qemu-img next to the exe
+      - name: Bundle qemu-img next to the exe and record SHA-256 hashes
         shell: pwsh
         run: |
           choco install qemu -y --no-progress
           $q = "C:\Program Files\qemu"
-          New-Item -ItemType Directory dist\qemu | Out-Null
-          Copy-Item "$q\qemu-img.exe" dist\qemu\
-          Copy-Item "$q\*.dll" dist\qemu\
-          Copy-Item README.md, config.example.yaml dist\
-          Compress-Archive -Path dist\* -DestinationPath vm2morpheus-windows.zip
+          $app = "dist\vm2morpheus"
+          New-Item -ItemType Directory "$app\qemu" | Out-Null
+          Copy-Item "$q\qemu-img.exe" "$app\qemu\"
+          Copy-Item "$q\*.dll" "$app\qemu\"
+          Copy-Item README.md, config.example.yaml $app
+          $hashes = Get-ChildItem "$app\vm2morpheus.exe", "$app\qemu\qemu-img.exe" |
+            Get-FileHash -Algorithm SHA256 | ForEach-Object { "$($_.Hash)  $(Split-Path $_.Path -Leaf)" }
+          $hashes | Set-Content "$app\SHA256.txt" -Encoding ascii
+          $hashes | ForEach-Object { Write-Host $_ }   # also visible in this job's log
+          Compress-Archive -Path "$app\*" -DestinationPath vm2morpheus-windows.zip
       - uses: actions/upload-artifact@v4
         with: { name: vm2morpheus-windows, path: vm2morpheus-windows.zip }
