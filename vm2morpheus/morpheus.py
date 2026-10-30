@@ -127,7 +127,8 @@ def render_template(obj, values: dict):
 
 
 def payload_from_reference(ref: dict, name: str, old_image_id: int, new_image_id: int,
-                           root_gb: int | None = None, extra_gb: list[int] | None = None) -> dict:
+                           root_gb: int | None = None, extra_gb: list[int] | None = None,
+                           omit_volumes: bool = False) -> dict:
     """Build POST /api/instances from an instance created by hand in the UI, swapping its image.
 
     Only values under keys that mention "image" are swapped (so an unrelated number that happens to
@@ -161,7 +162,7 @@ def payload_from_reference(ref: dict, name: str, old_image_id: int, new_image_id
         "config": config,
     }
     volumes = []
-    for v in ref.get("volumes") or []:
+    for v in [] if omit_volumes else (ref.get("volumes") or []):
         nv = {"id": -1, "name": v.get("name"), "rootVolume": bool(v.get("rootVolume")), "size": v.get("size")}
         st = (v.get("type") or v.get("storageType"))
         if isinstance(st, dict) and st.get("id") is not None:

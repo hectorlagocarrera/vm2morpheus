@@ -2,6 +2,7 @@ import json
 import shutil
 from pathlib import Path
 
+from .bundle import build_bundle, disk_file_name
 from .convert import convert_disk, inject_drivers
 from .morpheus import MorpheusClient, payload_from_reference, render_template
 from .sources.base import Source
@@ -73,6 +74,8 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                 + ", ".join(f"{i['name']} (id {i['id']})" for i in st.d.get("images", [])))
             log(f"to migrate this VM again from scratch, delete {st.path}")
 
+    bundle = bool(opts.get("multi_disk_bundle", True)) and len(vm.disks) > 1
+
     if not st.done("fetch"):
         if vm.power_state == "on":
             log("powering off source VM ...")
@@ -85,8 +88,8 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         log(f"converting to {fmt} ...")
         out = []
         source.ensure_access([Path(p) for p in st.d["fetched"]])
-        for src in map(Path, st.d["fetched"]):
-            dst = workdir / f"{src.stem}.{fmt}"
+        for i, src in enumerate(map(Path, st.d["fetched"])):
+            dst = workdir / (disk_file_name(vm.name, i) if bundle else f"{src.stem}.{fmt}")
             bar = Progress(f"convert {src.name}", percent=True)
             convert_disk(src, dst, fmt, bar)
             bar.finish()
@@ -103,22 +106,35 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         st.mark("drivers")
 
     if not st.done("upload"):
-        images = []
-        for i, f in enumerate(map(Path, st.d["converted"])):
-            name = f"{vm.name}" if i == 0 else f"{vm.name}-disk{i}"
+        def publish(path: Path, name: str) -> dict:
             log(f"creating Morpheus image {name!r} ...")
             img = morpheus.create_virtual_image(
                 name, mcfg.get("image_type", fmt), os_type=mcfg.get("os_type"),
                 uefi=vm.firmware == "uefi", storage_provider_id=mcfg.get("storage_provider_id"),
                 extra=mcfg.get("image_extra"))
-            bar = Progress(f"upload {f.name}")
-            morpheus.upload_image(img["id"], f, bar)
+            bar = Progress(f"upload {path.name}")
+            morpheus.upload_image(img["id"], path, bar)
             bar.finish()
             morpheus.wait_image_ready(img["id"])
-            images.append({"id": img["id"], "name": name})
+            return {"id": img["id"], "name": name}
+
+        converted = [Path(p) for p in st.d["converted"]]
+        images = []
+        if bundle:
+            log(f"packing {len(converted)} disks into one multi-disk image (zip + metadata.json) ...")
+            zip_path = workdir / f"{vm.name}.zip"
+            build_bundle(vm.name, [(f, d.size_bytes) for f, d in zip(converted, vm.disks)], zip_path)
+            images.append(publish(zip_path, vm.name))
             if not opts.get("keep_files"):
-                f.unlink(missing_ok=True)
-        st.mark("upload", images=images)
+                zip_path.unlink(missing_ok=True)
+                for f in converted:
+                    f.unlink(missing_ok=True)
+        else:
+            for i, f in enumerate(converted):
+                images.append(publish(f, vm.name if i == 0 else f"{vm.name}-disk{i}"))
+                if not opts.get("keep_files"):
+                    f.unlink(missing_ok=True)
+        st.mark("upload", images=images, bundle=bundle)
 
     result = {"images": st.d["images"]}
     if not st.done("instance"):
@@ -127,10 +143,14 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         if refcfg:
             ref = morpheus.get_instance(refcfg["instance_id"])
             root_gb = -(-vm.disks[0].size_bytes // 2**30)
-            extra_gb = [-(-d.size_bytes // 2**30) for d in vm.disks[1:]]
+            in_bundle = st.d.get("bundle", False)  # the image already carries every disk
+            extra_gb = [] if in_bundle else [-(-d.size_bytes // 2**30) for d in vm.disks[1:]]
             payload = payload_from_reference(ref, vm.name, int(refcfg["image_id"]),
-                                             st.d["images"][0]["id"], root_gb, extra_gb)
-            if extra_gb:
+                                             st.d["images"][0]["id"], root_gb, extra_gb,
+                                             omit_volumes=in_bundle)
+            if in_bundle:
+                log("disks are taken from the multi-disk image")
+            elif extra_gb:
                 log(f"note: {len(extra_gb)} extra disk(s) are added as BLANK volumes; their data was uploaded "
                     "as separate images but is not attached")
             log("creating Morpheus instance (cloned from the reference instance) ...")

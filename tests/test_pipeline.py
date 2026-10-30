@@ -186,3 +186,41 @@ def test_reference_payload_adds_blank_extra_volumes():
     p = payload_from_reference(ref, "vm1", 3, 7, root_gb=110, extra_gb=[100])
     assert p["volumes"][0]["size"] == 110
     assert p["volumes"][1] == {"id": -1, "name": "data1", "rootVolume": False, "size": 100, "storageType": 9}
+
+
+def test_two_disks_are_bundled_with_metadata_json(tmp_path):
+    import io
+    import zipfile
+    d0, d1 = tmp_path / "a.vmdk", tmp_path / "b.vmdk"
+    for d, size in ((d0, "8M"), (d1, "4M")):
+        subprocess.run(["qemu-img", "create", "-f", "vmdk", str(d), size], check=True, capture_output=True)
+
+    class Two(FakeSource):
+        def get_vm(self, name):
+            return VMInfo(name, 2, 2048, "bios", "windows", "off",
+                          [DiskInfo("a.vmdk", 8 << 20, "x"), DiskInfo("b.vmdk", 4 << 20, "y")])
+
+        def fetch_disks(self, vm, dest, progress):
+            out = []
+            for src in (d0, d1):
+                shutil.copy(src, dest / src.name)
+                out.append(dest / src.name)
+            return out
+
+    FakeMorpheus.log.clear()
+    FakeMorpheus.uploads.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    client = MorpheusClient(f"http://127.0.0.1:{srv.server_port}", "tok")
+    migrate(Two(d0), client, "vm1", {"workdir": str(tmp_path / "w3")}, {"image_type": "qcow2",
+            "reference_instance": {"instance_id": 5, "image_id": 3}}, log=lambda *_: None)
+    srv.shutdown()
+    z = zipfile.ZipFile(io.BytesIO(FakeMorpheus.uploads[7]))
+    assert sorted(z.namelist()) == ["metadata.json", "vm1-sda", "vm1-sdb"]
+    meta = json.loads(z.read("metadata.json"))
+    assert meta["disks"] == [
+        {"capacity": 8 << 20, "guestDeviceName": "sda", "position": 0, "name": "root", "file": "vm1-sda"},
+        {"capacity": 4 << 20, "guestDeviceName": "sdb", "position": 1, "name": "data", "file": "vm1-sdb"}]
+    assert z.read("vm1-sda")[:4] == b"QFI\xfb" and z.read("vm1-sdb")[:4] == b"QFI\xfb"
+    inst = dict(FakeMorpheus.log)["instance"]
+    assert "volumes" not in inst  # volumes come from the image metadata
