@@ -61,6 +61,13 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
 
     workdir.mkdir(parents=True, exist_ok=True)
     st = State(workdir / "state.json")
+    skipped = [x for x in STEPS if st.done(x)]
+    if skipped:
+        log(f"resuming from {st.path}: already done: {', '.join(skipped)}")
+        if len(skipped) == len(STEPS):
+            log("everything was already completed in a previous run. Images in Morpheus: "
+                + ", ".join(f"{i['name']} (id {i['id']})" for i in st.d.get("images", [])))
+            log(f"to migrate this VM again from scratch, delete {st.path}")
 
     if not st.done("fetch"):
         if vm.power_state == "on":
