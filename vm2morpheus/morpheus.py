@@ -129,7 +129,7 @@ def render_template(obj, values: dict):
 def payload_from_reference(ref: dict, name: str, old_image_id: int | None, new_image_id: int,
                            root_gb: int | None = None, extra_gb: list[int] | None = None,
                            root_only: bool = False, uefi: bool | None = None,
-                           extra_name: str | None = None) -> dict:
+                           extra_name: str | None = None, boot_sata: bool = False) -> dict:
     """Build POST /api/instances from an instance created by hand in the UI, swapping its image.
 
     Only values under keys that mention "image" are swapped (so an unrelated number that happens to
@@ -184,6 +184,8 @@ def payload_from_reference(ref: dict, name: str, old_image_id: int | None, new_i
             nv["size"] = max(int(nv["size"] or 0), root_gb)  # the root disk must hold the migrated image
         volumes.append(nv)
     root = next((v for v in volumes if v["rootVolume"]), None)
+    if boot_sata and root:
+        root["controllerMountPoint"] = sata_mount_point(ref)
     for i, gb in enumerate(extra_gb or [], start=1):  # blank data disks sized like the source's extra disks
         nv = {"id": -1, "name": extra_name or f"data{i}", "rootVolume": False, "size": gb}
         for k in ("storageType", "datastoreId"):
@@ -200,3 +202,12 @@ def payload_from_reference(ref: dict, name: str, old_image_id: int | None, new_i
     if nics:
         payload["networkInterfaces"] = nics
     return payload
+
+
+def sata_mount_point(ref: dict) -> str:
+    """controllerMountPoint ("controllerId:bus:controllerTypeId:unit", as seen on a real HVM volume) for the SATA
+    controller. Uses the reference instance's SATA controller when it lists one; otherwise a placeholder id."""
+    for c in ref.get("controllers") or []:
+        if (c.get("type") or {}).get("code") == "kvm-sata":
+            return f"{c['id']}:{c.get('busNumber', 0)}:{c['type']['id']}:0"
+    return "-1:0:8:0"  # 8 = id of the "kvm-sata" controller type on the observed Morpheus; -1 = not created yet

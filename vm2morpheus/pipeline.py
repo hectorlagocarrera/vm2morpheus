@@ -149,24 +149,37 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             root_gb = -(-vm.disks[0].size_bytes // 2**30)
             in_bundle = st.d.get("bundle", False)  # one image carrying every disk (names match metadata.json)
             extra_gb = [-(-d.size_bytes // 2**30) for d in vm.disks[1:]]
-            try:
-                payload = payload_from_reference(ref, vm.name,
-                                                 int(refcfg["image_id"]) if refcfg.get("image_id") else None,
-                                                 st.d["images"][0]["id"], root_gb, extra_gb,
-                                                 uefi=vm.firmware == "uefi",
-                                                 extra_name="data" if in_bundle else None)
-            except MorpheusError:
-                dump = workdir / "reference-instance.json"
-                dump.write_text(json.dumps(redact(ref), indent=2, ensure_ascii=False), encoding="utf-8")
-                log(f"saved the reference instance (credentials hidden) to {dump}")
-                raise
+            want_sata = bool(opts.get("boot_sata", True))
+
+            def build(boot_sata: bool) -> dict:
+                try:
+                    return payload_from_reference(
+                        ref, vm.name, int(refcfg["image_id"]) if refcfg.get("image_id") else None,
+                        st.d["images"][0]["id"], root_gb, extra_gb, uefi=vm.firmware == "uefi",
+                        extra_name="data" if in_bundle else None, boot_sata=boot_sata)
+                except MorpheusError:
+                    dump = workdir / "reference-instance.json"
+                    dump.write_text(json.dumps(redact(ref), indent=2, ensure_ascii=False), encoding="utf-8")
+                    log(f"saved the reference instance (credentials hidden) to {dump}")
+                    raise
+
             if extra_gb and not in_bundle:
                 log(f"note: {len(extra_gb)} extra disk(s) are added as BLANK volumes; their data was uploaded "
                     "as separate images but is not attached")
             elif extra_gb:
                 log(f"adding {len(extra_gb)} data volume(s) matching the multi-disk image")
+            log("note: no guest drivers are installed. The boot disk is requested on a SATA controller so "
+                "Windows can boot without VirtIO drivers" if want_sata else
+                "note: no guest drivers are installed; a Windows guest needs VirtIO drivers to boot from VirtIO")
             log("creating Morpheus instance (cloned from the reference instance) ...")
-            inst = morpheus.create_instance(payload)
+            try:
+                inst = morpheus.create_instance(build(want_sata))
+            except MorpheusError as e:
+                if not want_sata or " 400:" not in str(e):
+                    raise
+                log(f"Morpheus rejected the SATA controller request ({e}); retrying without it. "
+                    "Change the boot disk to SATA by hand if Windows does not boot.")
+                inst = morpheus.create_instance(build(False))
             st.mark("instance", instance={"id": inst.get("id"), "name": inst.get("name")})
         elif template:
             vals = {"image_id": st.d["images"][0]["id"], "image_name": st.d["images"][0]["name"],

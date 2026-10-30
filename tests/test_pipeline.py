@@ -17,6 +17,7 @@ pytestmark = pytest.mark.skipif(not shutil.which("qemu-img"), reason="qemu-img m
 class FakeMorpheus(BaseHTTPRequestHandler):
     log = []
     uploads = {}
+    reject_sata = False
 
     def _send(self, obj, code=200):
         b = json.dumps(obj).encode()
@@ -39,7 +40,10 @@ class FakeMorpheus(BaseHTTPRequestHandler):
             self.uploads[7] = body
             return self._send({"success": True})
         if self.path == "/api/instances":
-            self.log.append(("instance", json.loads(body)))
+            sent = json.loads(body)
+            if self.reject_sata and any("controllerMountPoint" in v for v in sent.get("volumes", [])):
+                return self._send({"success": False, "msg": "bad controller"}, 400)
+            self.log.append(("instance", sent))
             return self._send({"success": True, "instance": {"id": 42, "name": "vm1"}})
         self._send({"success": False, "msg": "nope"}, 404)
 
@@ -286,3 +290,47 @@ def test_hyperv_list_vms_handles_single_and_many_results():
     assert [v["name"] for v in h.list_vms()] == ["A", "b"]
     h._ps = lambda script: ""
     assert h.list_vms() == []
+
+
+def _run_with_reference(tmp_path, name, opts_extra=None):
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    FakeMorpheus.log.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    client = MorpheusClient(f"http://127.0.0.1:{srv.server_port}", "tok")
+    msgs = []
+    migrate(FakeSource(disk), client, "vm1", {"workdir": str(tmp_path / name), "shutdown_source": True,
+                                              **(opts_extra or {})},
+            {"image_type": "qcow2", "reference_instance": {"instance_id": 5, "image_id": 3}}, log=msgs.append)
+    srv.shutdown()
+    return dict(FakeMorpheus.log)["instance"], msgs
+
+
+def test_boot_disk_requested_on_sata_by_default(tmp_path):
+    FakeMorpheus.reject_sata = False
+    inst, _ = _run_with_reference(tmp_path, "w5")
+    assert inst["volumes"][0]["controllerMountPoint"] == "-1:0:8:0"
+
+
+def test_sata_rejected_by_morpheus_retries_without_it(tmp_path):
+    FakeMorpheus.reject_sata = True
+    try:
+        inst, msgs = _run_with_reference(tmp_path, "w6")
+    finally:
+        FakeMorpheus.reject_sata = False
+    assert "controllerMountPoint" not in inst["volumes"][0]
+    assert any("retrying without it" in m for m in msgs)
+
+
+def test_sata_can_be_turned_off(tmp_path):
+    FakeMorpheus.reject_sata = False
+    inst, _ = _run_with_reference(tmp_path, "w7", {"boot_sata": False})
+    assert "controllerMountPoint" not in inst["volumes"][0]
+
+
+def test_sata_mount_point_uses_reference_controller():
+    from vm2morpheus.morpheus import sata_mount_point
+    ref = {"controllers": [{"id": 172, "busNumber": "0", "type": {"id": 9, "code": "kvm-virtio-blk"}},
+                           {"id": 173, "busNumber": "0", "type": {"id": 8, "code": "kvm-sata"}}]}
+    assert sata_mount_point(ref) == "173:0:8:0"
