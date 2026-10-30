@@ -103,11 +103,17 @@ def test_refuses_running_vm_without_shutdown(tmp_path):
         migrate(src, MorpheusClient("http://x", "t"), "vm1", {"workdir": str(tmp_path)}, {}, log=lambda *_: None)
 
 
-def test_gui_template_and_job_log():
-    from vm2morpheus.gui import JobLog, build_instance_template
-    assert build_instance_template({"layout_id": ""}) is None
-    t = build_instance_template({"cloud_id": "1", "group_id": "2", "plan_id": "3", "layout_id": "4", "network_id": "5"})
-    assert t["instance"]["layout"] == {"id": 4} and t["networkInterfaces"][0]["network"]["id"] == "5"
+def test_gui_synthetic_reference_builds_hvm_payload():
+    from vm2morpheus.gui import JobLog, synthetic_reference
+    from vm2morpheus.morpheus import payload_from_reference
+    f = {"cloud_id": "1", "group_id": "2", "plan_id": "3", "layout_id": "32", "network_id": "5",
+         "resource_pool": "pool-9"}
+    p = payload_from_reference(synthetic_reference(f), "vm1", None, 77, root_gb=110, extra_gb=[100], uefi=False)
+    assert p["zoneId"] == 1 and p["instance"]["layout"] == {"id": 32}
+    assert p["instance"]["instanceType"] == {"code": "mvm"}
+    assert p["config"]["imageId"] == 77 and p["config"]["resourcePoolId"] == "pool-9"
+    assert p["networkInterfaces"] == [{"network": {"id": "network-5"}}]
+    assert [v["size"] for v in p["volumes"]] == [110, 100] and p["volumes"][0]["datastoreId"] == "auto"
     jl = JobLog()
     jl.write("a\n\rp 10%\rp 50%")
     assert jl.text() == "a\np 50%"

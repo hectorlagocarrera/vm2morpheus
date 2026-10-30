@@ -145,7 +145,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         template = mcfg.get("instance")
         refcfg = mcfg.get("reference_instance")
         if refcfg:
-            ref = morpheus.get_instance(refcfg["instance_id"])
+            ref = refcfg["synthetic"] if "synthetic" in refcfg else morpheus.get_instance(refcfg["instance_id"])
             root_gb = -(-vm.disks[0].size_bytes // 2**30)
             in_bundle = st.d.get("bundle", False)  # one image carrying every disk (names match metadata.json)
             extra_gb = [-(-d.size_bytes // 2**30) for d in vm.disks[1:]]

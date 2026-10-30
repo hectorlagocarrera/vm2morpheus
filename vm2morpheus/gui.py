@@ -42,24 +42,22 @@ class JobLog:
         return "\n".join(self.lines + ([self.cur] if self.cur.strip() else []))
 
 
-def build_instance_template(f: dict) -> dict | None:
-    """Payload for POST /api/instances from the form fields. UNVERIFIED against a live appliance."""
-    if not f.get("layout_id"):
-        return None
-    payload = {
-        "zoneId": int(f["cloud_id"]),
-        "instance": {
-            "name": "{vm_name}",
-            "site": {"id": int(f["group_id"])},
-            "instanceType": {"code": f.get("instance_type", "ubuntu")},
-            "layout": {"id": int(f["layout_id"])},
-            "plan": {"id": int(f["plan_id"])},
-        },
-        "config": {},
+def synthetic_reference(f: dict) -> dict:
+    """An instance description shaped like what GET /api/instances/{id} returns for an HVM VM,
+    built from the form so no hand-made reference instance is needed. Defaults (storageType 1,
+    datastore "auto", poolProviderType "mvm") were taken from a real HVM instance of Morpheus."""
+    net = f.get("network_id")
+    return {
+        "cloud": {"id": int(f["cloud_id"])},
+        "group": {"id": int(f["group_id"])},
+        "instanceType": {"code": f.get("instance_type") or "mvm"},
+        "layout": {"id": int(f["layout_id"])},
+        "plan": {"id": int(f["plan_id"])},
+        "config": {"imageId": None, "resourcePoolId": f.get("resource_pool") or "pool-1",
+                   "poolProviderType": "mvm", "layoutSize": 1, "createUser": False, "uefi": False},
+        "volumes": [{"name": "root", "rootVolume": True, "size": 1, "storageType": 1, "datastoreId": "auto"}],
+        "interfaces": [{"id": f"network-{net}", "network": {"id": int(net)}}] if net else [],
     }
-    if f.get("network_id"):
-        payload["networkInterfaces"] = [{"network": {"id": str(f["network_id"])}}]
-    return payload
 
 
 def make_cfgs(f: dict):
@@ -73,12 +71,11 @@ def make_cfgs(f: dict):
            "verify_ssl": False, "direct_read": bool(f.get("direct_read"))}
     m = {"url": f["morpheus_url"], "token": f["morpheus_token"], "verify_ssl": bool(f.get("verify_ssl")),
          "image_type": f.get("image_type") or "qcow2"}
-    tpl = build_instance_template(f)
     if f.get("ref_instance_id"):
         m["reference_instance"] = {"instance_id": int(f["ref_instance_id"]),
                                    "image_id": int(f["ref_image_id"]) if f.get("ref_image_id") else None}
-    elif tpl:
-        m["instance"] = tpl
+    elif f.get("layout_id"):
+        m["reference_instance"] = {"synthetic": synthetic_reference(f)}
     opts = {"workdir": f.get("workdir") or "vm2morpheus-work", "shutdown_source": bool(f.get("shutdown")),
             "inject_drivers": bool(f.get("inject_drivers")), "keep_files": False, "multi_disk_bundle": bool(f.get("multi_disk_bundle")),
             "recreate_instance": bool(f.get("recreate_instance"))}
@@ -140,7 +137,21 @@ class Handler(BaseHTTPRequestHandler):
                 c = MorpheusClient(f["morpheus_url"], f["morpheus_token"], verify=bool(f.get("verify_ssl")))
                 zone = f.get("cloud_id")
                 plans = c._req("GET", "/api/service-plans", params={"max": 200, **({"zoneId": zone} if zone else {})})
+                def best_effort(fn):
+                    try:
+                        return fn()
+                    except Exception:
+                        return []  # endpoint not available in this version: the user can type the value
+
+                layouts = best_effort(lambda: [
+                    (l["id"], l.get("name", ""))
+                    for t in c._req("GET", "/api/library/instance-types", params={"code": "mvm"}).get("instanceTypes", [])
+                    for l in t.get("instanceTypeLayouts", [])])
+                pools = best_effort(lambda: [
+                    (f"pool-{p['id']}", p.get("name", "")) for p in
+                    c._req("GET", f"/api/zones/{zone}/resource-pools").get("resourcePools", [])] if zone else [])
                 return self._json({
+                    "layouts": layouts, "pools": pools,
                     "clouds": [(z["id"], z["name"]) for z in c.clouds()],
                     "groups": [(g["id"], g["name"]) for g in c._req("GET", "/api/groups", params={"max": 200}).get("groups", [])],
                     "plans": [(p["id"], p["name"]) for p in plans.get("servicePlans", [])],
@@ -218,10 +229,10 @@ small{color:#5d6b7b}
 <div class="row"><div><label>Instancia de referencia (pulsa "Cargar" arriba)</label><select id="ref_instance_id"><option value="">(ninguna: solo subir la imagen)</option></select></div>
 <div><label>ID de su imagen <small>(opcional; se detecta sola)</small></label><input id="ref_image_id"></div></div>
 <button class="sec" onclick="refinfo()">Ver instancia de referencia (JSON)</button>
-<details><summary><small>Alternativa avanzada: layout manual</small></summary>
+<details open><summary><small>Sin instancia de referencia: crear desde cero (rellena nube, grupo, plan, red y layout)</small></summary>
 <div class="row"><div><label>Nube</label><select id="cloud_id"></select></div><div><label>Grupo</label><select id="group_id"></select></div>
 <div><label>Plan</label><select id="plan_id"></select></div><div><label>Red</label><select id="network_id"></select></div>
-<div><label>Instance type (código)</label><input id="instance_type" value="ubuntu"></div><div><label>Layout ID</label><input id="layout_id"></div></div></details></fieldset>
+<div><label>Instance type (código)</label><input id="instance_type" value="mvm"></div><div><label>Layout ID <small>(HVM: "Single HVM")</small></label><input id="layout_id" list="layouts"><datalist id="layouts"></datalist></div><div><label>Resource pool</label><input id="resource_pool" list="pools" placeholder="pool-1"><datalist id="pools"></datalist></div></div></details></fieldset>
 <fieldset><legend>4. Opciones</legend><div class="chk">
 <label><input type="checkbox" id="shutdown"> Apagar la VM de origen</label>
 <label><input type="checkbox" id="multi_disk_bundle" checked> Varios discos en una sola imagen (zip + metadata.json)</label>
@@ -232,7 +243,7 @@ small{color:#5d6b7b}
 <button onclick="run('/dryrun')" class="sec">Simulación</button><button onclick="run('/migrate')">Migrar</button>
 <pre id="log">Listo.</pre></main>
 <script>
-const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","ref_instance_id","ref_image_id","workdir"];
+const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","ref_instance_id","ref_image_id","workdir"];
 const chks=["verify_ssl","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers"];
 const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);return o};
 const show=t=>document.getElementById("log").textContent=t;
@@ -242,7 +253,8 @@ async function refinfo(){try{show(JSON.stringify(await post("/refinfo",form()),n
 async function lookups(){try{const j=await post("/lookups",form());
  for(const [k,id] of [["clouds","cloud_id"],["groups","group_id"],["plans","plan_id"],["networks","network_id"],["instances","ref_instance_id"]]){
   const s=document.getElementById(id);s.innerHTML=(id=="network_id"||id=="ref_instance_id"?'<option value="">(ninguna)</option>':'')+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("")}
- show("Datos cargados.")}catch(e){show("ERROR: "+e.message)}}
+  for(const [k,id] of [["layouts","layouts"],["pools","pools"]]){document.getElementById(id).innerHTML=j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("")}
+ show("Datos cargados."+(j.layouts.length?"":" (layouts no detectados: escribe el ID a mano)"))}catch(e){show("ERROR: "+e.message)}}
 async function run(p){try{const {job}=await post(p,form());show("Trabajo "+job+" en marcha...");
  const t=setInterval(async()=>{const r=await (await fetch("/job/"+job)).json();show(r.log||"...");if(r.status!=="running")clearInterval(t)},1000)}catch(e){show("ERROR: "+e.message)}}
 </script></html>"""
