@@ -576,3 +576,29 @@ def test_pipeline_reports_monotonic_progress_ending_at_100(tmp_path):
     assert overall == sorted(overall) and overall[-1] == 1.0
     assert [s for s in ("fetch", "convert", "upload", "instance") if any(e["step"] == s for e in events)] == [
         "fetch", "convert", "upload", "instance"]
+
+
+def test_browse_lists_folders_with_free_space(tmp_path):
+    from vm2morpheus.util import browse
+    (tmp_path / "Beta").mkdir()
+    (tmp_path / "alfa").mkdir()
+    (tmp_path / "$Recycle").mkdir()
+    (tmp_path / "file.txt").write_text("x")
+    r = browse(str(tmp_path))
+    assert r["dirs"] == ["alfa", "Beta"] and r["free"] > 0 and r["parent"] == str(tmp_path.parent)
+    assert browse("")["drives"] and browse("")["path"] == ""
+    with pytest.raises(ValueError, match="no existe"):
+        browse(str(tmp_path / "nope"))
+
+
+def test_browse_endpoint_over_http(tmp_path):
+    import urllib.parse
+    import urllib.request
+    from vm2morpheus.gui import Handler
+    (tmp_path / "datos").mkdir()
+    srv = HTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{srv.server_port}/browse?path=" + urllib.parse.quote(str(tmp_path))
+    data = json.loads(urllib.request.urlopen(url).read())
+    srv.shutdown()
+    assert data["dirs"] == ["datos"]

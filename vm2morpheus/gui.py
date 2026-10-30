@@ -1,6 +1,7 @@
 """Local web GUI (stdlib only). Binds to 127.0.0.1; credentials are never written to disk."""
 import contextlib
 import json
+import urllib.parse
 import threading
 import uuid
 import webbrowser
@@ -11,7 +12,7 @@ from . import __version__, settings
 from .morpheus import MorpheusClient
 from .pipeline import migrate
 from .sources import make_source
-from .util import CancelledError, pick_workdir, redact
+from .util import CancelledError, browse, pick_workdir, redact
 
 JOBS: dict[str, dict] = {}
 RUN_LOCK = threading.Lock()
@@ -151,6 +152,12 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
             self.wfile.write(b)
+        elif self.path.startswith("/browse"):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            try:
+                self._json(browse(query.get("path", [""])[0]))
+            except ValueError as e:
+                self._json({"error": str(e)}, 400)
         elif self.path == "/settings":
             self._json(settings.load())
         elif self.path.startswith("/job/"):
@@ -254,6 +261,9 @@ input,select{width:100%;padding:7px;border:1px solid #b9c2cc;border-radius:5px;b
 .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0 14px}
 .chk label{display:inline-block;margin-right:16px;color:#1b2430;font-size:14px} .chk input{width:auto}
 button{padding:9px 16px;margin:4px 8px 4px 0;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer;font-size:14px}
+#picker{display:none;background:#fff;border:1px solid #b9c2cc;border-radius:8px;padding:10px;margin-top:8px}
+#picker .item{padding:5px 8px;cursor:pointer;border-radius:4px} #picker .item:hover{background:#e8eef7}
+#pickerlist{max-height:220px;overflow:auto;border:1px solid #e1e6ec;border-radius:6px;margin:6px 0}
 #barwrap{display:none;margin:10px 0}
 #barline{background:#dfe5ec;border-radius:6px;height:20px;overflow:hidden}
 #bar{height:100%;width:0;background:#2563eb;transition:width .4s}
@@ -297,7 +307,9 @@ small{color:#5d6b7b}
 <label><input type="checkbox" id="inject_drivers"> Inyectar drivers VirtIO en el disco de Windows (solo Windows; ejecuta el programa como administrador)</label>
 <label><input type="checkbox" id="boot_sata" checked> Disco de arranque en SATA (Windows sin drivers VirtIO)</label></div>
 <label>ISO de virtio-win <small>(vacío = se descarga sola, ~700 MB, y se guarda en caché)</small></label><input id="virtio_iso" placeholder="C:\ISOs\virtio-win.iso">
-<label>Carpeta de trabajo <small>(necesita ~2× el tamaño real de los discos; vacío = automática)</small></label><input id="workdir" placeholder="vacío = automático (disco local con más espacio libre)"></fieldset>
+<label>Carpeta de trabajo <small>(necesita ~2× el tamaño real de los discos; vacío = automática)</small></label><div style="display:flex;gap:8px"><input id="workdir" placeholder="vacío = automático (disco local con más espacio libre)"><button class="sec" style="margin:0;white-space:nowrap" onclick="openPicker(document.getElementById('workdir').value.trim())">Examinar…</button></div>
+<div id="picker"><div id="pickerhead"></div><div id="pickerlist"></div>
+<button class="sec" onclick="pickerUp()">Subir</button><button onclick="pickerUse()">Usar esta carpeta</button><button class="sec" onclick="closePicker()">Cerrar</button></div></fieldset>
 <button onclick="run('/dryrun')" class="sec">Simulación</button><button onclick="run('/migrate')">Migrar</button><button id="cancelbtn" class="danger" style="display:none" onclick="cancelJob()">Cancelar migración</button>
 <div id="barwrap"><div id="barline"><div id="bar"></div></div><div id="barlabel"></div></div>
 <pre id="log">Listo.</pre></main>
@@ -317,6 +329,20 @@ async function lookups(){try{await persist();const j=await post("/lookups",form(
   const s=document.getElementById(id);s.innerHTML=(id=="network_id"||id=="ref_instance_id"?'<option value="">(ninguna)</option>':'')+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id]}
   for(const [k,id] of [["layouts","layouts"],["pools","pools"]]){document.getElementById(id).innerHTML=j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("")}
  show("Datos cargados."+(j.layouts.length?"":" (layouts no detectados: escribe el ID a mano)"))}catch(e){show("ERROR: "+e.message)}}
+const SEP=String.fromCharCode(92);
+let pickerState={path:"",parent:null};
+const gib=b=>b==null?"?":(b/1073741824).toFixed(1)+" GiB";
+async function openPicker(path){try{const r=await fetch("/browse?path="+encodeURIComponent(path||""));const j=await r.json();if(j.error)throw new Error(j.error);
+ pickerState=j;const box=document.getElementById("picker");box.style.display="block";
+ document.getElementById("pickerhead").innerHTML=j.path?`<b>${j.path}</b> — ${gib(j.free)} libres`:"<b>Elige un disco</b>";
+ const list=document.getElementById("pickerlist");list.innerHTML="";
+ const add=(txt,go)=>{const d=document.createElement("div");d.className="item";d.textContent=txt;d.onclick=go;list.appendChild(d)};
+ j.drives.forEach(d=>add(`${d.path} — ${gib(d.free)} libres de ${gib(d.total)} (${d.local?"local":"red/otro"})`,()=>openPicker(d.path)));
+ j.dirs.forEach(n=>add("📁 "+n,()=>openPicker(j.path.endsWith(SEP)||j.path.endsWith("/")?j.path+n:j.path+(j.path.includes(SEP)?SEP:"/")+n)));
+ if(!j.drives.length&&!j.dirs.length)add("(sin subcarpetas)",()=>{})}catch(e){show("ERROR: "+e.message)}}
+function pickerUp(){openPicker(pickerState.parent||"")}
+function pickerUse(){if(pickerState.path){document.getElementById("workdir").value=pickerState.path;closePicker()}else show("Entra primero en un disco o carpeta.")}
+function closePicker(){document.getElementById("picker").style.display="none"}
 let currentJob=null;
 function drawBar(r){const w=document.getElementById("barwrap"),b=document.getElementById("bar"),l=document.getElementById("barlabel");
  const p=r.progress;if(!p&&r.status==="running"){return}w.style.display="block";

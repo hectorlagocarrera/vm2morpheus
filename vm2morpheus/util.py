@@ -95,3 +95,39 @@ def pick_workdir() -> str:
         if best:
             return str(Path(best[1]) / "vm2morpheus-work")
     return str(Path(tempfile.gettempdir()) / "vm2morpheus-work")
+
+
+def browse(path: str | None) -> dict:
+    """Folder listing for the GUI picker. Empty path = the disks (with free space) instead of a folder."""
+    if not path:
+        roots = ([f"{letter}:\\" for letter in string.ascii_uppercase if os.path.exists(f"{letter}:\\")]
+                 if os.name == "nt" else ["/", str(Path.home())])
+        drives = []
+        for root in roots:
+            try:
+                usage = shutil.disk_usage(root)
+                free, total = usage.free, usage.total
+            except OSError:
+                free = total = None
+            drives.append({"path": root, "free": free, "total": total, "local": _fixed_drive(root)})
+        return {"path": "", "parent": None, "dirs": [], "drives": drives, "free": None}
+    folder = Path(path)
+    if not folder.is_dir():
+        raise ValueError(f"La carpeta no existe: {path}")
+    dirs = []
+    try:
+        for entry in folder.iterdir():
+            try:
+                if entry.is_dir() and not entry.name.startswith("$") and entry.name != "System Volume Information":
+                    dirs.append(entry.name)
+            except OSError:
+                continue  # no permission on this entry
+    except OSError as e:
+        raise ValueError(f"No se puede leer la carpeta: {e}")
+    parent = str(folder.parent) if folder.parent != folder else ""
+    try:
+        free = shutil.disk_usage(folder).free
+    except OSError:
+        free = None
+    return {"path": str(folder), "parent": parent, "dirs": sorted(dirs, key=str.lower)[:500], "drives": [],
+            "free": free}
