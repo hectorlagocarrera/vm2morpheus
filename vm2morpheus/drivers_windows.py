@@ -3,11 +3,11 @@
 The disk (VHD/VHDX) is attached with Mount-DiskImage, the virtio-win ISO is mounted too, and DISM adds the
 drivers to the offline Windows image. Must run on Windows as Administrator, on a COPY of the disk.
 """
+import ctypes
 import json
 import os
 import shutil
 import subprocess
-import sys
 from pathlib import Path
 
 import requests
@@ -29,6 +29,25 @@ def file_attributes(path: Path) -> int:
     return attrs
 
 
+def describe_file(path: Path, attrs=file_attributes) -> str:
+    """One line for the log: file system and the attributes Mount-DiskImage cares about."""
+    try:
+        flags = attrs(path)
+    except (OSError, AttributeError):  # AttributeError: not Windows
+        return "atributos no legibles"
+    fs = "?"
+    try:
+        buf = ctypes.create_unicode_buffer(32)
+        root = os.path.splitdrive(os.path.abspath(str(path)))[0] + "\\"
+        ctypes.windll.kernel32.GetVolumeInformationW(root, None, 0, None, None, None, buf, 32)
+        fs = buf.value or "?"
+    except Exception:
+        pass
+    yes = lambda bit: "sí" if flags & bit else "no"  # noqa: E731
+    return (f"sistema de ficheros {fs} · disperso: {yes(SPARSE)} · comprimido: {yes(COMPRESSED)} · "
+            f"cifrado: {yes(ENCRYPTED)}")
+
+
 def rewrite_dense(path: Path) -> None:
     """Copy the file through ordinary reads and writes: holes read back as zeros and are written out as data, so the
     new file is not sparse."""
@@ -42,6 +61,7 @@ def make_mountable(path: Path, log=print, attrs=file_attributes, run=subprocess.
     """Mount-DiskImage refuses VHD/VHDX files that are sparse, compressed or encrypted. qemu-img on Windows writes
     sparse files, so the VHDX it just produced is exactly that."""
     quiet = {"capture_output": True, **no_window()}
+    log(f"Disco a montar: {path.name} ({describe_file(path, attrs)})")
     for _ in range(3):
         flags = attrs(path)
         if not flags & (SPARSE | COMPRESSED | ENCRYPTED):
@@ -57,6 +77,40 @@ def make_mountable(path: Path, log=print, attrs=file_attributes, run=subprocess.
                 rewrite_dense(path)
     raise RuntimeError("No se pudo dejar el disco sin comprimir, sin cifrar y sin dispersar, que es lo que exige "
                        "Windows para montarlo. Prueba con otra carpeta de trabajo en un disco NTFS sin compresión.")
+
+
+def _clear_attributes(path: Path, run=subprocess.run) -> None:
+    quiet = {"capture_output": True, **no_window()}
+    for cmd in (["compact", "/u", str(path)], ["cipher", "/d", str(path)], ["fsutil", "sparse", "setflag", str(path), "0"]):
+        try:
+            run(cmd, **quiet)
+        except OSError:
+            pass
+
+
+def mount_disk(ps, image: str, iso: str, disk: Path, log=print, run=subprocess.run) -> str:
+    """Mount the disk and the ISO. If Windows answers with the virtual-disk limitation (0xc03a001a) even though
+    the attributes looked fine, rewrite the file through ordinary writes, clear any inherited compression and
+    try once more."""
+    script = _mount_script(image, iso)
+    try:
+        return ps(script)
+    except RuntimeError as e:
+        if "c03a001a" not in str(e).lower():
+            raise
+    log(f"Windows rechazó el disco ({describe_file(disk)}). Se reescribe como fichero normal y se reintenta ...")
+    ps(_dismount_script(image, iso))
+    rewrite_dense(disk)
+    _clear_attributes(disk, run)
+    try:
+        return ps(script)
+    except RuntimeError as e:
+        if "c03a001a" in str(e).lower():
+            raise RuntimeError(
+                f"Windows no puede montar el disco virtual ({describe_file(disk)}). Debe estar en un disco NTFS, "
+                "sin comprimir, sin cifrar y sin dispersar; prueba con otra carpeta de trabajo en otro disco. "
+                f"Detalle: {e}") from e
+        raise
 
 
 def os_folder(build: int, installation_type: str) -> str | None:
@@ -168,7 +222,8 @@ def inject_virtio_windows(disk: Path, iso: str, log=print, ps=run_powershell, di
         prepare = make_mountable if ps is run_powershell else (lambda *a, **k: None)  # fakes in tests skip the OS call
     prepare(Path(disk), log)
     try:
-        info = json.loads(ps(_mount_script(image, iso)))
+        raw = mount_disk(ps, image, iso, Path(disk), log)
+        info = json.loads(raw)
         folder = os_folder(int(info["build"]), info["type"])
         if not folder:
             raise RuntimeError(f"Versión de Windows no soportada para los drivers VirtIO: build {info['build']} ({info['type']})")

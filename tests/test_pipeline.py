@@ -934,3 +934,66 @@ def test_failed_injection_keeps_the_converted_vhdx_in_the_saved_state(tmp_path, 
                          log=lambda *_: None)
     saved = json.loads((wd / "vm1" / "state.json").read_text())
     assert saved["fetched"][0].endswith(".vhdx") and Path(saved["fetched"][0]).exists()
+
+
+def test_describe_file_reports_the_attributes_that_matter(tmp_path):
+    from vm2morpheus.drivers_windows import COMPRESSED, SPARSE, describe_file
+    f = tmp_path / "d.vhdx"
+    f.write_bytes(b"x")
+    text = describe_file(f, attrs=lambda p: SPARSE | COMPRESSED)
+    assert "disperso: sí" in text and "comprimido: sí" in text and "cifrado: no" in text
+    assert describe_file(f, attrs=lambda p: 0).count("no") == 3
+
+
+def _mount_ps(fail_mounts: int, iso_root=""):
+    """Fake PowerShell: the first `fail_mounts` mount scripts fail with 0xc03a001a, dismounts always work."""
+    state = {"mounts": 0, "dismounts": 0}
+
+    def ps(script):
+        if "Dismount" in script:
+            state["dismounts"] += 1
+            return ""
+        state["mounts"] += 1
+        if state["mounts"] <= fail_mounts:
+            raise RuntimeError("Falló PowerShell: HRESULT 0xc03a001a,Mount-DiskImage")
+        return json.dumps({"win": "E:\\", "iso": iso_root, "build": 14393, "type": "Server"})
+    return ps, state
+
+
+def test_mount_limitation_is_retried_after_rewriting_the_file(tmp_path):
+    from vm2morpheus.drivers_windows import inject_virtio_windows
+    disk = tmp_path / "d.vhdx"
+    disk.write_bytes(b"vhdx-bytes" * 100)
+    iso_root = _fake_iso(tmp_path)
+    ps, state = _mount_ps(1, iso_root)
+    msgs, dism_calls = [], []
+    added = inject_virtio_windows(disk, "x.iso", log=msgs.append, ps=ps, dism=dism_calls.append)
+    assert added == ["viostor", "NetKVM"] and state["mounts"] == 2
+    assert any("se reintenta" in m for m in msgs)
+    assert disk.read_bytes() == b"vhdx-bytes" * 100 and not (tmp_path / "d.vhdx.dense").exists()
+    assert state["dismounts"] == 2  # one before the retry, one at the end
+
+
+def test_mount_limitation_that_persists_is_explained_with_the_file_state(tmp_path):
+    from vm2morpheus.drivers_windows import inject_virtio_windows
+    disk = tmp_path / "d.vhdx"
+    disk.write_bytes(b"x")
+    ps, state = _mount_ps(99)
+    with pytest.raises(RuntimeError, match="NTFS, sin comprimir"):
+        inject_virtio_windows(disk, "x.iso", log=lambda *_: None, ps=ps, dism=lambda a: None)
+    assert state["mounts"] == 2 and state["dismounts"] == 2  # tried twice, always dismounted
+
+
+def test_no_undefined_names_anywhere_in_the_package():
+    """Windows-only code paths never run on the CI/Linux box, so a missing import there (this happened with
+    ctypes) would only show up on a user's machine. pyflakes finds those statically."""
+    pyflakes_api = pytest.importorskip("pyflakes.api")
+    import io
+    from pathlib import Path as P
+    import vm2morpheus
+    out = io.StringIO()
+    reporter = __import__("pyflakes.reporter", fromlist=["Reporter"]).Reporter(out, out)
+    for f in P(vm2morpheus.__file__).parent.rglob("*.py"):
+        pyflakes_api.check(f.read_text(encoding="utf-8"), str(f), reporter)
+    undefined = [l for l in out.getvalue().splitlines() if "undefined name" in l]
+    assert undefined == []

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vm2morpheus"
-version = "0.13.4"
+version = "0.13.5"
 description = "Migrate VMs from Hyper-V / VMware to HPE Morpheus (VM Essentials, KVM) in one command"
 requires-python = ">=3.10"
 dependencies = ["requests>=2.31", "PyYAML>=6"]
@@ -14,7 +14,7 @@ hyperv = ["pywinrm>=0.4.3", "smbprotocol>=1.10"]
 vmware = ["pyvmomi>=8.0"]
 window = ["pywebview>=5; sys_platform == 'win32'"]
 all = ["pywinrm>=0.4.3", "smbprotocol>=1.10", "pyvmomi>=8.0", "pywebview>=5; sys_platform == 'win32'"]
-dev = ["pytest"]
+dev = ["pytest", "pyflakes"]
 
 [project.scripts]
 vm2morpheus = "vm2morpheus.cli:main"
