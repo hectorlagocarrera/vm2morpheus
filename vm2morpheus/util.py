@@ -1,6 +1,14 @@
 import os
+import shutil
+import string
 import sys
+import tempfile
 import time
+from pathlib import Path
+
+
+class CancelledError(Exception):
+    """The user pressed Cancel."""
 
 
 def human(n: float) -> str:
@@ -33,13 +41,16 @@ def resolve_secret(value):
 class Progress:
     """Callable (done, total) -> None that prints a throttled one-line progress bar."""
 
-    def __init__(self, label: str, stream=None, percent: bool = False):
+    def __init__(self, label: str, stream=None, percent: bool = False, cancel=None):
         self.label = label
+        self.cancel = cancel
         self.percent = percent
         self.stream = stream or sys.stderr
         self._last = 0.0
 
     def __call__(self, done: float, total: float | None = None):
+        if self.cancel is not None and self.cancel.is_set():
+            raise CancelledError("cancelled")
         now = time.monotonic()
         if now - self._last < 0.5 and not (total and done >= total):
             return
@@ -55,3 +66,29 @@ class Progress:
     def finish(self):
         self.stream.write("\n")
         self.stream.flush()
+
+
+def _fixed_drive(root: str) -> bool:
+    try:
+        import ctypes
+        return ctypes.windll.kernel32.GetDriveTypeW(root) == 3  # DRIVE_FIXED: skip USB, optical and network drives
+    except (AttributeError, OSError):
+        return True
+
+
+def pick_workdir() -> str:
+    """Work folder on the fixed local disk with the most free space (Windows); the temp dir elsewhere."""
+    if os.name == "nt":
+        best = None
+        for letter in string.ascii_uppercase:
+            root = f"{letter}:\\"
+            if os.path.exists(root) and _fixed_drive(root):
+                try:
+                    free = shutil.disk_usage(root).free
+                except OSError:
+                    continue
+                if best is None or free > best[0]:
+                    best = (free, root)
+        if best:
+            return str(Path(best[1]) / "vm2morpheus-work")
+    return str(Path(tempfile.gettempdir()) / "vm2morpheus-work")

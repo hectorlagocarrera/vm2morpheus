@@ -16,6 +16,8 @@ def load() -> dict:
 
 def save(form: dict) -> None:
     data = dict(form)
+    if "auto_workdir" not in data and load().get("auto_workdir"):
+        data["auto_workdir"] = load()["auto_workdir"]  # chosen once so resumes find the same folder
     if not data.get("remember_secrets"):
         for k in SECRET_KEYS:
             data.pop(k, None)

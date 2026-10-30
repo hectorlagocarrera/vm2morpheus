@@ -1,9 +1,12 @@
 import os
 import re
+import threading
 import shutil
 import subprocess
 import sys
 from pathlib import Path
+
+from .util import CancelledError
 
 PCT = re.compile(rb"\((\d+(?:\.\d+)?)/100%\)")
 
@@ -30,11 +33,23 @@ def require_tool(name: str) -> str:
     return path
 
 
-def convert_disk(src: Path, dst: Path, fmt: str = "qcow2", progress=None) -> Path:
+def convert_disk(src: Path, dst: Path, fmt: str = "qcow2", progress=None, cancel=None) -> Path:
     """qemu-img convert; the input format is auto-detected (vhdx, vmdk, vhd, raw ...)."""
     qemu_img = require_tool("qemu-img")
+    if cancel is not None and cancel.is_set():
+        raise CancelledError("cancelled")
     proc = subprocess.Popen([qemu_img, "convert", "-p", "-O", fmt, str(src), str(dst)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    finished = threading.Event()
+
+    def watch():  # kill qemu-img as soon as Cancel is pressed, even while it prints nothing
+        while not finished.is_set():
+            if cancel.wait(0.3):
+                proc.kill()
+                return
+
+    if cancel is not None:
+        threading.Thread(target=watch, daemon=True).start()
     buf = b""
     while chunk := proc.stdout.read(64):
         buf = (buf + chunk)[-64:]
@@ -42,7 +57,12 @@ def convert_disk(src: Path, dst: Path, fmt: str = "qcow2", progress=None) -> Pat
         if m and progress:
             progress(float(m[-1]), 100)
     err = proc.stderr.read().decode(errors="replace")
-    if proc.wait() != 0:
+    code = proc.wait()
+    finished.set()
+    if cancel is not None and cancel.is_set():
+        dst.unlink(missing_ok=True)
+        raise CancelledError("cancelled")
+    if code != 0:
         raise RuntimeError(f"qemu-img convert failed for {src.name}: {err.strip()}")
     return dst
 

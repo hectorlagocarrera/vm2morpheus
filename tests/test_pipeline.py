@@ -414,3 +414,90 @@ def test_pipeline_injects_into_a_private_vhdx_copy_before_converting(tmp_path, m
     assert src.direct is False and seen["iso"] == "my.iso"
     assert str(seen["path"]).startswith(str(tmp_path / "w8"))  # never the original disk
     assert FakeMorpheus.uploads[7][:4] == b"QFI\xfb"
+
+
+def test_progress_raises_when_cancelled():
+    import io
+    from vm2morpheus.util import CancelledError, Progress
+    ev = threading.Event()
+    bar = Progress("x", io.StringIO(), cancel=ev)
+    bar(1, 10)
+    ev.set()
+    with pytest.raises(CancelledError):
+        bar(2, 10)
+
+
+def test_convert_kills_qemu_img_on_cancel(tmp_path, monkeypatch):
+    import time
+    from vm2morpheus import convert
+    from vm2morpheus.util import CancelledError
+    fake = tmp_path / "fake-qemu"
+    fake.write_text("#!/bin/sh\nexec sleep 30\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(convert, "require_tool", lambda name: str(fake))
+    ev = threading.Event()
+    threading.Timer(0.5, ev.set).start()
+    t0 = time.monotonic()
+    with pytest.raises(CancelledError):
+        convert.convert_disk(tmp_path / "a", tmp_path / "b.qcow2", "qcow2", None, ev)
+    assert time.monotonic() - t0 < 10
+
+
+def test_cancel_between_steps_uploads_nothing(tmp_path):
+    from vm2morpheus.util import CancelledError
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    ev = threading.Event()
+
+    class Cancelling(FakeSource):
+        def fetch_disks(self, vm, dest, progress):
+            out = super().fetch_disks(vm, dest, progress)
+            ev.set()  # the user presses Cancel right after the download
+            return out
+
+    FakeMorpheus.log.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    client = MorpheusClient(f"http://127.0.0.1:{srv.server_port}", "tok")
+    with pytest.raises(CancelledError):
+        migrate(Cancelling(disk), client, "vm1", {"workdir": str(tmp_path / "w9"), "shutdown_source": True},
+                {"image_type": "qcow2"}, log=lambda *_: None, cancel=ev)
+    srv.shutdown()
+    assert FakeMorpheus.log == []  # no image created
+
+
+def test_cancel_during_upload_removes_the_partial_image(tmp_path):
+    from vm2morpheus.util import CancelledError
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    ev = threading.Event()
+    deleted = []
+
+    class Client(MorpheusClient):
+        def upload_image(self, image_id, path, progress=None):
+            ev.set()
+            progress(1, 2)  # raises CancelledError
+
+        def delete_image(self, image_id):
+            deleted.append(image_id)
+
+    FakeMorpheus.log.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    with pytest.raises(CancelledError):
+        migrate(FakeSource(disk), Client(f"http://127.0.0.1:{srv.server_port}", "tok"), "vm1",
+                {"workdir": str(tmp_path / "w10"), "shutdown_source": True}, {"image_type": "qcow2"},
+                log=lambda *_: None, cancel=ev)
+    srv.shutdown()
+    assert deleted == [7]
+
+
+def test_pick_workdir_and_auto_workdir_is_remembered(tmp_path, monkeypatch):
+    from vm2morpheus import gui, settings
+    from vm2morpheus.util import pick_workdir
+    assert pick_workdir().endswith("vm2morpheus-work")
+    monkeypatch.setattr(settings, "PATH", tmp_path / "s.json")
+    first = gui.resolve_workdir({"workdir": ""})
+    settings.save({"vm": "x"})  # the form is saved on every action; the auto folder must survive it
+    assert gui.resolve_workdir({"workdir": ""}) == first
+    assert gui.resolve_workdir({"workdir": "D:\\\\mine"}) == "D:\\\\mine"

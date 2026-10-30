@@ -78,6 +78,9 @@ class MorpheusClient:
         finally:
             reader.close()
 
+    def delete_image(self, image_id: int) -> None:
+        self._req("DELETE", f"/api/virtual-images/{image_id}")
+
     def image_exists(self, image_id: int) -> bool:
         try:
             self._req("GET", f"/api/virtual-images/{image_id}")

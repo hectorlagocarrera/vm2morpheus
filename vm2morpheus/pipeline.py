@@ -8,7 +8,7 @@ from .convert import convert_disk, inject_drivers
 from .drivers_windows import ensure_virtio_iso, inject_virtio_windows
 from .morpheus import MorpheusClient, MorpheusError, payload_from_reference, render_template
 from .sources.base import Source
-from .util import Progress, human, redact
+from .util import CancelledError, Progress, human, redact
 
 def _is_windows() -> bool:
     return os.name == "nt"
@@ -38,7 +38,11 @@ class State:
 
 
 def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, mcfg: dict,
-            dry_run=False, log=print) -> dict:
+            dry_run=False, log=print, cancel=None) -> dict:
+    def check():
+        if cancel is not None and cancel.is_set():
+            raise CancelledError("cancelled")
+
     vm = source.get_vm(vm_name)
     fmt = opts.get("output_format", "qcow2")
     windows_inject = bool(opts.get("inject_drivers")) and _is_windows() and vm.os_family == "windows"
@@ -74,6 +78,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     if problems:
         raise RuntimeError("; ".join(problems))
 
+    log(f"work folder: {workdir}")
     workdir.mkdir(parents=True, exist_ok=True)
     st = State(workdir / "state.json")
     if st.done("upload") and not all(morpheus.image_exists(i["id"]) for i in st.d.get("images", [])):
@@ -94,14 +99,16 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
 
     bundle = bool(opts.get("multi_disk_bundle", True)) and len(vm.disks) > 1
 
+    check()
     if not st.done("fetch"):
         if vm.power_state == "on":
             log("powering off source VM ...")
             source.power_off(vm.name)
         log("fetching disks ...")
-        files = source.fetch_disks(vm, workdir, lambda label: _bar(label))
+        files = source.fetch_disks(vm, workdir, lambda label: Progress(label, cancel=cancel))
         st.mark("fetch", fetched=[str(f) for f in files])
 
+    check()
     if not st.done("convert"):
         log(f"converting to {fmt} ...")
         out = []
@@ -111,13 +118,13 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             if boot.suffix.lower() not in (".vhd", ".vhdx"):  # Windows can only mount VHD/VHDX
                 log(f"converting {boot.name} to VHDX so Windows can mount it ...")
                 vhdx = boot.with_suffix(".vhdx")
-                bar = Progress(f"convert {boot.name}", percent=True)
-                convert_disk(boot, vhdx, "vhdx", bar)
+                bar = Progress(f"convert {boot.name}", percent=True, cancel=cancel)
+                convert_disk(boot, vhdx, "vhdx", bar, cancel)
                 bar.finish()
                 if _inside(boot, workdir):
                     boot.unlink(missing_ok=True)
                 st.d["fetched"][0] = str(vhdx)
-            bar = Progress("virtio-win ISO")
+            bar = Progress("virtio-win ISO", cancel=cancel)
             iso = ensure_virtio_iso(opts.get("virtio_iso"), bar)
             log("injecting VirtIO drivers into the Windows disk (DISM) ...")
             added = inject_virtio_windows(Path(st.d["fetched"][0]), iso, log)
@@ -125,14 +132,15 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             st.set(injected=True, fetched=st.d["fetched"])
         for i, src in enumerate(map(Path, st.d["fetched"])):
             dst = workdir / (disk_file_name(vm.name, i) if bundle else f"{src.stem}.{fmt}")
-            bar = Progress(f"convert {src.name}", percent=True)
-            convert_disk(src, dst, fmt, bar)
+            bar = Progress(f"convert {src.name}", percent=True, cancel=cancel)
+            convert_disk(src, dst, fmt, bar, cancel)
             bar.finish()
             out.append(str(dst))
             if not opts.get("keep_files") and _inside(src, workdir):  # never delete the source VM's own disks
                 src.unlink(missing_ok=True)
         st.mark("convert", converted=out)
 
+    check()
     if not st.done("drivers"):
         if opts.get("inject_drivers") and not _is_windows():
             log("injecting virtio drivers (virt-v2v-in-place) ...")
@@ -140,6 +148,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                            vm.firmware == "uefi", fmt)
         st.mark("drivers")
 
+    check()
     if not st.done("upload"):
         def publish(path: Path, name: str) -> dict:
             log(f"creating Morpheus image {name!r} ...")
@@ -147,8 +156,16 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                 name, mcfg.get("image_type", fmt), os_type=mcfg.get("os_type"),
                 uefi=vm.firmware == "uefi", storage_provider_id=mcfg.get("storage_provider_id"),
                 extra=mcfg.get("image_extra"))
-            bar = Progress(f"upload {path.name}")
-            morpheus.upload_image(img["id"], path, bar)
+            bar = Progress(f"upload {path.name}", cancel=cancel)
+            try:
+                morpheus.upload_image(img["id"], path, bar)
+            except CancelledError:
+                try:
+                    morpheus.delete_image(img["id"])  # do not leave a half-uploaded image behind
+                    log(f"removed the incomplete image {name!r} from Morpheus")
+                except Exception:
+                    log(f"could not remove the incomplete image {name!r} (id {img['id']}); delete it by hand")
+                raise
             bar.finish()
             morpheus.wait_image_ready(img["id"])
             return {"id": img["id"], "name": name}
@@ -171,6 +188,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                     f.unlink(missing_ok=True)
         st.mark("upload", images=images, bundle=bundle)
 
+    check()
     result = {"images": st.d["images"]}
     if not st.done("instance"):
         template = mcfg.get("instance")
@@ -234,8 +252,3 @@ def _inside(path: Path, folder: Path) -> bool:
         return True
     except ValueError:
         return False
-
-
-def _bar(label):
-    bar = Progress(label)
-    return bar
