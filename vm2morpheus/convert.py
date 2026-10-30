@@ -6,7 +6,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from .util import CancelledError
+from .util import CancelledError, no_window
 
 PCT = re.compile(rb"\((\d+(?:\.\d+)?)/100%\)")
 
@@ -39,7 +39,7 @@ def convert_disk(src: Path, dst: Path, fmt: str = "qcow2", progress=None, cancel
     if cancel is not None and cancel.is_set():
         raise CancelledError("cancelled")
     proc = subprocess.Popen([qemu_img, "convert", "-p", "-O", fmt, str(src), str(dst)],
-                            stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+                            stdout=subprocess.PIPE, stderr=subprocess.PIPE, **no_window())
     finished = threading.Event()
 
     def watch():  # kill qemu-img as soon as Cancel is pressed, even while it prints nothing
@@ -81,6 +81,6 @@ def inject_drivers(disk: Path, vm_name: str, memory_mb: int, cpu: int, uefi: boo
     xml_path = disk.with_suffix(".xml")
     xml_path.write_text(xml)
     r = subprocess.run(["virt-v2v-in-place", "-i", "libvirtxml", str(xml_path)],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, **no_window())
     if r.returncode != 0:
         raise RuntimeError(f"Falló virt-v2v-in-place: {r.stderr.strip()[-800:]}")

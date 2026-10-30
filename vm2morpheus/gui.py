@@ -1,6 +1,7 @@
 """Local web GUI (stdlib only). Binds to 127.0.0.1; credentials are never written to disk."""
 import contextlib
 import json
+import time
 import urllib.parse
 import threading
 import uuid
@@ -15,8 +16,15 @@ from .pipeline import migrate
 from .sources import make_source
 from .util import CancelledError, browse, pick_workdir, redact
 
+STATE = {"server": None, "last_ping": None}
+IDLE_LIMIT = 180  # seconds without the page pinging us (tab closed) before the app exits
 JOBS: dict[str, dict] = {}
 RUN_LOCK = threading.Lock()
+
+
+def idle_too_long(last_ping, now: float, busy: bool, limit: float = IDLE_LIMIT) -> bool:
+    """True when the browser page has gone away (no heartbeat) and no migration is running."""
+    return last_ping is not None and not busy and now - last_ping > limit
 
 
 class JobLog:
@@ -90,7 +98,8 @@ def make_cfgs(f: dict):
     opts = {"workdir": resolve_workdir(f), "shutdown_source": bool(f.get("shutdown")),
             "boot_sata": bool(f.get("boot_sata")), "inject_drivers": bool(f.get("inject_drivers")),
             "virtio_iso": (f.get("virtio_iso") or "").strip() or None, "keep_files": False, "multi_disk_bundle": bool(f.get("multi_disk_bundle")),
-            "recreate_instance": bool(f.get("recreate_instance"))}
+            "recreate_instance": bool(f.get("recreate_instance")),
+            "disk_indexes": [int(i) for i in f["disk_indexes"]] if f.get("disk_indexes") is not None else None}
     return src, m, opts
 
 
@@ -153,6 +162,9 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
             self.wfile.write(b)
+        elif self.path == "/ping":
+            STATE["last_ping"] = time.monotonic()
+            self._json({"ok": True})
         elif self.path == "/logo.png":
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
@@ -207,6 +219,9 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"vms": s.list_vms(), "kind": kind})
                 finally:
                     s.close()
+            if self.path == "/shutdown":
+                threading.Timer(0.3, STATE["server"].shutdown).start()  # after this response has been sent
+                return self._json({"ok": True})
             if self.path == "/cancel":
                 job = JOBS.get(f.get("job"))
                 if not job:
@@ -237,9 +252,25 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(port: int = 8765, open_browser: bool = True):
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     url = f"http://127.0.0.1:{port}"
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError:  # a second double-click: reuse the instance that is already running
+        print(f"Ya hay una instancia en marcha en {url}: se abre en el navegador")
+        if open_browser:
+            webbrowser.open(url)
+        return
+    STATE["server"] = srv
     print(f"Interfaz de vm2morpheus en {url}  (Ctrl+C para parar)")
+
+    def watchdog():
+        while True:
+            time.sleep(10)
+            if idle_too_long(STATE["last_ping"], time.monotonic(), RUN_LOCK.locked()):
+                srv.shutdown()
+                return
+
+    threading.Thread(target=watchdog, daemon=True).start()
     if open_browser:
         webbrowser.open(url)
     try:
@@ -254,13 +285,14 @@ PAGE = r"""<!doctype html><html lang="es"><meta charset="utf-8"><meta name="view
 <style>
 body{font:15px system-ui,sans-serif;margin:0;background:#f4f6f8;color:#1b2430}
 main{max-width:920px;margin:0 auto;padding:16px}
-.brand{padding:4px 0 10px} .brand img{height:56px;max-width:100%}
+.brand{padding:4px 0 10px;display:flex;justify-content:space-between;align-items:center} .brand .quit{margin:0} .brand img{height:56px;max-width:100%}
 h1{font-size:22px} fieldset{background:#fff;border:1px solid #d5dbe2;border-radius:8px;margin:0 0 14px;padding:12px 16px}
 legend{font-weight:600;padding:0 6px} label{display:block;margin:8px 0 2px;font-size:13px;color:#4a5665}
 input,select{width:100%;padding:7px;border:1px solid #b9c2cc;border-radius:5px;box-sizing:border-box}
 .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0 14px}
 .chk label{display:inline-block;margin-right:16px;color:#1b2430;font-size:14px} .chk input{width:auto}
 button{padding:9px 16px;margin:4px 8px 4px 0;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer;font-size:14px}
+input.diskchk{width:auto;margin:0 8px 0 0;vertical-align:middle}
 #picker{display:none;background:#fff;border:1px solid #b9c2cc;border-radius:8px;padding:10px;margin-top:8px}
 #picker .item{padding:5px 8px;cursor:pointer;border-radius:4px} #picker .item:hover{background:#e8eef7}
 #pickerlist{max-height:220px;overflow:auto;border:1px solid #e1e6ec;border-radius:6px;margin:6px 0}
@@ -273,17 +305,18 @@ button.danger{background:#c0392b}
 button.sec{background:#e5e9ee;color:#1b2430} pre{background:#0f172a;color:#d6e2f0;padding:12px;border-radius:8px;min-height:140px;max-height:420px;overflow:auto;white-space:pre-wrap}
 small{color:#5d6b7b}
 </style><main>
-<div class="brand"><img src="/logo.png" alt="Redes · 25 años innovando el futuro"></div>
+<div class="brand"><img src="/logo.png" alt="Redes · 25 años innovando el futuro"><button class="sec quit" onclick="quit()">Salir del programa</button></div>
 <h1>vm2morpheus <small>Hyper-V / VMware → Morpheus (KVM) · v__VERSION__</small></h1>
 <fieldset><legend>1. Origen</legend><div class="row">
-<div><label>Tipo</label><select id="source_type"><option value="hyperv">Hyper-V</option><option value="vmware">VMware vCenter o ESXi</option></select></div>
+<div><label>Tipo</label><select id="source_type" onchange="srcHint()"><option value="hyperv">Hyper-V</option><option value="vmware">VMware vCenter</option><option value="esxi">VMware ESXi (sin vCenter)</option></select></div>
 <div><label>Host / IP</label><input id="source_host"></div>
-<div><label>Usuario</label><input id="source_user" placeholder="vCenter: usuario@vsphere.local"></div>
+<div><label>Usuario</label><input id="source_user" placeholder="Administrador"></div>
 <div><label>Contraseña</label><input id="source_password" type="password"></div>
-<div><label>Nombre de la VM</label><input id="vm"></div>
-<div><label>VM del origen <small>(pulsa "Listar VMs")</small></label><select id="vm_select" onchange="if(this.value)document.getElementById('vm').value=this.value"><option value="">(sin listar)</option></select></div>
+<div><label>Nombre de la VM</label><input id="vm" onchange="analyze()"></div>
+<div><label>VM del origen <small>(pulsa "Listar VMs")</small></label><select id="vm_select" onchange="if(this.value){document.getElementById('vm').value=this.value;analyze()}"><option value="">(sin listar)</option></select></div>
 <div><label>Sistema operativo (Hyper-V)</label><select id="os_family"><option value="windows">Windows</option><option value="linux">Linux</option><option value="other">Otro</option></select></div>
-</div><button class="sec" onclick="listvms()">Listar VMs del origen</button><button class="sec" onclick="inspect_()">Inspeccionar VM</button></fieldset>
+</div><button class="sec" onclick="listvms()">Listar VMs del origen</button><button class="sec" onclick="inspect_()">Analizar VM</button>
+<div id="diskpanel" style="display:none;margin-top:8px"><div id="diskinfo"></div><div id="disklist" style="margin:6px 0"></div><small id="diskhint"></small></div></fieldset>
 <fieldset><legend>2. Destino Morpheus</legend><div class="row">
 <div><label>URL (https://ip)</label><input id="morpheus_url"></div>
 <div><label>Token API</label><input id="morpheus_token" type="password"></div>
@@ -317,13 +350,30 @@ small{color:#5d6b7b}
 <script>
 const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","virtio_iso","ref_instance_id","ref_image_id","workdir"];
 const chks=["verify_ssl","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
-const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);return o};
+let analyzedVm=null;
+const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);if(analyzedVm&&analyzedVm===document.getElementById("vm").value.trim()&&document.querySelector(".diskchk"))o.disk_indexes=[...document.querySelectorAll(".diskchk")].filter(c=>c.checked).map(c=>Number(c.value));else o.disk_indexes=null;return o};
 const show=t=>document.getElementById("log").textContent=t;
 async function post(p,b){const r=await fetch(p,{method:"POST",body:JSON.stringify(b)});const j=await r.json();if(j.error)throw new Error(j.error);return j}
 async function persist(){try{await post("/settings",form())}catch(e){}}
 let saved={};
 async function listvms(){try{await persist();const j=await post("/listvms",form());const s=document.getElementById("vm_select");s.innerHTML='<option value="">(elige una VM)</option>'+j.vms.map(v=>`<option value="${v.name}">${v.name} — ${v.state=="on"?"encendida":"apagada"}, ${v.cpu} vCPU, ${(v.memory_mb/1024).toFixed(1)} GiB${v.host?" · host "+v.host:""}</option>`).join("");show("Conectado a "+j.kind+": "+j.vms.length+" VM(s) encontradas. Elige una en el desplegable.")}catch(e){show("ERROR: "+e.message)}}
-async function inspect_(){try{await persist();show(JSON.stringify(await post("/inspect",form()),null,2))}catch(e){show("ERROR: "+e.message)}}
+async function analyze(force){const vm=document.getElementById("vm").value.trim();
+ if(!vm||!document.getElementById("source_host").value.trim())return;
+ if(!force&&analyzedVm===vm)return; // same VM: keep the disks the user ticked
+ try{await persist();const j=await post("/inspect",form());analyzedVm=vm;renderDisks(j)}
+ catch(e){document.getElementById("diskpanel").style.display="none";analyzedVm=null;show("ERROR: "+e.message)}}
+function renderDisks(j){document.getElementById("diskpanel").style.display="block";
+ document.getElementById("diskinfo").innerHTML=`<b>${j.name}</b>: ${j.cpu} vCPU, ${(j.memory_mb/1024).toFixed(1)} GiB RAM, ${j.firmware.toUpperCase()}, ${j.power_state==="on"?"encendida":"apagada"}, ${j.disks.length} disco(s)`;
+ document.getElementById("disklist").innerHTML=j.disks.map(d=>`<label style="display:block;color:#1b2430;font-size:14px"><input type="checkbox" class="diskchk" value="${d.index}" checked onchange="disksChanged()"> ${d.name} — ${gib(d.size_bytes)} provisionados${d.used_bytes?` (${gib(d.used_bytes)} usados)`:""}</label>`).join("");
+ disksChanged()}
+function disksChanged(){const n=document.querySelectorAll(".diskchk:checked").length,t=document.querySelectorAll(".diskchk").length;
+ document.getElementById("multi_disk_bundle").checked=n>1;
+ document.getElementById("diskhint").textContent=n===0?"Selecciona al menos un disco.":n>1?`${n} discos: se activa "Varios discos en una sola imagen". El primero marcado se trata como disco de arranque.`:`1 disco seleccionado${t>1?" (los demás no se migrarán)":""}.`}
+async function inspect_(){await analyze(true);if(analyzedVm)show("VM analizada: revisa el panel de discos.")}
+async function quit(){if(currentJob&&!confirm("Hay una migración en curso. ¿Salir igualmente?"))return;
+ try{await post("/shutdown",{})}catch(e){}
+ document.body.innerHTML="<main><h1>Programa cerrado</h1><p>Ya puedes cerrar esta pestaña.</p></main>"}
+setInterval(()=>fetch("/ping").catch(()=>{}),5000);fetch("/ping").catch(()=>{});
 async function refinfo(){try{show(JSON.stringify(await post("/refinfo",form()),null,2))}catch(e){show("ERROR: "+e.message)}}
 async function lookups(){try{await persist();const j=await post("/lookups",form());
  for(const [k,id] of [["clouds","cloud_id"],["groups","group_id"],["plans","plan_id"],["networks","network_id"],["instances","ref_instance_id"]]){
@@ -331,8 +381,11 @@ async function lookups(){try{await persist();const j=await post("/lookups",form(
   for(const [k,id] of [["layouts","layout_id"],["pools","resource_pool"]]){const s=document.getElementById(id);s.innerHTML='<option value="">(automático)</option>'+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id]}
  show("Datos cargados.")}catch(e){show("ERROR: "+e.message)}}
 const SEP=String.fromCharCode(92);
+function srcHint(){const t=document.getElementById("source_type").value;
+ document.getElementById("source_user").placeholder={hyperv:"Administrador",vmware:"usuario@vsphere.local",esxi:"root"}[t]||"";
+ document.getElementById("os_family").closest("div").style.display=t==="hyperv"?"":"none"}
 let pickerState={path:"",parent:null};
-const gib=b=>b==null?"?":(b/1073741824).toFixed(1)+" GiB";
+const gib=b=>b==null?"?":b<1073741824?Math.max(1,Math.round(b/1048576))+" MiB":(b/1073741824).toFixed(1)+" GiB";
 async function openPicker(path){try{const r=await fetch("/browse?path="+encodeURIComponent(path||""));const j=await r.json();if(j.error)throw new Error(j.error);
  pickerState=j;const box=document.getElementById("picker");box.style.display="block";
  document.getElementById("pickerhead").innerHTML=j.path?`<b>${j.path}</b> — ${gib(j.free)} libres`:"<b>Elige un disco</b>";
@@ -357,8 +410,10 @@ async function cancelJob(){if(!currentJob)return;document.getElementById("cancel
 async function run(p){try{await persist();const {job}=await post(p,form());currentJob=job;show("Trabajo "+job+" en marcha...");
  const btn=document.getElementById("cancelbtn");btn.style.display="inline-block";btn.disabled=false;document.getElementById("barwrap").style.display="none";
  const t=setInterval(async()=>{const r=await (await fetch("/job/"+job)).json();show(r.log||"...");drawBar(r);if(r.status!=="running"){clearInterval(t);btn.style.display="none";currentJob=null}},1000)}catch(e){show("ERROR: "+e.message)}}
+srcHint();
 (async()=>{try{saved=await (await fetch("/settings")).json();
  ids.forEach(i=>{if(saved[i]!==undefined&&document.getElementById(i).tagName==="INPUT"||saved[i]!==undefined&&["source_type","os_family"].includes(i))document.getElementById(i).value=saved[i]});
  chks.forEach(i=>{if(saved[i]!==undefined)document.getElementById(i).checked=!!saved[i]});
+ srcHint();
  if(saved.morpheus_url&&saved.morpheus_token)lookups()}catch(e){}})();
 </script></html>"""

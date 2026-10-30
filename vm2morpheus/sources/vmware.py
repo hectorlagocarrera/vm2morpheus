@@ -10,6 +10,16 @@ from .base import Source
 CHUNK = 4 * 1024 * 1024
 
 
+def explain_error(e: Exception) -> Exception:
+    """Standalone ESXi with a free license answers write operations with RestrictedVersion; say so clearly."""
+    text = f"{type(e).__name__} {e}".lower()
+    if "restrictedversion" in text or "license" in text and "prohibit" in text:
+        return RuntimeError("La licencia de este ESXi no permite la operación por API (la licencia gratuita es de "
+                            "solo lectura). Usa una licencia que lo permita o conéctate a través de vCenter. "
+                            f"Detalle: {e}")
+    return e
+
+
 def lease_url(url: str, api_type: str, esxi_host: str | None, connect_host: str) -> str:
     """NFC export URLs carry a '*' where the host name goes. Connected to a standalone ESXi that is the host we
     connected to; connected to vCenter the data comes straight from the ESXi host that runs the VM."""
@@ -89,7 +99,7 @@ class VMwareSource(Source):
         for dev in cfg.hardware.device:
             if isinstance(dev, vim.vm.device.VirtualDisk):
                 disks.append(DiskInfo(name=dev.deviceInfo.label, size_bytes=int(dev.capacityInBytes),
-                                      path=dev.backing.fileName))
+                                      path=dev.backing.fileName, index=len(disks)))
             elif isinstance(dev, vim.vm.device.VirtualEthernetCard):
                 nets.append(dev.deviceInfo.summary)
         guest = (cfg.guestId or "").lower()
@@ -104,6 +114,14 @@ class VMwareSource(Source):
         )
 
     def power_off(self, name: str) -> None:
+        try:
+            self._power_off(name)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise explain_error(e)
+
+    def _power_off(self, name: str) -> None:
         vm = self._find(name)
         if vm.runtime.powerState != "poweredOn":
             return
@@ -123,6 +141,14 @@ class VMwareSource(Source):
         raise RuntimeError(f"La VM {name} no se apagó en 5 minutos")
 
     def fetch_disks(self, vm: VMInfo, dest: Path, progress) -> list[Path]:
+        try:
+            return self._fetch_disks(vm, dest, progress)
+        except RuntimeError:
+            raise
+        except Exception as e:
+            raise explain_error(e)
+
+    def _fetch_disks(self, vm: VMInfo, dest: Path, progress) -> list[Path]:
         from pyVmomi import vim
         mo = self._find(vm.name)
         lease = mo.ExportVm()
@@ -135,10 +161,12 @@ class VMwareSource(Source):
             cookie = self.si._stub.cookie
             esxi_host = str(getattr(mo.runtime.host, "name", "") or "")
             disk_urls = [d for d in lease.info.deviceUrl if d.disk]
+            wanted = {d.index for d in vm.disks}
             for i, du in enumerate(disk_urls):
+                if i not in wanted:  # the user left this disk out
+                    continue
                 url = lease_url(du.url, self.api_type, esxi_host, self.host)
                 local = dest / f"{vm.name}-disk{i}.vmdk"
-                total = vm.disks[i].size_bytes if i < len(vm.disks) else None
                 cb = progress(f"descargar {local.name}")
                 done = 0
                 with requests.get(url, stream=True, verify=self.verify, headers={"Cookie": cookie}) as r:

@@ -11,6 +11,11 @@ class CancelledError(Exception):
     """The user pressed Cancel."""
 
 
+def no_window(platform: str | None = None) -> dict:
+    """subprocess kwargs that stop Windows from flashing a console window when the app itself has none."""
+    return {"creationflags": 0x08000000} if (platform or sys.platform) == "win32" else {}  # CREATE_NO_WINDOW
+
+
 def human(n: float) -> str:
     for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
         if n < 1024 or unit == "TiB":

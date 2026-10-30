@@ -59,6 +59,17 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             raise CancelledError("cancelled")
 
     vm = source.get_vm(vm_name)
+    for i, d in enumerate(vm.disks):
+        if d.index is None:
+            d.index = i
+    selected = opts.get("disk_indexes")
+    if selected is not None:
+        total_disks = len(vm.disks)
+        vm.disks = [d for d in vm.disks if d.index in set(selected)]
+        if not vm.disks:
+            raise RuntimeError("No hay ningún disco seleccionado para convertir")
+        log(f"Discos seleccionados: {len(vm.disks)} de {total_disks} "
+            f"({', '.join(d.name for d in vm.disks)}); el primero se trata como disco de arranque")
     fmt = opts.get("output_format", "qcow2")
     windows_inject = bool(opts.get("inject_drivers")) and _is_windows() and vm.os_family == "windows"
     if windows_inject and source.direct:

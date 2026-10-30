@@ -7,6 +7,7 @@ class DiskInfo:
     size_bytes: int
     path: str
     used_bytes: int | None = None  # actual file size on the source, when known
+    index: int | None = None  # position on the source VM, kept when only some disks are selected
 
 
 @dataclass

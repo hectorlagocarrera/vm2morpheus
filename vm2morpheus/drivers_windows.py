@@ -11,6 +11,8 @@ from pathlib import Path
 
 import requests
 
+from .util import no_window
+
 DRIVERS = ("viostor", "vioscsi", "NetKVM", "Balloon", "vioserial")
 ISO_URL = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
 CACHED_ISO = Path.home() / ".vm2morpheus" / "virtio-win.iso"
@@ -48,14 +50,14 @@ def ps_quote(s: str) -> str:
 
 def run_powershell(script: str) -> str:
     r = subprocess.run(["powershell", "-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script],
-                       capture_output=True, text=True)
+                       capture_output=True, text=True, **no_window())
     if r.returncode != 0:
         raise RuntimeError(f"Falló PowerShell: {(r.stderr or r.stdout).strip()[-600:]}")
     return r.stdout.strip()
 
 
 def run_dism(args: list[str]) -> None:
-    r = subprocess.run(["dism", *args], capture_output=True, text=True)
+    r = subprocess.run(["dism", *args], capture_output=True, text=True, **no_window())
     if r.returncode != 0:
         raise RuntimeError(f"Falló DISM ({r.returncode}): {(r.stdout + r.stderr).strip()[-600:]}")
 

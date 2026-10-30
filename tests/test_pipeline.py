@@ -669,3 +669,129 @@ def test_vmware_nfc_url_host_depends_on_vcenter_or_esxi():
     assert lease_url(url, "VirtualCenter", "esxi01.lab", "vcenter.lab") == "https://esxi01.lab/nfc/52d1/disk-0.vmdk"
     assert lease_url(url, "HostAgent", "esxi01.lab", "esxi01.lab") == "https://esxi01.lab/nfc/52d1/disk-0.vmdk"
     assert lease_url(url, "VirtualCenter", "", "vcenter.lab") == "https://vcenter.lab/nfc/52d1/disk-0.vmdk"
+
+
+def test_esxi_alias_and_license_hint():
+    from vm2morpheus.sources import make_source
+    from vm2morpheus.sources.vmware import VMwareSource, explain_error
+    src = make_source({"type": "esxi", "host": "10.0.0.9", "username": "root", "password": "p"})
+    assert isinstance(src, VMwareSource)
+
+    class RestrictedVersion(Exception):
+        pass
+
+    msg = str(explain_error(RestrictedVersion("Current license or ESXi version prohibits execution")))
+    assert "solo lectura" in msg and "vCenter" in msg
+    other = ValueError("boom")
+    assert explain_error(other) is other
+
+
+def test_no_window_flag_only_on_windows():
+    from vm2morpheus.util import no_window
+    assert no_window("win32") == {"creationflags": 0x08000000} and no_window("linux") == {}
+
+
+def test_launcher_logs_to_file_when_there_is_no_console(tmp_path, monkeypatch):
+    import sys
+    from vm2morpheus import launcher
+    monkeypatch.setattr(launcher, "LOG", tmp_path / "logs" / "x.log")
+    monkeypatch.setattr(sys, "stdout", None)
+    monkeypatch.setattr(sys, "stderr", None)
+    handle = launcher.setup_streams()
+    try:
+        assert sys.stderr is handle and sys.stdout is handle
+        print("hola", file=sys.stderr)
+    finally:
+        handle.close()
+    assert "hola" in (tmp_path / "logs" / "x.log").read_text(encoding="utf-8")
+
+
+def test_launcher_reports_unexpected_errors(monkeypatch):
+    from vm2morpheus import launcher
+    shown = []
+    monkeypatch.setattr(launcher, "show_error", shown.append)
+
+    def boom():
+        raise ValueError("kaput")
+
+    assert launcher.run(boom) == 1 and "kaput" in shown[0]
+
+    def bye():
+        raise SystemExit("mensaje de salida")
+
+    assert launcher.run(bye) == 1 and shown[-1] == "mensaje de salida"
+    assert launcher.run(lambda: 0) == 0
+
+
+def test_idle_watchdog_rule():
+    from vm2morpheus.gui import idle_too_long
+    assert not idle_too_long(None, 1000, False)          # the page never connected: keep running
+    assert not idle_too_long(900, 1000, False)           # recent heartbeat
+    assert idle_too_long(100, 1000, False)               # tab closed long ago
+    assert not idle_too_long(100, 1000, True)            # ...but never while a migration runs
+
+
+def test_ping_and_shutdown_endpoints(tmp_path):
+    import urllib.request
+    from vm2morpheus import gui
+    srv = HTTPServer(("127.0.0.1", 0), gui.Handler)
+    gui.STATE["server"] = srv
+    t = threading.Thread(target=srv.serve_forever, daemon=True)
+    t.start()
+    base = f"http://127.0.0.1:{srv.server_port}"
+    urllib.request.urlopen(base + "/ping").read()
+    assert gui.STATE["last_ping"] is not None
+    urllib.request.urlopen(urllib.request.Request(base + "/shutdown", data=b"{}", method="POST")).read()
+    t.join(timeout=5)
+    assert not t.is_alive()
+
+
+def test_second_instance_reuses_the_running_one(capsys):
+    import socket
+    from vm2morpheus import gui
+    sock = socket.socket()
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    port = sock.getsockname()[1]
+    try:
+        gui.serve(port, open_browser=False)  # must return instead of raising "address in use"
+    finally:
+        sock.close()
+    assert "Ya hay una instancia" in capsys.readouterr().out
+
+
+def test_only_selected_disks_are_migrated(tmp_path):
+    import io
+    import zipfile
+    d0, d1, d2 = (tmp_path / n for n in ("a.vmdk", "b.vmdk", "c.vmdk"))
+    for d in (d0, d1, d2):
+        subprocess.run(["qemu-img", "create", "-f", "vmdk", str(d), "4M"], check=True, capture_output=True)
+
+    class Three(FakeSource):
+        def get_vm(self, name):
+            return VMInfo(name, 2, 2048, "bios", "windows", "off",
+                          [DiskInfo(f"{c}.vmdk", 4 << 20, "x", index=i) for i, c in enumerate("abc")])
+
+        def fetch_disks(self, vm, dest, progress):
+            out = []
+            for d in vm.disks:  # only what the pipeline kept
+                src = (d0, d1, d2)[d.index]
+                shutil.copy(src, dest / src.name)
+                out.append(dest / src.name)
+            return out
+
+    FakeMorpheus.log.clear()
+    FakeMorpheus.uploads.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    msgs = []
+    migrate(Three(d0), _client(srv), "vm1", {"workdir": str(tmp_path / "w15"), "shutdown_source": True,
+                                             "disk_indexes": [0, 2]}, {"image_type": "qcow2"}, log=msgs.append)
+    srv.shutdown()
+    z = zipfile.ZipFile(io.BytesIO(FakeMorpheus.uploads[7]))
+    meta = json.loads(z.read("metadata.json"))
+    assert [d["capacity"] for d in meta["disks"]] == [4 << 20, 4 << 20] and len(meta["disks"]) == 2
+    assert any("Discos seleccionados: 2 de 3" in m for m in msgs)
+    with pytest.raises(RuntimeError, match="ningún disco"):
+        migrate(Three(d0), _client(HTTPServer(("127.0.0.1", 0), FakeMorpheus)), "vm1",
+                {"workdir": str(tmp_path / "w16"), "disk_indexes": []}, {}, log=lambda *_: None)

@@ -17,7 +17,7 @@ def build_parser():
     p.add_argument("command", nargs="?", default="gui", choices=["inspect", "check", "migrate", "gui"])
     p.add_argument("-c", "--config", help="fichero de configuración YAML")
     p.add_argument("--vm", help="nombre de la VM en el origen")
-    p.add_argument("--source-type", choices=["hyperv", "vmware"])
+    p.add_argument("--source-type", choices=["hyperv", "vmware", "esxi"])
     p.add_argument("--source-host")
     p.add_argument("--source-user")
     p.add_argument("--morpheus-url")

@@ -12,7 +12,7 @@ jobs:
         with: { python-version: "3.12" }
       - run: pip install -e ".[all]" pyinstaller
       - run: >
-          pyinstaller --onefile --name vm2morpheus
+          pyinstaller --onefile --noconsole --name vm2morpheus
           --collect-all pyVmomi --collect-all smbprotocol --collect-all winrm
           --hidden-import smbclient exe_entry.py
       - name: Bundle qemu-img next to the exe
