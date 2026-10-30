@@ -62,6 +62,11 @@ def build_instance_template(f: dict) -> dict | None:
 
 
 def make_cfgs(f: dict):
+    for key, label in (("vm", "el nombre de la VM"), ("source_host", "el host de origen"),
+                       ("morpheus_url", "la URL de Morpheus")):
+        f[key] = (f.get(key) or "").strip()
+        if not f[key] and (key != "morpheus_url" or f.get("_needs_morpheus", True)):
+            raise ValueError(f"Falta {label}")
     src = {"type": f["source_type"], "host": f["source_host"], "username": f["source_user"],
            "password": f["source_password"], "os_family": f.get("os_family", "other"),
            "verify_ssl": False}
