@@ -15,6 +15,27 @@ def _is_windows() -> bool:
 
 
 STEPS = ["fetch", "convert", "drivers", "upload", "instance"]
+STEP_LABELS = {
+    "fetch": "descarga de discos",
+    "convert": "conversión a qcow2",
+    "drivers": "inyección de drivers",
+    "upload": "subida a Morpheus",
+    "instance": "creación de la VM",
+}
+
+
+def relevant_steps(opts: dict, mcfg: dict, injected: bool = False) -> list[str]:
+    """Steps that apply to this run, so the messages do not mention things that were never requested."""
+    steps = list(STEPS)
+    if not (opts.get("inject_drivers") or injected):
+        steps.remove("drivers")
+    if not (mcfg.get("reference_instance") or mcfg.get("instance")):
+        steps.remove("instance")
+    return steps
+
+
+def labels(steps: list[str]) -> str:
+    return ", ".join(STEP_LABELS[x] for x in steps) or "nada"
 
 
 class State:
@@ -77,7 +98,8 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     if dry_run:
         for p in problems:
             log(f"  fallaría: {p}")
-        log("Simulación: pasos = " + " -> ".join(STEPS) + f" (formato de destino {fmt})")
+        steps = " → ".join(STEP_LABELS[x] for x in relevant_steps(opts, mcfg))
+        log(f"Simulación: se harían estos pasos: {steps}. No se ha modificado nada.")
         return {"dry_run": True, "problems": problems}
     if problems:
         raise RuntimeError("; ".join(problems))
@@ -93,13 +115,17 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         st.d["done"].remove("instance")  # redo only the last step; delete the old instance in Morpheus first
         st.d.pop("instance", None)
         st.path.write_text(json.dumps(st.d, indent=2))
-    skipped = [x for x in STEPS if st.done(x)]
-    if skipped:
-        log(f"Se reanuda desde {st.path}; ya hecho: {', '.join(skipped)}")
-        if len(skipped) == len(STEPS):
-            log("Todo se completó en una ejecución anterior. Imágenes en Morpheus: "
-                + ", ".join(f"{i['name']} (id {i['id']})" for i in st.d.get("images", [])))
-            log(f"Para migrar esta VM de nuevo desde cero, borra {st.path}")
+    steps = relevant_steps(opts, mcfg, bool(st.d.get("injected")))
+    done = [x for x in steps if st.done(x)]
+    pending = [x for x in steps if not st.done(x)]
+    if done and pending:
+        log(f"Se continúa una migración anterior. Ya hecho: {labels(done)}. Falta: {labels(pending)}.")
+        log(f"(Progreso guardado en {st.path})")
+    elif done:
+        names = ", ".join(f"{i['name']} (id {i['id']})" for i in st.d.get("images", []))
+        log(f"Esta VM ya se migró por completo en una ejecución anterior (imágenes en Morpheus: {names}).")
+        log(f"Para migrarla otra vez desde cero, borra {st.path}; para recrear solo la VM, marca "
+            "'Recrear solo la instancia'.")
 
     bundle = bool(opts.get("multi_disk_bundle", True)) and len(vm.disks) > 1
 

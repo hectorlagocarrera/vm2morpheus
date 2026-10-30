@@ -519,3 +519,27 @@ def test_driver_injection_without_admin_fails_before_any_work(tmp_path, monkeypa
         migrate(Win(tmp_path / "x"), MorpheusClient("http://x", "t"), "vm1",
                 {"workdir": str(tmp_path / "w11"), "inject_drivers": True}, {}, log=lambda *_: None)
     assert not (tmp_path / "w11" / "vm1").exists()  # nothing was created or downloaded
+
+
+def test_resume_and_dryrun_messages_are_readable(tmp_path):
+    from vm2morpheus.pipeline import labels, relevant_steps
+    assert relevant_steps({}, {}) == ["fetch", "convert", "upload"]
+    assert relevant_steps({"inject_drivers": True}, {"reference_instance": {"instance_id": 5}}) == [
+        "fetch", "convert", "drivers", "upload", "instance"]
+    assert labels(["fetch", "upload"]) == "descarga de discos, subida a Morpheus"
+
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    wd = tmp_path / "w12" / "vm1"
+    wd.mkdir(parents=True)
+    ready = wd / "vm1.qcow2"
+    subprocess.run(["qemu-img", "create", "-f", "qcow2", str(ready), "8M"], check=True, capture_output=True)
+    (wd / "state.json").write_text(json.dumps({"done": ["fetch", "convert"], "fetched": [str(disk)],
+                                               "converted": [str(ready)]}))
+    msgs = []
+    with pytest.raises(Exception):  # no Morpheus is listening: the run stops at the upload, after the message
+        migrate(FakeSource(disk), MorpheusClient("http://127.0.0.1:1", "t"), "vm1",
+                {"workdir": str(tmp_path / "w12"), "shutdown_source": True}, {"image_type": "qcow2"}, log=msgs.append)
+    text = "\n".join(msgs)
+    assert "Ya hecho: descarga de discos, conversión a qcow2. Falta: subida a Morpheus." in text
+    assert "fetch" not in text and "drivers" not in text
