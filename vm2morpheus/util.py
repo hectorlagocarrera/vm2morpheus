@@ -23,8 +23,9 @@ def resolve_secret(value):
 class Progress:
     """Callable (done, total) -> None that prints a throttled one-line progress bar."""
 
-    def __init__(self, label: str, stream=None):
+    def __init__(self, label: str, stream=None, percent: bool = False):
         self.label = label
+        self.percent = percent
         self.stream = stream or sys.stderr
         self._last = 0.0
 
@@ -33,7 +34,9 @@ class Progress:
         if now - self._last < 0.5 and not (total and done >= total):
             return
         self._last = now
-        if total:
+        if total and self.percent:
+            self.stream.write(f"\r  {self.label}: {done / total:6.1%}   ")
+        elif total:
             self.stream.write(f"\r  {self.label}: {done / total:6.1%} ({human(done)} / {human(total)})   ")
         else:
             self.stream.write(f"\r  {self.label}: {human(done)}   ")

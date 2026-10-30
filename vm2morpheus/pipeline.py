@@ -87,7 +87,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         source.ensure_access([Path(p) for p in st.d["fetched"]])
         for src in map(Path, st.d["fetched"]):
             dst = workdir / f"{src.stem}.{fmt}"
-            bar = Progress(f"convert {src.name}")
+            bar = Progress(f"convert {src.name}", percent=True)
             convert_disk(src, dst, fmt, bar)
             bar.finish()
             out.append(str(dst))
