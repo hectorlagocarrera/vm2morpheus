@@ -66,6 +66,10 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         log("the saved progress says the image was uploaded, but it is not in this Morpheus: starting from scratch")
         st.path.unlink(missing_ok=True)
         st = State(st.path)
+    if opts.get("recreate_instance") and st.done("instance"):
+        st.d["done"].remove("instance")  # redo only the last step; delete the old instance in Morpheus first
+        st.d.pop("instance", None)
+        st.path.write_text(json.dumps(st.d, indent=2))
     skipped = [x for x in STEPS if st.done(x)]
     if skipped:
         log(f"resuming from {st.path}: already done: {', '.join(skipped)}")
@@ -143,23 +147,24 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         if refcfg:
             ref = morpheus.get_instance(refcfg["instance_id"])
             root_gb = -(-vm.disks[0].size_bytes // 2**30)
-            in_bundle = st.d.get("bundle", False)  # the image already carries every disk
-            extra_gb = [] if in_bundle else [-(-d.size_bytes // 2**30) for d in vm.disks[1:]]
+            in_bundle = st.d.get("bundle", False)  # one image carrying every disk (names match metadata.json)
+            extra_gb = [-(-d.size_bytes // 2**30) for d in vm.disks[1:]]
             try:
                 payload = payload_from_reference(ref, vm.name,
                                                  int(refcfg["image_id"]) if refcfg.get("image_id") else None,
                                                  st.d["images"][0]["id"], root_gb, extra_gb,
-                                                 root_only=in_bundle, uefi=vm.firmware == "uefi")
+                                                 uefi=vm.firmware == "uefi",
+                                                 extra_name="data" if in_bundle else None)
             except MorpheusError:
                 dump = workdir / "reference-instance.json"
                 dump.write_text(json.dumps(redact(ref), indent=2, ensure_ascii=False), encoding="utf-8")
                 log(f"saved the reference instance (credentials hidden) to {dump}")
                 raise
-            if in_bundle:
-                log("disks are taken from the multi-disk image")
-            elif extra_gb:
+            if extra_gb and not in_bundle:
                 log(f"note: {len(extra_gb)} extra disk(s) are added as BLANK volumes; their data was uploaded "
                     "as separate images but is not attached")
+            elif extra_gb:
+                log(f"adding {len(extra_gb)} data volume(s) matching the multi-disk image")
             log("creating Morpheus instance (cloned from the reference instance) ...")
             inst = morpheus.create_instance(payload)
             st.mark("instance", instance={"id": inst.get("id"), "name": inst.get("name")})

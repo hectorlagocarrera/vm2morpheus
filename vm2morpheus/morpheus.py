@@ -128,7 +128,8 @@ def render_template(obj, values: dict):
 
 def payload_from_reference(ref: dict, name: str, old_image_id: int | None, new_image_id: int,
                            root_gb: int | None = None, extra_gb: list[int] | None = None,
-                           root_only: bool = False, uefi: bool | None = None) -> dict:
+                           root_only: bool = False, uefi: bool | None = None,
+                           extra_name: str | None = None) -> dict:
     """Build POST /api/instances from an instance created by hand in the UI, swapping its image.
 
     Only values under keys that mention "image" are swapped (so an unrelated number that happens to
@@ -184,7 +185,7 @@ def payload_from_reference(ref: dict, name: str, old_image_id: int | None, new_i
         volumes.append(nv)
     root = next((v for v in volumes if v["rootVolume"]), None)
     for i, gb in enumerate(extra_gb or [], start=1):  # blank data disks sized like the source's extra disks
-        nv = {"id": -1, "name": f"data{i}", "rootVolume": False, "size": gb}
+        nv = {"id": -1, "name": extra_name or f"data{i}", "rootVolume": False, "size": gb}
         for k in ("storageType", "datastoreId"):
             if root and k in root:
                 nv[k] = root[k]

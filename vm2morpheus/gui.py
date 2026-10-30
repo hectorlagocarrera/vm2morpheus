@@ -80,7 +80,8 @@ def make_cfgs(f: dict):
     elif tpl:
         m["instance"] = tpl
     opts = {"workdir": f.get("workdir") or "vm2morpheus-work", "shutdown_source": bool(f.get("shutdown")),
-            "inject_drivers": bool(f.get("inject_drivers")), "keep_files": False, "multi_disk_bundle": bool(f.get("multi_disk_bundle"))}
+            "inject_drivers": bool(f.get("inject_drivers")), "keep_files": False, "multi_disk_bundle": bool(f.get("multi_disk_bundle")),
+            "recreate_instance": bool(f.get("recreate_instance"))}
     return src, m, opts
 
 
@@ -224,6 +225,7 @@ small{color:#5d6b7b}
 <fieldset><legend>4. Opciones</legend><div class="chk">
 <label><input type="checkbox" id="shutdown"> Apagar la VM de origen</label>
 <label><input type="checkbox" id="multi_disk_bundle" checked> Varios discos en una sola imagen (zip + metadata.json)</label>
+<label><input type="checkbox" id="recreate_instance"> Recrear solo la instancia (borra antes la anterior en Morpheus)</label>
 <label><input type="checkbox" id="direct_read"> Conversión directa, sin copiar el disco antes (Hyper-V, solo Windows)</label>
 <label><input type="checkbox" id="inject_drivers"> Inyectar drivers VirtIO (experimental)</label></div>
 <label>Carpeta de trabajo (necesita ~2× el tamaño de los discos)</label><input id="workdir" value="vm2morpheus-work"></fieldset>
@@ -231,7 +233,7 @@ small{color:#5d6b7b}
 <pre id="log">Listo.</pre></main>
 <script>
 const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","ref_instance_id","ref_image_id","workdir"];
-const chks=["verify_ssl","shutdown","direct_read","multi_disk_bundle","inject_drivers"];
+const chks=["verify_ssl","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers"];
 const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);return o};
 const show=t=>document.getElementById("log").textContent=t;
 async function post(p,b){const r=await fetch(p,{method:"POST",body:JSON.stringify(b)});const j=await r.json();if(j.error)throw new Error(j.error);return j}

@@ -223,7 +223,7 @@ def test_two_disks_are_bundled_with_metadata_json(tmp_path):
         {"capacity": 4 << 20, "guestDeviceName": "sdb", "position": 1, "name": "data", "file": "vm1-sdb"}]
     assert z.read("vm1-sda")[:4] == b"QFI\xfb" and z.read("vm1-sdb")[:4] == b"QFI\xfb"
     inst = dict(FakeMorpheus.log)["instance"]
-    assert [v["rootVolume"] for v in inst["volumes"]] == [True]  # extra disks come from the image metadata
+    assert [(v["name"], v["rootVolume"]) for v in inst["volumes"]] == [("root", True), ("data", False)]
 
 
 def test_reference_payload_autodetects_image_value():
