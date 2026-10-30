@@ -44,6 +44,12 @@ class FakeMorpheus(BaseHTTPRequestHandler):
         self._send({"success": False, "msg": "nope"}, 404)
 
     def do_GET(self):
+        if self.path == "/api/instances/5":
+            return self._send({"success": True, "instance": {
+                "cloud": {"id": 1}, "group": {"id": 2}, "instanceType": {"code": "hvm"}, "layout": {"id": 4},
+                "plan": {"id": 6}, "config": {"imageId": 3, "hostId": 3, "memory": 3},
+                "volumes": [{"name": "root", "rootVolume": True, "size": 20, "type": {"id": 9}}],
+                "interfaces": [{"network": {"id": 11}}]}})
         if self.path == "/api/virtual-images/7":
             return self._send({"success": True, "virtualImage": {"id": 7, "status": "Active"}})
         self._send({"success": False, "msg": "nope"}, 404)
@@ -152,3 +158,21 @@ def test_stale_state_is_discarded_when_image_missing_in_morpheus(tmp_path):
                   {"image_type": "qcow2"}, log=lambda *_: None)
     srv.shutdown()
     assert res["images"] == [{"id": 7, "name": "vm1"}]
+
+
+def test_instance_cloned_from_reference_swaps_only_image(tmp_path):
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    FakeMorpheus.log.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    client = MorpheusClient(f"http://127.0.0.1:{srv.server_port}", "tok")
+    migrate(FakeSource(disk), client, "vm1", {"workdir": str(tmp_path / "w2"), "shutdown_source": True},
+            {"image_type": "qcow2", "reference_instance": {"instance_id": 5, "image_id": 3}},
+            log=lambda *_: None)
+    srv.shutdown()
+    sent = dict(FakeMorpheus.log)["instance"]
+    assert sent["config"] == {"imageId": 7, "hostId": 3, "memory": 3}
+    assert sent["instance"]["layout"] == {"id": 4} and sent["zoneId"] == 1
+    assert sent["networkInterfaces"] == [{"network": {"id": "11"}}]
+    assert sent["volumes"][0]["size"] == 20 and sent["volumes"][0]["storageType"] == 9

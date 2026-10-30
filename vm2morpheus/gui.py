@@ -73,7 +73,9 @@ def make_cfgs(f: dict):
     m = {"url": f["morpheus_url"], "token": f["morpheus_token"], "verify_ssl": bool(f.get("verify_ssl")),
          "image_type": f.get("image_type") or "qcow2"}
     tpl = build_instance_template(f)
-    if tpl:
+    if f.get("ref_instance_id") and f.get("ref_image_id"):
+        m["reference_instance"] = {"instance_id": int(f["ref_instance_id"]), "image_id": int(f["ref_image_id"])}
+    elif tpl:
         m["instance"] = tpl
     opts = {"workdir": f.get("workdir") or "vm2morpheus-work", "shutdown_source": bool(f.get("shutdown")),
             "inject_drivers": bool(f.get("inject_drivers")), "keep_files": False}
@@ -203,10 +205,13 @@ small{color:#5d6b7b}
 </div><div class="chk"><label><input type="checkbox" id="verify_ssl"> Verificar certificado TLS</label></div>
 <button class="sec" onclick="lookups()">Cargar nubes, grupos, planes y redes</button></fieldset>
 <fieldset><legend>3. Crear la VM en Morpheus (opcional)</legend>
-<small>Requiere un Layout (Library → Blueprints) que use un Node Type con la imagen subida. Si lo dejas vacío, solo se sube la imagen.</small>
+<small>Crea antes a mano UNA instancia HPE HVM con cualquier imagen (Provisioning → Instances → Add). Pon aquí su ID y el ID de la imagen que usó (Library → Virtual Images): el programa la clona cambiando solo la imagen. Vacío = solo se sube la imagen.</small>
+<div class="row"><div><label>ID de la instancia de referencia</label><input id="ref_instance_id"></div>
+<div><label>ID de la imagen de esa instancia</label><input id="ref_image_id"></div></div>
+<details><summary><small>Alternativa avanzada: layout manual</small></summary>
 <div class="row"><div><label>Nube</label><select id="cloud_id"></select></div><div><label>Grupo</label><select id="group_id"></select></div>
 <div><label>Plan</label><select id="plan_id"></select></div><div><label>Red</label><select id="network_id"></select></div>
-<div><label>Instance type (código)</label><input id="instance_type" value="ubuntu"></div><div><label>Layout ID</label><input id="layout_id"></div></div></fieldset>
+<div><label>Instance type (código)</label><input id="instance_type" value="ubuntu"></div><div><label>Layout ID</label><input id="layout_id"></div></div></details></fieldset>
 <fieldset><legend>4. Opciones</legend><div class="chk">
 <label><input type="checkbox" id="shutdown"> Apagar la VM de origen</label>
 <label><input type="checkbox" id="direct_read"> Conversión directa, sin copiar el disco antes (Hyper-V, solo Windows)</label>
@@ -215,7 +220,7 @@ small{color:#5d6b7b}
 <button onclick="run('/dryrun')" class="sec">Simulación</button><button onclick="run('/migrate')">Migrar</button>
 <pre id="log">Listo.</pre></main>
 <script>
-const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","workdir"];
+const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","ref_instance_id","ref_image_id","workdir"];
 const chks=["verify_ssl","shutdown","direct_read","inject_drivers"];
 const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);return o};
 const show=t=>document.getElementById("log").textContent=t;

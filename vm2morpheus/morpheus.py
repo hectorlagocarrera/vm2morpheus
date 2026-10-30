@@ -101,6 +101,9 @@ class MorpheusClient:
             time.sleep(poll)
 
     # --- instances -------------------------------------------------------
+    def get_instance(self, instance_id: int) -> dict:
+        return self._req("GET", f"/api/instances/{instance_id}")["instance"]
+
     def create_instance(self, payload: dict) -> dict:
         return self._req("POST", "/api/instances", json=payload)["instance"]
 
@@ -121,3 +124,54 @@ def render_template(obj, values: dict):
         except (KeyError, IndexError):
             return obj
     return obj
+
+
+def payload_from_reference(ref: dict, name: str, old_image_id: int, new_image_id: int,
+                           root_gb: int | None = None) -> dict:
+    """Build POST /api/instances from an instance created by hand in the UI, swapping its image.
+
+    Only values under keys that mention "image" are swapped (so an unrelated number that happens to
+    equal the image id is left alone). Raises if the reference image id is not found.
+    """
+    swapped = []
+
+    def swap(o, in_image_key=False):
+        if isinstance(o, dict):
+            return {k: swap(v, in_image_key or "image" in k.lower()) for k, v in o.items()}
+        if isinstance(o, list):
+            return [swap(v, in_image_key) for v in o]
+        if in_image_key and not isinstance(o, bool) and str(o) == str(old_image_id):
+            swapped.append(o)
+            return type(o)(new_image_id)
+        return o
+
+    config = swap(ref.get("config") or {})
+    if not swapped:
+        raise MorpheusError(f"image id {old_image_id} not found in the reference instance config; "
+                            "check the reference image ID (Library > Virtual Images)")
+    payload = {
+        "zoneId": ref["cloud"]["id"],
+        "instance": {
+            "name": name,
+            "site": {"id": ref["group"]["id"]},
+            "instanceType": {"code": ref["instanceType"]["code"]},
+            "layout": {"id": ref["layout"]["id"]},
+            "plan": {"id": ref["plan"]["id"]},
+        },
+        "config": config,
+    }
+    volumes = []
+    for v in ref.get("volumes") or []:
+        nv = {"id": -1, "name": v.get("name"), "rootVolume": bool(v.get("rootVolume")), "size": v.get("size")}
+        st = (v.get("type") or v.get("storageType"))
+        if isinstance(st, dict) and st.get("id") is not None:
+            nv["storageType"] = st["id"]
+        if nv["rootVolume"] and root_gb:
+            nv["size"] = max(int(nv["size"] or 0), root_gb)  # the root disk must hold the migrated image
+        volumes.append(nv)
+    if volumes:
+        payload["volumes"] = volumes
+    nics = [{"network": {"id": str(i["network"]["id"])}} for i in ref.get("interfaces") or [] if i.get("network")]
+    if nics:
+        payload["networkInterfaces"] = nics
+    return payload

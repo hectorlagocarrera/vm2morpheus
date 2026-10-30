@@ -3,7 +3,7 @@ import shutil
 from pathlib import Path
 
 from .convert import convert_disk, inject_drivers
-from .morpheus import MorpheusClient, render_template
+from .morpheus import MorpheusClient, payload_from_reference, render_template
 from .sources.base import Source
 from .util import Progress, human
 
@@ -123,7 +123,16 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     result = {"images": st.d["images"]}
     if not st.done("instance"):
         template = mcfg.get("instance")
-        if template:
+        refcfg = mcfg.get("reference_instance")
+        if refcfg:
+            ref = morpheus.get_instance(refcfg["instance_id"])
+            root_gb = -(-vm.disks[0].size_bytes // 2**30)
+            payload = payload_from_reference(ref, vm.name, int(refcfg["image_id"]),
+                                             st.d["images"][0]["id"], root_gb)
+            log("creating Morpheus instance (cloned from the reference instance) ...")
+            inst = morpheus.create_instance(payload)
+            st.mark("instance", instance={"id": inst.get("id"), "name": inst.get("name")})
+        elif template:
             vals = {"image_id": st.d["images"][0]["id"], "image_name": st.d["images"][0]["name"],
                     "vm_name": vm.name, "cpu": vm.cpu, "memory_mb": vm.memory_mb,
                     "memory_bytes": vm.memory_mb * 1024 * 1024}
