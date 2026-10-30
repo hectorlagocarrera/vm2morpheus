@@ -232,3 +232,9 @@ def test_reference_payload_autodetects_image_value():
            "plan": {"id": 6}, "config": {"imageId": 3, "hostId": 3, "imageType": "qcow2"}}
     p = payload_from_reference(ref, "vm1", None, 7)
     assert p["config"] == {"imageId": 7, "hostId": 3, "imageType": "qcow2"}
+
+
+def test_redact_hides_credentials():
+    from vm2morpheus.gui import redact
+    assert redact({"a": {"adminPassword": "x", "n": 1}, "l": [{"apiToken": "t"}]}) == {
+        "a": {"adminPassword": "***", "n": 1}, "l": [{"apiToken": "***"}]}

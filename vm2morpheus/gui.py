@@ -41,6 +41,16 @@ class JobLog:
         return "\n".join(self.lines + ([self.cur] if self.cur.strip() else []))
 
 
+def redact(o):
+    """Hide anything that looks like a credential before the JSON is shown (and maybe pasted)."""
+    if isinstance(o, dict):
+        return {k: "***" if any(w in k.lower() for w in ("password", "secret", "token", "privatekey")) else redact(v)
+                for k, v in o.items()}
+    if isinstance(o, list):
+        return [redact(v) for v in o]
+    return o
+
+
 def build_instance_template(f: dict) -> dict | None:
     """Payload for POST /api/instances from the form fields. UNVERIFIED against a live appliance."""
     if not f.get("layout_id"):
@@ -145,6 +155,11 @@ class Handler(BaseHTTPRequestHandler):
                     "instances": [(i["id"], i["name"]) for i in c._req("GET", "/api/instances", params={"max": 200}).get("instances", [])],
                     "networks": [(n["id"], n["name"]) for n in c._req("GET", "/api/networks", params={"max": 200}).get("networks", [])],
                 })
+            if self.path == "/refinfo":
+                c = MorpheusClient(f["morpheus_url"], f["morpheus_token"], verify=bool(f.get("verify_ssl")))
+                if not f.get("ref_instance_id"):
+                    raise ValueError("Elige primero la instancia de referencia")
+                return self._json(redact(c.get_instance(int(f["ref_instance_id"]))))
             if self.path == "/inspect":
                 src_cfg, _, _ = make_cfgs(f)
                 s = make_source(src_cfg)
@@ -210,6 +225,7 @@ small{color:#5d6b7b}
 <small>Crea antes a mano UNA instancia HPE HVM con cualquier imagen (Provisioning → Instances → Add). Elígela en el desplegable: el programa la clona cambiando solo la imagen. Vacío = solo se sube la imagen.</small>
 <div class="row"><div><label>Instancia de referencia (pulsa "Cargar" arriba)</label><select id="ref_instance_id"><option value="">(ninguna: solo subir la imagen)</option></select></div>
 <div><label>ID de su imagen <small>(opcional; se detecta sola)</small></label><input id="ref_image_id"></div></div>
+<button class="sec" onclick="refinfo()">Ver instancia de referencia (JSON)</button>
 <details><summary><small>Alternativa avanzada: layout manual</small></summary>
 <div class="row"><div><label>Nube</label><select id="cloud_id"></select></div><div><label>Grupo</label><select id="group_id"></select></div>
 <div><label>Plan</label><select id="plan_id"></select></div><div><label>Red</label><select id="network_id"></select></div>
@@ -229,6 +245,7 @@ const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value)
 const show=t=>document.getElementById("log").textContent=t;
 async function post(p,b){const r=await fetch(p,{method:"POST",body:JSON.stringify(b)});const j=await r.json();if(j.error)throw new Error(j.error);return j}
 async function inspect_(){try{show(JSON.stringify(await post("/inspect",form()),null,2))}catch(e){show("ERROR: "+e.message)}}
+async function refinfo(){try{show(JSON.stringify(await post("/refinfo",form()),null,2))}catch(e){show("ERROR: "+e.message)}}
 async function lookups(){try{const j=await post("/lookups",form());
  for(const [k,id] of [["clouds","cloud_id"],["groups","group_id"],["plans","plan_id"],["networks","network_id"],["instances","ref_instance_id"]]){
   const s=document.getElementById(id);s.innerHTML=(id=="network_id"||id=="ref_instance_id"?'<option value="">(ninguna)</option>':'')+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("")}
