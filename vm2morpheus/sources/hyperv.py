@@ -1,4 +1,7 @@
 import json
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path, PureWindowsPath
 
@@ -33,7 +36,13 @@ class HyperVSource(Source):
         self.ssl = bool(cfg.get("ssl", False))
         self.verify = bool(cfg.get("verify_ssl", False))
         self.os_family = cfg.get("os_family", "other")
+        self.local = self.host in ("127.0.0.1", "localhost", "::1")
+        # qemu-img reads the VHDX in place (SMB or local disk): no intermediate copy. Windows only.
+        self.direct = bool(cfg.get("direct_read", False)) and os.name == "nt"
+        if cfg.get("direct_read") and not self.direct:
+            print("direct_read is only supported on Windows; copying disks instead", file=sys.stderr)
         self.session = None
+        self._shares: set[str] = set()
 
     def connect(self) -> None:
         import winrm
@@ -85,7 +94,39 @@ $snaps = @(Get-VMSnapshot -VM $vm).Count
             time.sleep(5)
         raise RuntimeError(f"VM {name} did not power off in 5 minutes")
 
+    def _unc(self, win_path: str) -> str:
+        p = PureWindowsPath(win_path)
+        return "\\\\" + self.host + "\\" + p.drive.rstrip(":") + "$\\" + "\\".join(p.parts[1:])
+
+    def ensure_access(self, paths) -> None:
+        """Open a Windows-level SMB session so qemu-img can read the UNC paths."""
+        if not self.direct or self.local:
+            return
+        for path in paths:
+            share = "\\".join(str(path).split("\\")[:4])  # \\host\X$
+            if share in self._shares:
+                continue
+            r = subprocess.run(["net", "use", share, f"/user:{self.user}", self.password],
+                               capture_output=True, text=True)
+            if r.returncode != 0:
+                raise RuntimeError(f"cannot open {share}: {(r.stdout + r.stderr).strip()}")
+            self._shares.add(share)
+
+    def close(self) -> None:
+        for share in self._shares:
+            subprocess.run(["net", "use", share, "/delete", "/y"], capture_output=True)
+        self._shares.clear()
+
     def fetch_disks(self, vm: VMInfo, dest: Path, progress) -> list[Path]:
+        if self.direct:
+            out = []
+            for disk in vm.disks:
+                if disk.path.lower().endswith(".avhdx"):
+                    raise RuntimeError(f"{disk.path} is a checkpoint (differencing) disk; "
+                                       "delete or merge the VM's checkpoints first")
+                out.append(Path(disk.path if self.local else self._unc(disk.path)))
+            self.ensure_access(out)
+            return out
         import smbclient
         smbclient.register_session(self.host, username=self.user, password=self.password)
         out = []

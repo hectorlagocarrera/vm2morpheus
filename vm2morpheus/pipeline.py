@@ -47,7 +47,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         probe = probe.parent
     free = shutil.disk_usage(probe).free
     # the downloaded disk files plus a converted copy; qcow2 only stores used blocks, so used size is a safe bound
-    needed = 2 * sum(d.used_bytes or d.size_bytes for d in vm.disks)
+    needed = (1 if source.direct else 2) * sum(d.used_bytes or d.size_bytes for d in vm.disks)
     if free < needed:
         problems.append(f"not enough free space in {probe}: {human(free)} free, about {human(needed)} needed; "
                         "set another work folder (e.g. D:\\migracion) on a bigger disk")
@@ -73,13 +73,14 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     if not st.done("convert"):
         log(f"converting to {fmt} ...")
         out = []
+        source.ensure_access([Path(p) for p in st.d["fetched"]])
         for src in map(Path, st.d["fetched"]):
-            dst = src.with_suffix(f".{fmt}")
+            dst = workdir / f"{src.stem}.{fmt}"
             bar = Progress(f"convert {src.name}")
             convert_disk(src, dst, fmt, bar)
             bar.finish()
             out.append(str(dst))
-            if not opts.get("keep_files"):
+            if not opts.get("keep_files") and _inside(src, workdir):  # never delete the source VM's own disks
                 src.unlink(missing_ok=True)
         st.mark("convert", converted=out)
 
@@ -124,6 +125,14 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     result["instance"] = st.d.get("instance")
     log("done.")
     return result
+
+
+def _inside(path: Path, folder: Path) -> bool:
+    try:
+        path.resolve().relative_to(folder.resolve())
+        return True
+    except ValueError:
+        return False
 
 
 def _bar(label):

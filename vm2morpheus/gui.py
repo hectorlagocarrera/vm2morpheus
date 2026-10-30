@@ -69,7 +69,7 @@ def make_cfgs(f: dict):
             raise ValueError(f"Falta {label}")
     src = {"type": f["source_type"], "host": f["source_host"], "username": f["source_user"],
            "password": f["source_password"], "os_family": f.get("os_family", "other"),
-           "verify_ssl": False}
+           "verify_ssl": False, "direct_read": bool(f.get("direct_read"))}
     m = {"url": f["morpheus_url"], "token": f["morpheus_token"], "verify_ssl": bool(f.get("verify_ssl")),
          "image_type": f.get("image_type") or "qcow2"}
     tpl = build_instance_template(f)
@@ -209,13 +209,14 @@ small{color:#5d6b7b}
 <div><label>Instance type (código)</label><input id="instance_type" value="ubuntu"></div><div><label>Layout ID</label><input id="layout_id"></div></div></fieldset>
 <fieldset><legend>4. Opciones</legend><div class="chk">
 <label><input type="checkbox" id="shutdown"> Apagar la VM de origen</label>
+<label><input type="checkbox" id="direct_read"> Conversión directa, sin copiar el disco antes (Hyper-V, solo Windows)</label>
 <label><input type="checkbox" id="inject_drivers"> Inyectar drivers VirtIO (experimental)</label></div>
 <label>Carpeta de trabajo (necesita ~2× el tamaño de los discos)</label><input id="workdir" value="vm2morpheus-work"></fieldset>
 <button onclick="run('/dryrun')" class="sec">Simulación</button><button onclick="run('/migrate')">Migrar</button>
 <pre id="log">Listo.</pre></main>
 <script>
 const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","workdir"];
-const chks=["verify_ssl","shutdown","inject_drivers"];
+const chks=["verify_ssl","shutdown","direct_read","inject_drivers"];
 const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);return o};
 const show=t=>document.getElementById("log").textContent=t;
 async function post(p,b){const r=await fetch(p,{method:"POST",body:JSON.stringify(b)});const j=await r.json();if(j.error)throw new Error(j.error);return j}

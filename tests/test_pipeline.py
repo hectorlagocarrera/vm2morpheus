@@ -115,3 +115,24 @@ def test_gui_http_serves_page_and_rejects_unknown_job():
     page = urllib.request.urlopen(f"http://127.0.0.1:{srv.server_port}/").read().decode()
     srv.shutdown()
     assert "vm2morpheus" in page and "Migrar" in page
+
+
+def test_direct_source_disk_is_never_deleted(tmp_path):
+    disk = tmp_path / "orig.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+
+    class Direct(FakeSource):
+        direct = True
+
+        def fetch_disks(self, vm, dest, progress):
+            return [disk]  # in place, outside the work folder
+
+    FakeMorpheus.log.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    client = MorpheusClient(f"http://127.0.0.1:{srv.server_port}", "tok")
+    migrate(Direct(disk), client, "vm1", {"workdir": str(tmp_path / "w"), "shutdown_source": True},
+            {"image_type": "qcow2"}, log=lambda *_: None)
+    srv.shutdown()
+    assert disk.exists()
+    assert FakeMorpheus.uploads[7][:4] == b"QFI\xfb"

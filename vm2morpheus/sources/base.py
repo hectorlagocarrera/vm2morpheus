@@ -23,5 +23,10 @@ class Source(ABC):
     def fetch_disks(self, vm: VMInfo, dest: Path, progress: Callable[[str], ProgressCb]) -> list[Path]:
         """Copy every disk of the (powered-off) VM into dest; returns the local files, boot disk first."""
 
+    direct = False  # True when fetch_disks returns paths on the source instead of local copies
+
+    def ensure_access(self, paths: list[Path]) -> None:
+        """Called before converting; sources with direct reads (re)open access to their paths here."""
+
     def close(self) -> None:
         pass
