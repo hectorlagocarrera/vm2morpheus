@@ -145,7 +145,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             root_gb = -(-vm.disks[0].size_bytes // 2**30)
             in_bundle = st.d.get("bundle", False)  # the image already carries every disk
             extra_gb = [] if in_bundle else [-(-d.size_bytes // 2**30) for d in vm.disks[1:]]
-            payload = payload_from_reference(ref, vm.name, int(refcfg["image_id"]),
+            payload = payload_from_reference(ref, vm.name, int(refcfg["image_id"]) if refcfg.get("image_id") else None,
                                              st.d["images"][0]["id"], root_gb, extra_gb,
                                              omit_volumes=in_bundle)
             if in_bundle:

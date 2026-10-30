@@ -126,7 +126,7 @@ def render_template(obj, values: dict):
     return obj
 
 
-def payload_from_reference(ref: dict, name: str, old_image_id: int, new_image_id: int,
+def payload_from_reference(ref: dict, name: str, old_image_id: int | None, new_image_id: int,
                            root_gb: int | None = None, extra_gb: list[int] | None = None,
                            omit_volumes: bool = False) -> dict:
     """Build POST /api/instances from an instance created by hand in the UI, swapping its image.
@@ -141,15 +141,17 @@ def payload_from_reference(ref: dict, name: str, old_image_id: int, new_image_id
             return {k: swap(v, in_image_key or "image" in k.lower()) for k, v in o.items()}
         if isinstance(o, list):
             return [swap(v, in_image_key) for v in o]
-        if in_image_key and not isinstance(o, bool) and str(o) == str(old_image_id):
+        if in_image_key and not isinstance(o, bool) and (
+                str(o) == str(old_image_id) if old_image_id is not None
+                else isinstance(o, int) or (isinstance(o, str) and o.isdigit())):
             swapped.append(o)
             return type(o)(new_image_id)
         return o
 
     config = swap(ref.get("config") or {})
     if not swapped:
-        raise MorpheusError(f"image id {old_image_id} not found in the reference instance config; "
-                            "check the reference image ID (Library > Virtual Images)")
+        raise MorpheusError(f"image id {old_image_id or '(any)'} not found in the reference instance config; "
+                            "check the reference instance / image ID")
     payload = {
         "zoneId": ref["cloud"]["id"],
         "instance": {

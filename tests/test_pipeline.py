@@ -224,3 +224,11 @@ def test_two_disks_are_bundled_with_metadata_json(tmp_path):
     assert z.read("vm1-sda")[:4] == b"QFI\xfb" and z.read("vm1-sdb")[:4] == b"QFI\xfb"
     inst = dict(FakeMorpheus.log)["instance"]
     assert "volumes" not in inst  # volumes come from the image metadata
+
+
+def test_reference_payload_autodetects_image_value():
+    from vm2morpheus.morpheus import payload_from_reference
+    ref = {"cloud": {"id": 1}, "group": {"id": 2}, "instanceType": {"code": "hvm"}, "layout": {"id": 4},
+           "plan": {"id": 6}, "config": {"imageId": 3, "hostId": 3, "imageType": "qcow2"}}
+    p = payload_from_reference(ref, "vm1", None, 7)
+    assert p["config"] == {"imageId": 7, "hostId": 3, "imageType": "qcow2"}

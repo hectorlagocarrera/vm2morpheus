@@ -73,8 +73,9 @@ def make_cfgs(f: dict):
     m = {"url": f["morpheus_url"], "token": f["morpheus_token"], "verify_ssl": bool(f.get("verify_ssl")),
          "image_type": f.get("image_type") or "qcow2"}
     tpl = build_instance_template(f)
-    if f.get("ref_instance_id") and f.get("ref_image_id"):
-        m["reference_instance"] = {"instance_id": int(f["ref_instance_id"]), "image_id": int(f["ref_image_id"])}
+    if f.get("ref_instance_id"):
+        m["reference_instance"] = {"instance_id": int(f["ref_instance_id"]),
+                                   "image_id": int(f["ref_image_id"]) if f.get("ref_image_id") else None}
     elif tpl:
         m["instance"] = tpl
     opts = {"workdir": f.get("workdir") or "vm2morpheus-work", "shutdown_source": bool(f.get("shutdown")),
@@ -141,6 +142,7 @@ class Handler(BaseHTTPRequestHandler):
                     "clouds": [(z["id"], z["name"]) for z in c.clouds()],
                     "groups": [(g["id"], g["name"]) for g in c._req("GET", "/api/groups", params={"max": 200}).get("groups", [])],
                     "plans": [(p["id"], p["name"]) for p in plans.get("servicePlans", [])],
+                    "instances": [(i["id"], i["name"]) for i in c._req("GET", "/api/instances", params={"max": 200}).get("instances", [])],
                     "networks": [(n["id"], n["name"]) for n in c._req("GET", "/api/networks", params={"max": 200}).get("networks", [])],
                 })
             if self.path == "/inspect":
@@ -205,9 +207,9 @@ small{color:#5d6b7b}
 </div><div class="chk"><label><input type="checkbox" id="verify_ssl"> Verificar certificado TLS</label></div>
 <button class="sec" onclick="lookups()">Cargar nubes, grupos, planes y redes</button></fieldset>
 <fieldset><legend>3. Crear la VM en Morpheus (opcional)</legend>
-<small>Crea antes a mano UNA instancia HPE HVM con cualquier imagen (Provisioning → Instances → Add). Pon aquí su ID y el ID de la imagen que usó (Library → Virtual Images): el programa la clona cambiando solo la imagen. Vacío = solo se sube la imagen.</small>
-<div class="row"><div><label>ID de la instancia de referencia</label><input id="ref_instance_id"></div>
-<div><label>ID de la imagen de esa instancia</label><input id="ref_image_id"></div></div>
+<small>Crea antes a mano UNA instancia HPE HVM con cualquier imagen (Provisioning → Instances → Add). Elígela en el desplegable: el programa la clona cambiando solo la imagen. Vacío = solo se sube la imagen.</small>
+<div class="row"><div><label>Instancia de referencia (pulsa "Cargar" arriba)</label><select id="ref_instance_id"><option value="">(ninguna: solo subir la imagen)</option></select></div>
+<div><label>ID de su imagen <small>(opcional; se detecta sola)</small></label><input id="ref_image_id"></div></div>
 <details><summary><small>Alternativa avanzada: layout manual</small></summary>
 <div class="row"><div><label>Nube</label><select id="cloud_id"></select></div><div><label>Grupo</label><select id="group_id"></select></div>
 <div><label>Plan</label><select id="plan_id"></select></div><div><label>Red</label><select id="network_id"></select></div>
@@ -228,8 +230,8 @@ const show=t=>document.getElementById("log").textContent=t;
 async function post(p,b){const r=await fetch(p,{method:"POST",body:JSON.stringify(b)});const j=await r.json();if(j.error)throw new Error(j.error);return j}
 async function inspect_(){try{show(JSON.stringify(await post("/inspect",form()),null,2))}catch(e){show("ERROR: "+e.message)}}
 async function lookups(){try{const j=await post("/lookups",form());
- for(const [k,id] of [["clouds","cloud_id"],["groups","group_id"],["plans","plan_id"],["networks","network_id"]]){
-  const s=document.getElementById(id);s.innerHTML=(id=="network_id"?'<option value="">(ninguna)</option>':'')+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("")}
+ for(const [k,id] of [["clouds","cloud_id"],["groups","group_id"],["plans","plan_id"],["networks","network_id"],["instances","ref_instance_id"]]){
+  const s=document.getElementById(id);s.innerHTML=(id=="network_id"||id=="ref_instance_id"?'<option value="">(ninguna)</option>':'')+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("")}
  show("Datos cargados.")}catch(e){show("ERROR: "+e.message)}}
 async function run(p){try{const {job}=await post(p,form());show("Trabajo "+job+" en marcha...");
  const t=setInterval(async()=>{const r=await (await fetch("/job/"+job)).json();show(r.log||"...");if(r.status!=="running")clearInterval(t)},1000)}catch(e){show("ERROR: "+e.message)}}
