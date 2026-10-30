@@ -4,6 +4,8 @@ import sys
 
 import yaml
 
+from . import __version__
+
 from .morpheus import MorpheusClient
 from .pipeline import migrate
 from .sources import make_source
@@ -52,6 +54,7 @@ def load_config(args) -> dict:
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
+    print(f"vm2morpheus {__version__}", file=sys.stderr)
     if args.command == "gui":
         from .gui import serve
         serve()

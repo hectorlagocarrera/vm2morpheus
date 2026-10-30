@@ -7,6 +7,7 @@ import webbrowser
 from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from . import __version__
 from .morpheus import MorpheusClient
 from .pipeline import migrate
 from .sources import make_source
@@ -107,7 +108,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):
         if self.path == "/":
-            b = PAGE.encode()
+            b = PAGE.replace("__VERSION__", __version__).encode()
             self.send_response(200)
             self.send_header("Content-Type", "text/html; charset=utf-8")
             self.send_header("Content-Length", str(len(b)))
@@ -181,7 +182,7 @@ button{padding:9px 16px;margin:4px 8px 4px 0;border:0;border-radius:6px;backgrou
 button.sec{background:#e5e9ee;color:#1b2430} pre{background:#0f172a;color:#d6e2f0;padding:12px;border-radius:8px;min-height:140px;max-height:420px;overflow:auto;white-space:pre-wrap}
 small{color:#5d6b7b}
 </style><main>
-<h1>vm2morpheus <small>Hyper-V / VMware → Morpheus (KVM)</small></h1>
+<h1>vm2morpheus <small>Hyper-V / VMware → Morpheus (KVM) · v__VERSION__</small></h1>
 <fieldset><legend>1. Origen</legend><div class="row">
 <div><label>Tipo</label><select id="source_type"><option value="hyperv">Hyper-V</option><option value="vmware">VMware (vCenter/ESXi)</option></select></div>
 <div><label>Host / IP</label><input id="source_host"></div>
