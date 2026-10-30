@@ -390,6 +390,7 @@ def test_pipeline_injects_into_a_private_vhdx_copy_before_converting(tmp_path, m
         return ["viostor"]
 
     monkeypatch.setattr(pipeline, "_is_windows", lambda: True)
+    monkeypatch.setattr(pipeline, "is_admin", lambda: True)
     monkeypatch.setattr(pipeline, "inject_virtio_windows", fake_inject)
     monkeypatch.setattr(pipeline, "ensure_virtio_iso", lambda p, progress=None: p or "cached.iso")
 
