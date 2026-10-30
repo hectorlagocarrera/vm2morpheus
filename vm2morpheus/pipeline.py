@@ -170,7 +170,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                 bar.finish()
                 if _inside(boot, workdir):
                     boot.unlink(missing_ok=True)
-                st.d["fetched"][0] = str(vhdx)
+                st.set(fetched=[str(vhdx)] + st.d["fetched"][1:])  # saved now: the VMDK is gone, a retry must find the VHDX
             tracker.begin("drivers")
             bar = Progress("ISO de virtio-win", cancel=cancel)
             iso = ensure_virtio_iso(opts.get("virtio_iso"), bar)

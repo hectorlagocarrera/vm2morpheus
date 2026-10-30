@@ -5,6 +5,7 @@ drivers to the offline Windows image. Must run on Windows as Administrator, on a
 """
 import json
 import os
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -16,6 +17,46 @@ from .util import no_window
 DRIVERS = ("viostor", "vioscsi", "NetKVM", "Balloon", "vioserial")
 ISO_URL = "https://fedorapeople.org/groups/virt/virtio-win/direct-downloads/stable-virtio/virtio-win.iso"
 CACHED_ISO = Path.home() / ".vm2morpheus" / "virtio-win.iso"
+
+
+SPARSE, COMPRESSED, ENCRYPTED = 0x200, 0x800, 0x4000  # FILE_ATTRIBUTE_* flags
+
+
+def file_attributes(path: Path) -> int:
+    attrs = ctypes.windll.kernel32.GetFileAttributesW(str(path))
+    if attrs == 0xFFFFFFFF:
+        raise OSError(f"no se pueden leer los atributos de {path}")
+    return attrs
+
+
+def rewrite_dense(path: Path) -> None:
+    """Copy the file through ordinary reads and writes: holes read back as zeros and are written out as data, so the
+    new file is not sparse."""
+    tmp = path.with_name(path.name + ".dense")
+    with open(path, "rb") as src, open(tmp, "wb") as dst:
+        shutil.copyfileobj(src, dst, 8 * 1024 * 1024)
+    os.replace(tmp, path)
+
+
+def make_mountable(path: Path, log=print, attrs=file_attributes, run=subprocess.run) -> None:
+    """Mount-DiskImage refuses VHD/VHDX files that are sparse, compressed or encrypted. qemu-img on Windows writes
+    sparse files, so the VHDX it just produced is exactly that."""
+    quiet = {"capture_output": True, **no_window()}
+    for _ in range(3):
+        flags = attrs(path)
+        if not flags & (SPARSE | COMPRESSED | ENCRYPTED):
+            return
+        if flags & ENCRYPTED:
+            run(["cipher", "/d", str(path)], **quiet)
+        if flags & COMPRESSED:
+            run(["compact", "/u", str(path)], **quiet)
+        if flags & SPARSE:
+            log("Quitando el atributo de fichero disperso del disco para poder montarlo ...")
+            run(["fsutil", "sparse", "setflag", str(path), "0"], **quiet)
+            if attrs(path) & SPARSE:  # holes remain: rewrite the file without them
+                rewrite_dense(path)
+    raise RuntimeError("No se pudo dejar el disco sin comprimir, sin cifrar y sin dispersar, que es lo que exige "
+                       "Windows para montarlo. Prueba con otra carpeta de trabajo en un disco NTFS sin compresión.")
 
 
 def os_folder(build: int, installation_type: str) -> str | None:
@@ -117,11 +158,15 @@ def ensure_virtio_iso(path: str | None, progress=None) -> str:
     return str(CACHED_ISO)
 
 
-def inject_virtio_windows(disk: Path, iso: str, log=print, ps=run_powershell, dism=run_dism) -> list[str]:
+def inject_virtio_windows(disk: Path, iso: str, log=print, ps=run_powershell, dism=run_dism,
+                          prepare=None) -> list[str]:
     """Add the VirtIO drivers found on the ISO to the Windows installed on `disk`. Returns the driver names added."""
     if os.name != "nt" and ps is run_powershell:
         raise RuntimeError("La inyección de drivers con DISM solo funciona en Windows")
     image = str(Path(disk).resolve())
+    if prepare is None:
+        prepare = make_mountable if ps is run_powershell else (lambda *a, **k: None)  # fakes in tests skip the OS call
+    prepare(Path(disk), log)
     try:
         info = json.loads(ps(_mount_script(image, iso)))
         folder = os_folder(int(info["build"]), info["type"])

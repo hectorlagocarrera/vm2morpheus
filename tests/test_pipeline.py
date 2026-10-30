@@ -1,4 +1,5 @@
 import json
+from pathlib import Path
 import shutil
 import subprocess
 import threading
@@ -868,3 +869,68 @@ def test_powershell_is_not_started_with_execution_policy_bypass():
     import inspect
     from vm2morpheus import drivers_windows
     assert "Bypass" not in inspect.getsource(drivers_windows.run_powershell)
+
+
+def test_make_mountable_clears_the_sparse_flag(tmp_path):
+    from vm2morpheus.drivers_windows import SPARSE, make_mountable
+    f = tmp_path / "d.vhdx"
+    f.write_bytes(b"data")
+    state, ran = {"flags": SPARSE}, []
+
+    def run(cmd, **kw):
+        ran.append(cmd[:3])
+        state["flags"] = 0  # fsutil worked
+    make_mountable(f, log=lambda *_: None, attrs=lambda p: state["flags"], run=run)
+    assert ran == [["fsutil", "sparse", "setflag"]] and f.read_bytes() == b"data"
+
+
+def test_make_mountable_rewrites_the_file_when_holes_remain(tmp_path):
+    from vm2morpheus.drivers_windows import COMPRESSED, SPARSE, make_mountable
+    f = tmp_path / "d.vhdx"
+    f.write_bytes(b"abc" * 1000)
+    calls = {"n": 0}
+
+    def attrs(p):  # sparse until the file has been rewritten (the .dense temp name is gone again)
+        calls["n"] += 1
+        return SPARSE | COMPRESSED if calls["n"] <= 2 else 0
+
+    ran = []
+    make_mountable(f, log=lambda *_: None, attrs=attrs, run=lambda cmd, **kw: ran.append(cmd[0]))
+    assert f.read_bytes() == b"abc" * 1000 and not (tmp_path / "d.vhdx.dense").exists()
+    assert "compact" in ran and "fsutil" in ran
+
+
+def test_make_mountable_gives_up_with_a_clear_message(tmp_path):
+    from vm2morpheus.drivers_windows import SPARSE, make_mountable
+    f = tmp_path / "d.vhdx"
+    f.write_bytes(b"x")
+    with pytest.raises(RuntimeError, match="NTFS sin compresión"):
+        make_mountable(f, log=lambda *_: None, attrs=lambda p: SPARSE, run=lambda cmd, **kw: None)
+
+
+def test_failed_injection_keeps_the_converted_vhdx_in_the_saved_state(tmp_path, monkeypatch):
+    from vm2morpheus import pipeline
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    monkeypatch.setattr(pipeline, "_is_windows", lambda: True)
+    monkeypatch.setattr(pipeline, "is_admin", lambda: True)
+    monkeypatch.setattr(pipeline, "ensure_virtio_iso", lambda p, progress=None: "x.iso")
+
+    def boom(path, iso, log):
+        raise RuntimeError("Mount-DiskImage falló")
+
+    monkeypatch.setattr(pipeline, "inject_virtio_windows", boom)
+
+    class Win(FakeSource):
+        def get_vm(self, name):
+            vm = super().get_vm(name)
+            vm.os_family = "windows"
+            return vm
+
+    wd = tmp_path / "w17"
+    with pytest.raises(RuntimeError, match="Mount-DiskImage"):
+        pipeline.migrate(Win(disk), MorpheusClient("http://127.0.0.1:1", "t"), "vm1",
+                         {"workdir": str(wd), "shutdown_source": True, "inject_drivers": True}, {},
+                         log=lambda *_: None)
+    saved = json.loads((wd / "vm1" / "state.json").read_text())
+    assert saved["fetched"][0].endswith(".vhdx") and Path(saved["fetched"][0]).exists()
