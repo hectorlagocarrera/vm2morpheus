@@ -334,3 +334,83 @@ def test_sata_mount_point_uses_reference_controller():
     ref = {"controllers": [{"id": 172, "busNumber": "0", "type": {"id": 9, "code": "kvm-virtio-blk"}},
                            {"id": 173, "busNumber": "0", "type": {"id": 8, "code": "kvm-sata"}}]}
     assert sata_mount_point(ref) == "173:0:8:0"
+
+
+def test_virtio_os_folder_mapping():
+    from vm2morpheus.drivers_windows import os_folder
+    assert os_folder(14393, "Server") == "2k16" and os_folder(17763, "Server") == "2k19"
+    assert os_folder(20348, "Server") == "2k22" and os_folder(26100, "Server") == "2k25"
+    assert os_folder(19045, "Client") == "w10" and os_folder(22631, "Client") == "w11"
+    assert os_folder(7601, "Server") == "2k8R2" and os_folder(1234, "Server") is None
+
+
+def _fake_iso(tmp_path, folder="2k16", drivers=("viostor", "NetKVM")):
+    for d in drivers:
+        (tmp_path / "iso" / d / folder / "amd64").mkdir(parents=True)
+    return str(tmp_path / "iso")
+
+
+def test_inject_runs_dism_per_driver_and_always_dismounts(tmp_path):
+    from vm2morpheus.drivers_windows import inject_virtio_windows
+    iso_root = _fake_iso(tmp_path)
+    calls, dism_calls = [], []
+
+    def ps(script):
+        calls.append(script)
+        return json.dumps({"win": "E:\\", "iso": iso_root, "build": 14393, "type": "Server"}) if len(calls) == 1 else ""
+
+    added = inject_virtio_windows(tmp_path / "d.vhdx", "x.iso", log=lambda *_: None, ps=ps, dism=dism_calls.append)
+    assert added == ["viostor", "NetKVM"] and len(dism_calls) == 2 and len(calls) == 2  # mount + dismount
+    assert dism_calls[0][:2] == ["/Image:E:\\", "/Add-Driver"]
+
+
+def test_inject_dismounts_even_when_driver_missing(tmp_path):
+    from vm2morpheus.drivers_windows import inject_virtio_windows
+    iso_root = _fake_iso(tmp_path, drivers=("NetKVM",))  # no viostor
+    calls = []
+
+    def ps(script):
+        calls.append(script)
+        return json.dumps({"win": "E:\\", "iso": iso_root, "build": 14393, "type": "Server"}) if len(calls) == 1 else ""
+
+    with pytest.raises(RuntimeError, match="viostor"):
+        inject_virtio_windows(tmp_path / "d.vhdx", "x.iso", log=lambda *_: None, ps=ps, dism=lambda a: None)
+    assert len(calls) == 2
+
+
+def test_pipeline_injects_into_a_private_vhdx_copy_before_converting(tmp_path, monkeypatch):
+    from vm2morpheus import pipeline
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    seen = {}
+
+    def fake_inject(path, iso, log):
+        seen["path"], seen["iso"] = path, iso
+        assert path.suffix == ".vhdx" and path.exists()
+        return ["viostor"]
+
+    monkeypatch.setattr(pipeline, "_is_windows", lambda: True)
+    monkeypatch.setattr(pipeline, "inject_virtio_windows", fake_inject)
+    monkeypatch.setattr(pipeline, "ensure_virtio_iso", lambda p, progress=None: p or "cached.iso")
+
+    class Win(FakeSource):
+        direct = True
+
+        def get_vm(self, name):
+            vm = super().get_vm(name)
+            vm.os_family = "windows"
+            return vm
+
+    FakeMorpheus.log.clear()
+    FakeMorpheus.uploads.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    client = MorpheusClient(f"http://127.0.0.1:{srv.server_port}", "tok")
+    src = Win(disk)
+    pipeline.migrate(src, client, "vm1", {"workdir": str(tmp_path / "w8"), "shutdown_source": True,
+                                          "inject_drivers": True, "virtio_iso": "my.iso"},
+                     {"image_type": "qcow2"}, log=lambda *_: None)
+    srv.shutdown()
+    assert src.direct is False and seen["iso"] == "my.iso"
+    assert str(seen["path"]).startswith(str(tmp_path / "w8"))  # never the original disk
+    assert FakeMorpheus.uploads[7][:4] == b"QFI\xfb"

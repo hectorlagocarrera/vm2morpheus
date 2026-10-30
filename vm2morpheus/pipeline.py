@@ -1,12 +1,18 @@
 import json
+import os
 import shutil
 from pathlib import Path
 
 from .bundle import build_bundle, disk_file_name
 from .convert import convert_disk, inject_drivers
+from .drivers_windows import ensure_virtio_iso, inject_virtio_windows
 from .morpheus import MorpheusClient, MorpheusError, payload_from_reference, render_template
 from .sources.base import Source
 from .util import Progress, human, redact
+
+def _is_windows() -> bool:
+    return os.name == "nt"
+
 
 STEPS = ["fetch", "convert", "drivers", "upload", "instance"]
 
@@ -21,6 +27,10 @@ class State:
     def done(self, step):
         return step in self.d.get("done", [])
 
+    def set(self, **data):
+        self.d.update(data)
+        self.path.write_text(json.dumps(self.d, indent=2))
+
     def mark(self, step, **data):
         self.d.setdefault("done", []).append(step)
         self.d.update(data)
@@ -31,6 +41,10 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             dry_run=False, log=print) -> dict:
     vm = source.get_vm(vm_name)
     fmt = opts.get("output_format", "qcow2")
+    windows_inject = bool(opts.get("inject_drivers")) and _is_windows() and vm.os_family == "windows"
+    if windows_inject and source.direct:
+        source.direct = False  # drivers are written into the disk, so it must be a private copy, never the original
+        log("driver injection needs a local copy of the disk: direct read is turned off")
     total = sum(d.size_bytes for d in vm.disks)
     log(f"VM {vm.name}: {vm.cpu} vCPU, {vm.memory_mb} MiB, {vm.firmware.upper()}, "
         f"{vm.os_family}, {vm.power_state}, {len(vm.disks)} disk(s), {human(total)} provisioned")
@@ -92,6 +106,23 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         log(f"converting to {fmt} ...")
         out = []
         source.ensure_access([Path(p) for p in st.d["fetched"]])
+        if windows_inject and not st.d.get("injected"):
+            boot = Path(st.d["fetched"][0])
+            if boot.suffix.lower() not in (".vhd", ".vhdx"):  # Windows can only mount VHD/VHDX
+                log(f"converting {boot.name} to VHDX so Windows can mount it ...")
+                vhdx = boot.with_suffix(".vhdx")
+                bar = Progress(f"convert {boot.name}", percent=True)
+                convert_disk(boot, vhdx, "vhdx", bar)
+                bar.finish()
+                if _inside(boot, workdir):
+                    boot.unlink(missing_ok=True)
+                st.d["fetched"][0] = str(vhdx)
+            bar = Progress("virtio-win ISO")
+            iso = ensure_virtio_iso(opts.get("virtio_iso"), bar)
+            log("injecting VirtIO drivers into the Windows disk (DISM) ...")
+            added = inject_virtio_windows(Path(st.d["fetched"][0]), iso, log)
+            log(f"drivers added: {', '.join(added)}")
+            st.set(injected=True, fetched=st.d["fetched"])
         for i, src in enumerate(map(Path, st.d["fetched"])):
             dst = workdir / (disk_file_name(vm.name, i) if bundle else f"{src.stem}.{fmt}")
             bar = Progress(f"convert {src.name}", percent=True)
@@ -103,7 +134,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         st.mark("convert", converted=out)
 
     if not st.done("drivers"):
-        if opts.get("inject_drivers"):
+        if opts.get("inject_drivers") and not _is_windows():
             log("injecting virtio drivers (virt-v2v-in-place) ...")
             inject_drivers(Path(st.d["converted"][0]), vm.name, vm.memory_mb, vm.cpu,
                            vm.firmware == "uefi", fmt)
@@ -168,9 +199,10 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                     "as separate images but is not attached")
             elif extra_gb:
                 log(f"adding {len(extra_gb)} data volume(s) matching the multi-disk image")
-            log("note: no guest drivers are installed. The boot disk is requested on a SATA controller so "
-                "Windows can boot without VirtIO drivers" if want_sata else
-                "note: no guest drivers are installed; a Windows guest needs VirtIO drivers to boot from VirtIO")
+            if not st.d.get("injected"):
+                log("note: no guest drivers were installed. " + (
+                    "The boot disk is requested on a SATA controller so Windows can boot without VirtIO drivers"
+                    if want_sata else "a Windows guest needs VirtIO drivers to boot from VirtIO"))
             log("creating Morpheus instance (cloned from the reference instance) ...")
             try:
                 inst = morpheus.create_instance(build(want_sata))

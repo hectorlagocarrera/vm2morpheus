@@ -86,7 +86,8 @@ def make_cfgs(f: dict):
     elif f.get("layout_id"):
         m["reference_instance"] = {"synthetic": synthetic_reference(f)}
     opts = {"workdir": f.get("workdir") or "vm2morpheus-work", "shutdown_source": bool(f.get("shutdown")),
-            "boot_sata": bool(f.get("boot_sata")), "keep_files": False, "multi_disk_bundle": bool(f.get("multi_disk_bundle")),
+            "boot_sata": bool(f.get("boot_sata")), "inject_drivers": bool(f.get("inject_drivers")),
+            "virtio_iso": (f.get("virtio_iso") or "").strip() or None, "keep_files": False, "multi_disk_bundle": bool(f.get("multi_disk_bundle")),
             "recreate_instance": bool(f.get("recreate_instance"))}
     return src, m, opts
 
@@ -261,13 +262,15 @@ small{color:#5d6b7b}
 <label><input type="checkbox" id="recreate_instance"> Recrear solo la instancia (borra antes la anterior en Morpheus)</label>
 <label><input type="checkbox" id="remember_secrets"> Recordar contraseñas y token (se guardan en texto plano en este equipo)</label>
 <label><input type="checkbox" id="direct_read"> Conversión directa, sin copiar el disco antes (Hyper-V, solo Windows)</label>
+<label><input type="checkbox" id="inject_drivers"> Inyectar drivers VirtIO en el disco de Windows (solo Windows; ejecuta el programa como administrador)</label>
 <label><input type="checkbox" id="boot_sata" checked> Disco de arranque en SATA (Windows sin drivers VirtIO)</label></div>
+<label>ISO de virtio-win <small>(vacío = se descarga sola, ~700 MB, y se guarda en caché)</small></label><input id="virtio_iso" placeholder="C:\ISOs\virtio-win.iso">
 <label>Carpeta de trabajo (necesita ~2× el tamaño de los discos)</label><input id="workdir" value="vm2morpheus-work"></fieldset>
 <button onclick="run('/dryrun')" class="sec">Simulación</button><button onclick="run('/migrate')">Migrar</button>
 <pre id="log">Listo.</pre></main>
 <script>
-const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","ref_instance_id","ref_image_id","workdir"];
-const chks=["verify_ssl","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","boot_sata"];
+const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","virtio_iso","ref_instance_id","ref_image_id","workdir"];
+const chks=["verify_ssl","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
 const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);return o};
 const show=t=>document.getElementById("log").textContent=t;
 async function post(p,b){const r=await fetch(p,{method:"POST",body:JSON.stringify(b)});const j=await r.json();if(j.error)throw new Error(j.error);return j}
