@@ -4,9 +4,9 @@ from pathlib import Path
 
 from .bundle import build_bundle, disk_file_name
 from .convert import convert_disk, inject_drivers
-from .morpheus import MorpheusClient, payload_from_reference, render_template
+from .morpheus import MorpheusClient, MorpheusError, payload_from_reference, render_template
 from .sources.base import Source
-from .util import Progress, human
+from .util import Progress, human, redact
 
 STEPS = ["fetch", "convert", "drivers", "upload", "instance"]
 
@@ -145,9 +145,16 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             root_gb = -(-vm.disks[0].size_bytes // 2**30)
             in_bundle = st.d.get("bundle", False)  # the image already carries every disk
             extra_gb = [] if in_bundle else [-(-d.size_bytes // 2**30) for d in vm.disks[1:]]
-            payload = payload_from_reference(ref, vm.name, int(refcfg["image_id"]) if refcfg.get("image_id") else None,
-                                             st.d["images"][0]["id"], root_gb, extra_gb,
-                                             omit_volumes=in_bundle)
+            try:
+                payload = payload_from_reference(ref, vm.name,
+                                                 int(refcfg["image_id"]) if refcfg.get("image_id") else None,
+                                                 st.d["images"][0]["id"], root_gb, extra_gb,
+                                                 omit_volumes=in_bundle)
+            except MorpheusError:
+                dump = workdir / "reference-instance.json"
+                dump.write_text(json.dumps(redact(ref), indent=2, ensure_ascii=False), encoding="utf-8")
+                log(f"saved the reference instance (credentials hidden) to {dump}")
+                raise
             if in_bundle:
                 log("disks are taken from the multi-disk image")
             elif extra_gb:

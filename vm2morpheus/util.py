@@ -10,6 +10,16 @@ def human(n: float) -> str:
         n /= 1024
 
 
+def redact(o):
+    """Hide anything that looks like a credential before the JSON is shown (and maybe pasted)."""
+    if isinstance(o, dict):
+        return {k: "***" if any(w in k.lower() for w in ("password", "secret", "token", "privatekey")) else redact(v)
+                for k, v in o.items()}
+    if isinstance(o, list):
+        return [redact(v) for v in o]
+    return o
+
+
 def resolve_secret(value):
     """'env:NAME' reads the secret from the environment; anything else is returned as-is."""
     if isinstance(value, str) and value.startswith("env:"):

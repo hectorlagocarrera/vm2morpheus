@@ -11,6 +11,7 @@ from . import __version__
 from .morpheus import MorpheusClient
 from .pipeline import migrate
 from .sources import make_source
+from .util import redact
 
 JOBS: dict[str, dict] = {}
 RUN_LOCK = threading.Lock()
@@ -39,16 +40,6 @@ class JobLog:
 
     def text(self):
         return "\n".join(self.lines + ([self.cur] if self.cur.strip() else []))
-
-
-def redact(o):
-    """Hide anything that looks like a credential before the JSON is shown (and maybe pasted)."""
-    if isinstance(o, dict):
-        return {k: "***" if any(w in k.lower() for w in ("password", "secret", "token", "privatekey")) else redact(v)
-                for k, v in o.items()}
-    if isinstance(o, list):
-        return [redact(v) for v in o]
-    return o
 
 
 def build_instance_template(f: dict) -> dict | None:
