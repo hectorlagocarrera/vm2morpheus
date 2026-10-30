@@ -10,7 +10,10 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with: { python-version: "3.12" }
-      - run: pip install -e ".[all]" pyinstaller
+      - run: pip install -e ".[all]"
+      # Build PyInstaller's bootloader from source (the windows runner has MSVC). The prebuilt bootloader is shared
+      # by thousands of programs, and antivirus machine-learning engines flag its fingerprint.
+      - run: pip install --no-binary pyinstaller pyinstaller
       # One folder instead of --onefile: the single-file build unpacks itself into %TEMP% at every start, which
       # is what antivirus heuristics dislike most.
       - run: >
