@@ -1805,3 +1805,69 @@ def test_each_source_declares_its_timing_kind():
     from vm2morpheus.sources.vmware import VMwareSource
     assert HyperVSource.timing_kind == "hyperv" and VMwareSource.timing_kind == "vmware"
     assert HyperVSource.__doc__ and VMwareSource.__doc__        # the attribute must not displace the docstring
+
+
+def test_compressed_qcow2_is_smaller_valid_and_opt_in(tmp_path):
+    from vm2morpheus.convert import convert_disk
+    raw = tmp_path / "d.img"
+    raw.write_bytes((b"windows-like compressible data " * 4096) * 64)   # ~8 MiB of repeating data
+    plain = convert_disk(raw, tmp_path / "plain.qcow2", "qcow2")
+    small = convert_disk(raw, tmp_path / "small.qcow2", "qcow2", compress=True)
+    assert small.stat().st_size < plain.stat().st_size * 0.5
+    assert subprocess.run(["qemu-img", "check", str(small)], capture_output=True).returncode == 0
+    # same virtual contents either way
+    back = tmp_path / "back.img"
+    subprocess.run(["qemu-img", "convert", "-O", "raw", str(small), str(back)], check=True, capture_output=True)
+    assert back.read_bytes() == raw.read_bytes()
+
+
+def test_pipeline_compresses_only_when_asked(tmp_path, monkeypatch):
+    from vm2morpheus import pipeline
+    seen = []
+    real = pipeline.convert_disk
+    monkeypatch.setattr(pipeline, "convert_disk",
+                        lambda src, dst, fmt, bar, cancel, compress=False: (seen.append(compress),
+                                                                           real(src, dst, fmt, bar, cancel, compress=compress))[1])
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    for name, opts_extra in (("w40", {}), ("w41", {"compress_image": True})):
+        srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        pipeline.migrate(FakeSource(disk), _client(srv), "vm1",
+                         {"workdir": str(tmp_path / name), "shutdown_source": True, **opts_extra},
+                         {"image_type": "qcow2"}, log=lambda *_: None)
+        srv.shutdown()
+    assert seen == [False, True]
+
+
+def _ranged_response(status, chunks):
+    class R(_FakeResponse):
+        status_code = status
+    return R(chunks)
+
+
+def test_parallel_measurement_adds_up_the_streams_and_spreads_the_offsets():
+    from vm2morpheus.sources.vmware import measure_parallel
+    ranges = []
+
+    def getter(url, **kw):
+        ranges.append(kw["headers"]["Range"])
+        return _ranged_response(206, [b"x" * 1000, b"y" * 1000])
+
+    total, secs, ranged = measure_parallel(getter, "https://esxi/x", size=4000, streams=4, seconds=60)
+    assert ranged is True and total == 4 * 2000
+    assert sorted(ranges) == ["bytes=0-", "bytes=1000-", "bytes=2000-", "bytes=3000-"]
+
+
+def test_parallel_measurement_detects_a_server_without_range_support():
+    from vm2morpheus.sources.vmware import measure_parallel
+    total, secs, ranged = measure_parallel(lambda url, **kw: _ranged_response(200, [b"x" * 10]),
+                                           "https://esxi/x", size=4000, streams=4, seconds=60)
+    assert ranged is False and total == 0
+
+
+def test_page_reports_parallel_speed_and_offers_compression():
+    from vm2morpheus.gui import render_page
+    page = render_page()
+    for needle in ("conexiones a la vez", "flat_parallel", 'id="compress_image"'):
+        assert needle in page

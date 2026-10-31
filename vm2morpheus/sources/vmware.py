@@ -138,6 +138,37 @@ def measure_download(getter, url: str, seconds: float = 20, clock=time.monotonic
     return total, max(clock() - start, 1e-6)
 
 
+def measure_parallel(getter, url: str, size: int, streams: int = 4, seconds: float = 20,
+                     clock=time.monotonic, **kw) -> tuple[int, float, bool]:
+    """Read from `streams` simultaneous ranged requests spread over the file, discarding the data.
+    Returns (total bytes, seconds, ranged_ok); ranged_ok is False if the server ignored the Range header."""
+    lock = threading.Lock()
+    state = {"bytes": 0, "ranged": True}
+    start = clock()
+
+    def worker(i: int) -> None:
+        offset = size // streams * i
+        try:
+            with getter(url, stream=True, timeout=(15, READ_TIMEOUT), headers={"Range": f"bytes={offset}-"}, **kw) as r:
+                if r.status_code != 206:  # 200 = the whole file again: the server does not do ranges
+                    state["ranged"] = False
+                    return
+                for chunk in r.iter_content(CHUNK):
+                    with lock:
+                        state["bytes"] += len(chunk)
+                    if clock() - start >= seconds:
+                        return
+        except Exception:
+            state["ranged"] = False
+
+    threads = [threading.Thread(target=worker, args=(i,), daemon=True) for i in range(streams)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(seconds + READ_TIMEOUT)
+    return state["bytes"], max(clock() - start, 1e-6), state["ranged"]
+
+
 def note_unverified_tls(verify: bool, host: str, stream=None) -> bool:
     """ESXi/vCenter normally use a self-signed certificate, so verification is off unless the user asks for it.
     Say so once, in Spanish, instead of letting urllib3 print its English warning for every request."""
@@ -236,8 +267,13 @@ class VMwareSource(Source):
             url = flat_url(self.host, vm.disks[0].path, self._datacenter_path(mo))
             b, t = measure_download(requests.get, url, seconds, auth=(self.user, self.password), verify=self.verify)
             out["flat"] = {"mib_s": b / t / 2**20, "mib": b / 2**20}
+            streams = 4
+            pb, pt, ranged = measure_parallel(requests.get, url, vm.disks[0].size_bytes, streams, seconds,
+                                              auth=(self.user, self.password), verify=self.verify)
+            out["flat_parallel"] = ({"streams": streams, "mib_s": pb / pt / 2**20, "mib": pb / 2**20} if ranged
+                                    else {"error": "el ESXi no admite descargas por tramos (Range)"})
         except Exception as e:
-            out["flat"] = {"error": str(e)}
+            out["flat"] = out.get("flat") or {"error": str(e)}
         if vm.power_state == "on":
             out["export"] = {"error": "la VM está encendida: la exportación solo funciona con la VM apagada"}
             return out

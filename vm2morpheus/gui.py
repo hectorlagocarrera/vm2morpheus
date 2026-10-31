@@ -104,7 +104,8 @@ def make_cfgs(f: dict):
             "virtio_iso": (f.get("virtio_iso") or "").strip() or None, "keep_files": False, "multi_disk_bundle": bool(f.get("multi_disk_bundle")),
             "recreate_instance": bool(f.get("recreate_instance")),
             "disk_indexes": [int(i) for i in f["disk_indexes"]] if f.get("disk_indexes") is not None else None,
-            "new_name": (f.get("new_vm_name") or "").strip() or None}
+            "new_name": (f.get("new_vm_name") or "").strip() or None,
+            "compress_image": bool(f.get("compress_image"))}
     return src, m, opts
 
 
@@ -402,6 +403,7 @@ small{color:#5d6b7b}
 <label><input type="checkbox" id="multi_disk_bundle" checked> Varios discos en una sola imagen (zip + metadata.json)</label>
 <label><input type="checkbox" id="recreate_instance"> Recrear solo la instancia (borra antes la anterior en Morpheus)</label>
 <label><input type="checkbox" id="verify_source"> Verificar el certificado del origen (VMware; déjalo apagado si es autofirmado)</label>
+<label><input type="checkbox" id="compress_image"> Comprimir el disco convertido (se sube y se copia más rápido; la VM puede leer algo más lento)</label>
 <label><input type="checkbox" id="remember_secrets"> Recordar contraseñas y token (se guardan en texto plano en este equipo)</label>
 <label><input type="checkbox" id="direct_read"> Conversión directa, sin copiar el disco antes (Hyper-V, solo Windows)</label>
 <label><input type="checkbox" id="inject_drivers"> Inyectar drivers VirtIO en el disco de Windows (solo Windows; ejecuta el programa como administrador)</label>
@@ -420,7 +422,7 @@ small{color:#5d6b7b}
 <div id="log" class="logbox" tabindex="0">Listo.</div></main>
 <script>
 const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","virtio_iso","vmware_method","new_vm_name","ref_instance_id","ref_image_id","workdir"];
-const chks=["verify_ssl","verify_source","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
+const chks=["verify_ssl","verify_source","compress_image","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
 const EMBEDDED=__EMBEDDED__;
 let analyzedVm=null;
 const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);if(analyzedVm&&analyzedVm===document.getElementById("vm").value.trim()&&document.querySelector(".diskchk"))o.disk_indexes=[...document.querySelectorAll(".diskchk")].filter(c=>c.checked).map(c=>Number(c.value));else o.disk_indexes=null;return o};
@@ -509,7 +511,9 @@ function disksChanged(){const n=document.querySelectorAll(".diskchk:checked").le
 async function speedtest(){try{await persist();
  const j=await busy("Midiendo la velocidad (unos 20 s por cada vía) …",()=>post("/speedtest",form()));
  const line=(n,r)=>r.error?`${n}: no se pudo medir (${r.error})`:`${n}: ${r.mib_s.toFixed(1)} MiB/s (${r.mib.toFixed(0)} MiB leídos)`;
- show(line("Exportación (la que usa el programa)",j.export)+"\n"+line("Disco plano (como el navegador)",j.flat)+"\n\nSi la exportación va mucho más lenta que el disco plano, el límite es la compresión del ESXi, no el programa.")}
+ show(line("Exportación (la que usa el programa)",j.export)+"\n"+line("Disco plano (como el navegador)",j.flat)
+ +(j.flat_parallel?"\n"+(j.flat_parallel.error?`Disco plano en paralelo: no se pudo medir (${j.flat_parallel.error})`:`Disco plano con ${j.flat_parallel.streams} conexiones a la vez: ${j.flat_parallel.mib_s.toFixed(1)} MiB/s`+(j.flat&&j.flat.mib_s?` (${(j.flat_parallel.mib_s/j.flat.mib_s).toFixed(1)}× la de una sola conexión)`:"")):"")
+ +"\n\nSi la exportación va mucho más lenta que el disco plano, el límite es la compresión del ESXi, no el programa. Si varias conexiones suman mucho más que una, descargar el disco plano en paralelo compensaría.")}
  catch(e){show("ERROR: "+e.message)}}
 async function inspect_(){await analyze(true);if(analyzedVm)show("VM analizada: revisa el panel de discos.")}
 async function quit(){if(currentJob&&!confirm("Hay una migración en curso. ¿Salir igualmente?"))return;

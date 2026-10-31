@@ -230,7 +230,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             n_conv = len(st.d["fetched"])
             bar = Progress(f"convertir {src.name}", percent=True, cancel=cancel,
                            on_progress=lambda f, i=i: tracker.update("convert", (i + f) / n_conv))
-            convert_disk(src, dst, fmt, bar, cancel)
+            convert_disk(src, dst, fmt, bar, cancel, compress=bool(opts.get("compress_image")))
             bar.finish()
             out.append(str(dst))
             if not opts.get("keep_files") and _inside(src, workdir):  # never delete the source VM's own disks

@@ -33,13 +33,15 @@ def require_tool(name: str) -> str:
     return path
 
 
-def convert_disk(src: Path, dst: Path, fmt: str = "qcow2", progress=None, cancel=None) -> Path:
-    """qemu-img convert; the input format is auto-detected (vhdx, vmdk, vhd, raw ...)."""
+def convert_disk(src: Path, dst: Path, fmt: str = "qcow2", progress=None, cancel=None, compress: bool = False) -> Path:
+    """qemu-img convert; the input format is auto-detected (vhdx, vmdk, vhd, raw ...). compress=True writes compressed
+    qcow2 clusters (-c): a smaller file to upload and for Morpheus to copy, at the cost of CPU now."""
     qemu_img = require_tool("qemu-img")
     if cancel is not None and cancel.is_set():
         raise CancelledError("cancelled")
     in_fmt = ["-f", "raw"] if src.suffix.lower() == ".img" else []  # flat ESXi disks are raw: do not let qemu guess
-    proc = subprocess.Popen([qemu_img, "convert", "-p", *in_fmt, "-O", fmt, str(src), str(dst)],
+    extra = ["-c"] if compress and fmt == "qcow2" else []
+    proc = subprocess.Popen([qemu_img, "convert", "-p", *in_fmt, *extra, "-O", fmt, str(src), str(dst)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, **no_window())
     finished = threading.Event()
 
