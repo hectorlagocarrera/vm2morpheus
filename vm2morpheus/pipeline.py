@@ -38,6 +38,7 @@ def _is_windows() -> bool:
 
 
 from .pipeline_steps import STEP_LABELS, STEPS
+from . import timings
 from .tracker import Tracker
 
 
@@ -156,7 +157,8 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             "'Recrear solo la instancia'.")
 
     bundle = bool(opts.get("multi_disk_bundle", True)) and len(vm.disks) > 1
-    tracker = Tracker(steps, done, on_progress)
+    gib = sum(d.used_bytes or d.size_bytes for d in vm.disks) / 2**30
+    tracker = Tracker(steps, done, on_progress, weights=timings.predict_weights(steps, gib))
 
     check()
     if not st.done("fetch"):
@@ -186,18 +188,23 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         source.ensure_access([Path(p) for p in st.d["fetched"]])
         if windows_inject and not st.d.get("injected"):
             boot = Path(st.d["fetched"][0])
-            if boot.suffix.lower() not in (".vhd", ".vhdx"):  # Windows can only mount VHD/VHDX
+            need_vhdx = boot.suffix.lower() not in (".vhd", ".vhdx")  # Windows can only mount VHD/VHDX
+            w_vhdx = 0.4 if need_vhdx else 0.0  # share of the "drivers" step: VHDX conversion, ISO, then DISM
+            tracker.begin("drivers")
+            if need_vhdx:
                 log(f"Convirtiendo {boot.name} a VHDX para que Windows pueda montarlo ...")
                 vhdx = boot.with_suffix(".vhdx")
-                bar = Progress(f"convertir {boot.name}", percent=True, cancel=cancel)
+                bar = Progress(f"convertir {boot.name}", percent=True, cancel=cancel,
+                               on_progress=lambda f: tracker.update("drivers", w_vhdx * f, "convirtiendo el disco a VHDX", f))
                 convert_disk(boot, vhdx, "vhdx", bar, cancel)
                 bar.finish()
                 if _inside(boot, workdir):
                     boot.unlink(missing_ok=True)
                 st.set(fetched=[str(vhdx)] + st.d["fetched"][1:])  # saved now: the VMDK is gone, a retry must find the VHDX
-            tracker.begin("drivers")
-            bar = Progress("ISO de virtio-win", cancel=cancel)
+            bar = Progress("ISO de virtio-win", cancel=cancel,
+                           on_progress=lambda f: tracker.update("drivers", w_vhdx + 0.2 * f, "descargando virtio-win", f))
             iso = ensure_virtio_iso(opts.get("virtio_iso"), bar)
+            tracker.update("drivers", w_vhdx + 0.2, "instalando los drivers con DISM", hide_percent=True)
             log("Inyectando drivers VirtIO en el disco de Windows (DISM) ...")
             added = inject_virtio_windows(Path(st.d["fetched"][0]), iso, log)
             log(f"Drivers añadidos: {', '.join(added)}")
@@ -350,6 +357,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         tracker.finish("instance")
     result["instance"] = st.d.get("instance")
     tracker.complete()
+    timings.record(tracker.durations, gib)  # only steps run now: resumed ones have no duration
     log("Terminado.")
     return result
 

@@ -1612,3 +1612,79 @@ def test_watchdog_stays_quiet_at_a_healthy_rate():
         wd.beat(value)
         assert wd.check() is False
     assert out.getvalue() == ""
+
+
+def test_tracker_books_time_per_step_even_when_steps_interleave():
+    from vm2morpheus.tracker import Tracker
+    t = {"now": 0.0}
+    tr = Tracker(["fetch", "convert", "drivers"], [], clock=lambda: t["now"])
+    tr.begin("fetch"); t["now"] = 100.0; tr.finish("fetch")
+    tr.begin("convert"); t["now"] = 110.0                       # 10 s converting...
+    tr.begin("drivers"); t["now"] = 140.0; tr.finish("drivers")  # ...30 s of driver work inside it...
+    tr.begin("convert"); t["now"] = 145.0; tr.finish("convert")  # ...then 5 s more converting
+    assert tr.durations == {"fetch": 100.0, "convert": 15.0, "drivers": 30.0}
+
+
+def test_tracker_uses_learned_weights_and_falls_back_when_incomplete():
+    from vm2morpheus.tracker import Tracker
+    ev = []
+    Tracker(["fetch", "convert", "upload"], ["fetch"], ev.append, weights={"fetch": 100, "convert": 10, "upload": 50})
+    assert ev[0]["overall"] == pytest.approx(100 / 160)
+    ev2 = []
+    Tracker(["fetch", "convert", "upload"], ["fetch"], ev2.append, weights={"fetch": 100})  # a step is missing
+    assert ev2[0]["overall"] == pytest.approx(0.30 / 0.85)  # default shares
+
+
+def test_timings_scale_with_size_and_blend_runs(tmp_path):
+    from vm2morpheus import timings
+    assert timings.predict_weights(["fetch"], 10) is None       # nothing learned yet
+    timings.record({"fetch": 600, "convert": 60, "upload": 300, "instance": 20}, gib=10)
+    w = timings.predict_weights(["fetch", "convert", "upload", "instance"], gib=20)  # twice the data
+    assert w == {"fetch": 1200.0, "convert": 120.0, "upload": 600.0, "instance": 20}  # fixed steps do not scale
+    timings.record({"fetch": 1200}, gib=10)                     # a slow day: blended 50/50, not adopted outright
+    assert timings.load()["fetch"] == pytest.approx((60 + 120) / 2)
+    assert timings.predict_weights(["fetch", "drivers"], 5) is None  # drivers was never timed
+
+
+def test_step_detail_makes_the_bar_agree_with_the_log_line():
+    from vm2morpheus.tracker import Tracker
+    ev = []
+    tr = Tracker(["fetch", "convert", "drivers", "upload"], [], ev.append)
+    tr.begin("drivers")
+    tr.update("drivers", 0.4 * 0.78, "convirtiendo el disco a VHDX", 0.78)
+    assert ev[-1]["label"] == "inyección de drivers · convirtiendo el disco a VHDX"
+    assert ev[-1]["fraction"] == pytest.approx(0.78)            # what the log line says
+    assert ev[-1]["overall"] == pytest.approx(0.1 / 0.95 * 0.4 * 0.78)  # while the whole job barely moved
+    tr.update("drivers", 0.6, "instalando los drivers con DISM", hide_percent=True)
+    assert ev[-1]["fraction"] is None                            # DISM reports no percentage
+    tr.finish("drivers")
+    assert ev[-1]["label"] == "" and ev[-1]["step"] is None
+
+
+def test_pipeline_vhdx_conversion_feeds_the_drivers_step_and_a_run_records_timings(tmp_path, monkeypatch):
+    from vm2morpheus import pipeline, timings
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    monkeypatch.setattr(pipeline, "_is_windows", lambda: True)
+    monkeypatch.setattr(pipeline, "is_admin", lambda: True)
+    monkeypatch.setattr(pipeline, "ensure_virtio_iso", lambda p, progress=None: "x.iso")
+    monkeypatch.setattr(pipeline, "inject_virtio_windows", lambda path, iso, log: ["viostor"])
+
+    class Win(FakeSource):
+        def get_vm(self, name):
+            vm = super().get_vm(name)
+            vm.os_family = "windows"
+            return vm
+
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    events = []
+    pipeline.migrate(Win(disk), _client(srv), "vm1", {"workdir": str(tmp_path / "w30"), "shutdown_source": True,
+                     "inject_drivers": True}, {"image_type": "qcow2"}, log=lambda *_: None, on_progress=events.append)
+    srv.shutdown()
+    vhdx = [e for e in events if e["step"] == "drivers" and "VHDX" in e["label"]]
+    assert vhdx and vhdx[-1]["fraction"] == pytest.approx(1.0)   # the VMDK -> VHDX step now moves the bar
+    assert not any(e["step"] == "convert" and e["fraction"] == 0 and e["overall"] > 0.2 and "VHDX" in e["label"]
+                   for e in events)
+    learned = timings.load()
+    assert {"fetch", "convert", "drivers", "upload"} <= set(learned)   # this run was timed for the next one

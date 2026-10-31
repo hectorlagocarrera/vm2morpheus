@@ -527,8 +527,8 @@ function drawBar(r){const w=document.getElementById("barwrap"),b=document.getEle
  const p=r.progress;if(!p&&r.status==="running"){return}w.style.display="block";
  let pct=Math.round(((p&&p.overall)||0)*100);if(r.status==="done")pct=100;
  b.style.width=pct+"%";b.className=r.status==="done"?"ok":r.status==="error"?"err":r.status==="cancelled"?"stop":"";
- let txt=pct+"% completado";
- if(r.status==="running"&&p&&p.step)txt=`Paso ${p.index} de ${p.total_steps}: ${p.label} (${Math.round(p.fraction*100)}%) · Total ${pct}%`;
+ let txt=pct+"% completado (estimado)";
+ if(r.status==="running"&&p&&p.step)txt=`Paso ${p.index} de ${p.total_steps}: ${p.label} (${p.fraction==null?"en curso":Math.round(p.fraction*100)+"%"}) · Total estimado ${pct}%`;
  else if(r.status==="done")txt="Terminado · 100%";else if(r.status==="error")txt=`Error · ${pct}% completado`;else if(r.status==="cancelled")txt=`Cancelado · ${pct}% completado`;
  l.textContent=txt}
 async function cancelJob(){if(!currentJob)return;document.getElementById("cancelbtn").disabled=true;try{await post("/cancel",{job:currentJob})}catch(e){show("ERROR: "+e.message)}}
