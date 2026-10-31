@@ -18,7 +18,7 @@ jobs:
       # engines more suspicious. One folder instead of --onefile: the single-file build unpacks itself into %TEMP% at every start, which
       # is what antivirus heuristics dislike most.
       - run: >
-          pyinstaller --name vm2morpheus
+          pyinstaller --name vm2morpheus --icon assets/vm2morpheus.ico
           --collect-all pyVmomi --collect-all smbprotocol --collect-all winrm
           --hidden-import smbclient exe_entry.py
       - name: Bundle qemu-img next to the exe and record SHA-256 hashes

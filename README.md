@@ -56,3 +56,10 @@ real fix; submitting the file as a false positive to the vendor helps too.
 The packaged program keeps its console window (it shows the log and closing it stops the app) and opens the
 interface in your default browser. An embedded window (`vm2morpheus gui --ventana`, needs `pip install pywebview`)
 and a hidden console are not used in the .exe: both made antivirus engines more suspicious.
+
+
+## Icons
+
+The icon (exe, Explorer, taskbar) and the browser favicon come from the Redes globe in `assets/globe-source.png`,
+turned into a transparent globe on a white rounded tile. Regenerate them with `python tools/make_icons.py`
+(needs Pillow); it rewrites `assets/*.ico`, `assets/icon-192.png` and `vm2morpheus/icon_data.py`.

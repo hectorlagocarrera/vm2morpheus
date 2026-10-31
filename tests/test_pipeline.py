@@ -1871,3 +1871,41 @@ def test_page_reports_parallel_speed_and_offers_compression():
     page = render_page()
     for needle in ("conexiones a la vez", "flat_parallel", 'id="compress_image"'):
         assert needle in page
+
+
+def _ico_sizes(data: bytes) -> list[int]:
+    reserved, kind, count = int.from_bytes(data[0:2], "little"), int.from_bytes(data[2:4], "little"), int.from_bytes(data[4:6], "little")
+    assert reserved == 0 and kind == 1                       # a real .ico header
+    return sorted((data[6 + 16 * i] or 256) for i in range(count))
+
+
+def test_exe_icon_has_every_size_windows_asks_for():
+    from pathlib import Path as P
+    ico = (P(__file__).resolve().parent.parent / "assets" / "vm2morpheus.ico").read_bytes()
+    assert _ico_sizes(ico) == [16, 24, 32, 48, 64, 128, 256]
+
+
+def test_favicon_and_png_icon_are_served_and_valid():
+    import urllib.request
+    from vm2morpheus import gui
+    srv = HTTPServer(("127.0.0.1", 0), gui.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_port}"
+    try:
+        fav = urllib.request.urlopen(base + "/favicon.ico")
+        png = urllib.request.urlopen(base + "/icon.png")
+        fav_body, png_body = fav.read(), png.read()
+        assert fav.headers["Content-Type"] == "image/x-icon" and png.headers["Content-Type"] == "image/png"
+    finally:
+        srv.shutdown()
+    assert _ico_sizes(fav_body) == [16, 32, 48]
+    assert png_body[:8] == b"\x89PNG\r\n\x1a\n"
+
+
+def test_page_uses_the_globe_as_favicon_and_the_build_embeds_it_in_the_exe():
+    from vm2morpheus import gui
+    page = gui.render_page()
+    assert '<link rel="icon" href="/favicon.ico" sizes="any">' in page and 'rel="apple-touch-icon"' in page
+    assert '<link rel="icon" href="/logo.png">' not in page   # the wide logo is no longer used as the tab icon
+    wf = open(".github/workflows/build-exe.yml", encoding="utf-8").read()
+    assert "--icon assets/vm2morpheus.ico" in wf

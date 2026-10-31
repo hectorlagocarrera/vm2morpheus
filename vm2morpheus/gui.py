@@ -10,6 +10,7 @@ from dataclasses import asdict
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import __version__, settings
+from .icon_data import FAVICON_ICO, ICON_PNG
 from .logo import LOGO_PNG
 from .morpheus import MorpheusClient
 from .pipeline import migrate
@@ -175,6 +176,14 @@ class Handler(BaseHTTPRequestHandler):
         elif self.path == "/ping":
             STATE["last_ping"] = time.monotonic()
             self._json({"ok": True})
+        elif self.path in ("/favicon.ico", "/icon.png"):
+            data, kind = (FAVICON_ICO, "image/x-icon") if self.path == "/favicon.ico" else (ICON_PNG, "image/png")
+            self.send_response(200)
+            self.send_header("Content-Type", kind)
+            self.send_header("Content-Length", str(len(data)))
+            self.send_header("Cache-Control", "max-age=86400")
+            self.end_headers()
+            self.wfile.write(data)
         elif self.path == "/logo.png":
             self.send_response(200)
             self.send_header("Content-Type", "image/png")
@@ -325,7 +334,9 @@ def render_page() -> str:
 
 PAGE = r"""<!doctype html><html lang="es"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
 <title>vm2morpheus</title>
-<link rel="icon" href="/logo.png">
+<link rel="icon" href="/favicon.ico" sizes="any">
+<link rel="icon" type="image/png" href="/icon.png">
+<link rel="apple-touch-icon" href="/icon.png">
 <style>
 body{font:15px system-ui,sans-serif;margin:0;background:#f4f6f8;color:#1b2430}
 main{max-width:920px;margin:0 auto;padding:16px}
