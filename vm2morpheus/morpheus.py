@@ -148,6 +148,14 @@ class MorpheusClient:
             return []
         return [(f"pool-{p['id']}", p.get("name", "")) for p in data.get("resourcePools", []) if p.get("active", True)]
 
+    def find_instance(self, name: str) -> dict | None:
+        """An existing instance with exactly this name, or None (also None if the lookup itself fails)."""
+        try:
+            items = self._req("GET", "/api/instances", params={"name": name, "max": 25}).get("instances", [])
+        except MorpheusError:
+            return None
+        return next((i for i in items if i.get("name") == name), None)
+
     def get_instance(self, instance_id: int) -> dict:
         return self._req("GET", f"/api/instances/{instance_id}")["instance"]
 

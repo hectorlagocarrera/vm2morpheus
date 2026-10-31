@@ -20,6 +20,10 @@ class FakeMorpheus(BaseHTTPRequestHandler):
     uploads = {}
     reject_sata = False
     no_library = False
+    existing_name = None
+    existing_image_name = None
+    name_clash = False
+    instance_posts = 0
 
     def _send(self, obj, code=200):
         b = json.dumps(obj).encode()
@@ -43,6 +47,10 @@ class FakeMorpheus(BaseHTTPRequestHandler):
             return self._send({"success": True})
         if self.path == "/api/instances":
             sent = json.loads(body)
+            type(self).instance_posts += 1
+            if self.name_clash:
+                return self._send({"success": False, "msg": "Failed to create instance",
+                                   "errors": {"name": "must be unique"}}, 400)
             if self.reject_sata and any("controllerMountPoint" in v for v in sent.get("volumes", [])):
                 return self._send({"success": False, "msg": "bad controller"}, 400)
             self.log.append(("instance", sent))
@@ -59,6 +67,12 @@ class FakeMorpheus(BaseHTTPRequestHandler):
             return self._send({"success": True, "instanceTypes": [{"id": 10, "code": "mvm"}]})
         if self.path.startswith("/api/zones/1/resource-pools"):
             return self._send({"success": True, "resourcePools": [{"id": 1, "name": "ClusterLab01", "active": True}]})
+        if self.path.startswith("/api/virtual-images?"):
+            hit = [{"id": 5, "name": self.existing_image_name}] if self.existing_image_name else []
+            return self._send({"success": True, "virtualImages": hit})
+        if self.path.startswith("/api/instances?") and "name=" in self.path:
+            hit = [{"id": 99, "name": self.existing_name, "status": "running"}] if self.existing_name else []
+            return self._send({"success": True, "instances": hit})
         if self.path.startswith("/api/instances?"):
             return self._send({"success": True, "instances": [
                 {"instanceType": {"code": "mvm"}, "layout": {"id": 32, "name": "Single HVM"}},
@@ -1484,3 +1498,53 @@ def test_download_starts_and_stops_its_watchdog(tmp_path, monkeypatch):
     vmware.download_to("https://esxi/x", tmp_path / "d.vmdk", "c", False, lambda d, t: None,
                        getter=lambda *a, **k: _FakeResponse([b"aaaa", b"bb"]))
     assert events == ["start", ("beat", 4), ("beat", 6), "stop"]
+
+
+def _migrate_with_reference(tmp_path, name, **flags):
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    FakeMorpheus.log.clear()
+    FakeMorpheus.instance_posts = 0
+    for k, v in flags.items():
+        setattr(FakeMorpheus, k, v)
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    msgs = []
+    try:
+        migrate(FakeSource(disk), _client(srv), "vm1", {"workdir": str(tmp_path / name), "shutdown_source": True},
+                {"image_type": "qcow2", "reference_instance": {"instance_id": 5, "image_id": 3}}, log=msgs.append)
+        return msgs, None
+    except Exception as e:
+        return msgs, e
+    finally:
+        srv.shutdown()
+        for k in flags:
+            setattr(FakeMorpheus, k, {"existing_name": None, "existing_image_name": None, "name_clash": False}[k])
+
+
+def test_an_existing_instance_with_that_name_is_reported_before_anything_is_created(tmp_path):
+    msgs, err = _migrate_with_reference(tmp_path, "w20", existing_name="vm1")
+    assert isinstance(err, RuntimeError)
+    assert "Ya existe en Morpheus una instancia llamada 'vm1' (id 99, estado running)" in str(err)
+    assert "conserva lo ya descargado" in str(err) and FakeMorpheus.instance_posts == 0
+
+
+def test_a_name_clash_the_precheck_missed_is_explained_and_not_retried_as_a_sata_problem(tmp_path):
+    msgs, err = _migrate_with_reference(tmp_path, "w21", name_clash=True)
+    assert isinstance(err, RuntimeError) and "Ya existe en Morpheus una instancia llamada 'vm1'" in str(err)
+    assert FakeMorpheus.instance_posts == 1                       # one attempt: no retry without SATA
+    assert not any("rechazó la petición del controlador SATA" in m for m in msgs)  # no misleading message
+
+
+def test_volume_rejection_detection():
+    from vm2morpheus.morpheus import MorpheusError
+    from vm2morpheus.pipeline import volume_related_rejection
+    assert volume_related_rejection(MorpheusError("POST /api/instances -> 400: invalid controllerMountPoint"))
+    assert not volume_related_rejection(MorpheusError("POST /api/instances -> 400: Failed {'name': 'must be unique'}"))
+    assert not volume_related_rejection(MorpheusError("POST /api/instances -> 500: controller exploded"))
+
+
+def test_a_same_name_image_only_produces_a_warning(tmp_path):
+    msgs, err = _migrate_with_reference(tmp_path, "w22", existing_image_name="vm1")
+    assert err is None
+    assert any("Aviso: ya hay una imagen llamada 'vm1' en Morpheus (id 5)" in m for m in msgs)

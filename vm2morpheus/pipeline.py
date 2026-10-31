@@ -11,6 +11,28 @@ from .morpheus import MorpheusClient, MorpheusError, payload_from_reference, ren
 from .sources.base import Source
 from .util import CancelledError, Progress, human, redact
 
+def instance_exists_message(name: str, found: dict | None = None) -> str:
+    where = f" (id {found['id']}, estado {found.get('status', '?')})" if found and found.get("id") else ""
+    return (f"Ya existe en Morpheus una instancia llamada {name!r}{where}. Si es una prueba anterior, bórrala en "
+            "Provisioning > Instances y vuelve a pulsar Migrar: el programa conserva lo ya descargado, convertido y "
+            "subido y solo creará la VM. Si ya es la VM migrada, no hace falta hacer nada más.")
+
+
+def volume_related_rejection(e: Exception) -> bool:
+    """A 400 that is about the disk/controller we asked for (worth retrying without SATA), not about the name."""
+    text = str(e).lower()
+    return " 400:" in text and "must be unique" not in text and any(k in text for k in ("controller", "volume", "storage", "disk"))
+
+
+def create_instance_clearly(morpheus, payload: dict, name: str) -> dict:
+    try:
+        return morpheus.create_instance(payload)
+    except MorpheusError as e:
+        if "must be unique" in str(e).lower():
+            raise RuntimeError(instance_exists_message(name)) from e
+        raise
+
+
 def _is_windows() -> bool:
     return os.name == "nt"
 
@@ -209,6 +231,13 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         tracker.begin("upload")
 
         def publish(path: Path, name: str, idx: int = 0, n: int = 1) -> dict:
+            try:
+                old_image = morpheus.find_one("virtual-images", "virtualImages", name)
+            except MorpheusError:
+                old_image = None  # only a courtesy warning: never fail the migration for it
+            if old_image:
+                log(f"Aviso: ya hay una imagen llamada {name!r} en Morpheus (id {old_image['id']}); se crea otra "
+                    "con el mismo nombre. Borra la antigua de Library > Virtual Images si sobra.")
             log(f"Creando la imagen {name!r} en Morpheus ...")
             img = morpheus.create_virtual_image(
                 name, mcfg.get("image_type", fmt), os_type=mcfg.get("os_type"),
@@ -254,6 +283,10 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         tracker.begin("instance")
         template = mcfg.get("instance")
         refcfg = mcfg.get("reference_instance")
+        if refcfg or template:
+            existing = morpheus.find_instance(vm.name)
+            if existing:  # checked before anything is built: a name clash is the commonest reason for a 400 here
+                raise RuntimeError(instance_exists_message(vm.name, existing))
         if refcfg:
             if "synthetic" in refcfg:
                 ref = refcfg["synthetic"]
@@ -296,20 +329,20 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                     if want_sata else "un Windows necesita drivers VirtIO para arrancar desde VirtIO"))
             log("Creando la instancia en Morpheus ...")
             try:
-                inst = morpheus.create_instance(build(want_sata))
+                inst = create_instance_clearly(morpheus, build(want_sata), vm.name)
             except MorpheusError as e:
-                if not want_sata or " 400:" not in str(e):
+                if not want_sata or not volume_related_rejection(e):
                     raise
                 log(f"Morpheus rechazó la petición del controlador SATA ({e}); se reintenta sin SATA. "
                     "Cambia el disco de arranque a SATA a mano si Windows no arranca.")
-                inst = morpheus.create_instance(build(False))
+                inst = create_instance_clearly(morpheus, build(False), vm.name)
             st.mark("instance", instance={"id": inst.get("id"), "name": inst.get("name")})
         elif template:
             vals = {"image_id": st.d["images"][0]["id"], "image_name": st.d["images"][0]["name"],
                     "vm_name": vm.name, "cpu": vm.cpu, "memory_mb": vm.memory_mb,
                     "memory_bytes": vm.memory_mb * 1024 * 1024}
             log("Creando la instancia en Morpheus ...")
-            inst = morpheus.create_instance(render_template(template, vals))
+            inst = create_instance_clearly(morpheus, render_template(template, vals), vm.name)
             st.mark("instance", instance={"id": inst.get("id"), "name": inst.get("name")})
         else:
             log("No hay plantilla de instancia configurada: se termina tras subir la imagen")
