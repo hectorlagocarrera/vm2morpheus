@@ -1778,3 +1778,30 @@ def test_page_picks_the_plan_that_matches_the_vm():
     page = render_page()
     for needle in ("function pickPlan", 'id="planhint"', "data-cores", "planTouched=true", "coincide con la VM original"):
         assert needle in page
+
+
+def test_timings_are_kept_separately_per_kind_of_source(tmp_path):
+    from vm2morpheus import timings
+    timings.record({"fetch": 100, "convert": 20, "upload": 50}, gib=10, kind="hyperv")
+    timings.record({"fetch": 1380, "convert": 220, "upload": 390}, gib=5.3, kind="vmware")
+    hv = timings.predict_weights(["fetch", "convert", "upload"], 10, "hyperv")
+    vm = timings.predict_weights(["fetch", "convert", "upload"], 10, "vmware")
+    assert hv["fetch"] == pytest.approx(100) and vm["fetch"] == pytest.approx(1380 / 5.3 * 10)
+    assert vm["fetch"] > 20 * hv["fetch"]                      # an ESXi export is not an SMB copy
+    assert timings.predict_weights(["fetch"], 10, "other") is None
+
+
+def test_an_old_flat_timings_file_is_ignored_not_misread(tmp_path):
+    from vm2morpheus import timings
+    timings.PATH.parent.mkdir(parents=True, exist_ok=True)
+    timings.PATH.write_text(json.dumps({"fetch": 60.0, "convert": 5.0, "upload": 30.0}))   # pre-0.19.3 layout
+    assert timings.predict_weights(["fetch", "convert", "upload"], 1, "hyperv") is None
+    timings.record({"fetch": 10}, 1, "hyperv")                  # and writing afterwards works
+    assert timings.load("hyperv")["fetch"] == pytest.approx(10)
+
+
+def test_each_source_declares_its_timing_kind():
+    from vm2morpheus.sources.hyperv import HyperVSource
+    from vm2morpheus.sources.vmware import VMwareSource
+    assert HyperVSource.timing_kind == "hyperv" and VMwareSource.timing_kind == "vmware"
+    assert HyperVSource.__doc__ and VMwareSource.__doc__        # the attribute must not displace the docstring

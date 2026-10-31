@@ -173,6 +173,7 @@ class VMwareSource(Source):
     Disks are pulled with an NFC export lease (the same mechanism as 'Export OVF'),
     which yields stream-optimized VMDKs. The VM must be powered off.
     """
+    timing_kind = "vmware"  # progress-bar timings are learned per kind of source
 
     def __init__(self, cfg: dict):
         self.host = cfg["host"]

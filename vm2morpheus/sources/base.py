@@ -27,6 +27,7 @@ class Source(ABC):
     def fetch_disks(self, vm: VMInfo, dest: Path, progress: Callable[[str], ProgressCb]) -> list[Path]:
         """Copy every disk of the (powered-off) VM into dest; returns the local files, boot disk first."""
 
+    timing_kind = "default"  # which history the progress bar learns from (see timings.py)
     direct = False  # True when fetch_disks returns paths on the source instead of local copies
 
     def ensure_access(self, paths: list[Path]) -> None:

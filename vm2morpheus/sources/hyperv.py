@@ -27,6 +27,7 @@ class HyperVSource(Source):
     Needs: WinRM enabled on the host, SMB access to the admin shares (C$ ...), and an
     account that is local admin / Hyper-V administrator.
     """
+    timing_kind = "hyperv"  # progress-bar timings are learned per kind of source
 
     def __init__(self, cfg: dict):
         self.host = cfg["host"]

@@ -172,7 +172,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     if target != vm.name:
         log(f"Nombre en Morpheus: {target!r} (en el origen es {vm.name!r})")
     gib = sum(d.used_bytes or d.size_bytes for d in vm.disks) / 2**30
-    tracker = Tracker(steps, done, on_progress, weights=timings.predict_weights(steps, gib))
+    tracker = Tracker(steps, done, on_progress, weights=timings.predict_weights(steps, gib, source.timing_kind))
 
     check()
     if not st.done("fetch"):
@@ -374,7 +374,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         tracker.finish("instance")
     result["instance"] = st.d.get("instance")
     tracker.complete()
-    timings.record(tracker.durations, gib)  # only steps run now: resumed ones have no duration
+    timings.record(tracker.durations, gib, source.timing_kind)  # only steps run now: resumed ones have no duration
     log("Terminado.")
     return result
 
