@@ -95,12 +95,16 @@ def make_cfgs(f: dict):
         m["reference_instance"] = {"instance_id": int(f["ref_instance_id"]),
                                    "image_id": int(f["ref_image_id"]) if f.get("ref_image_id") else None}
     elif f.get("cloud_id") and f.get("group_id") and f.get("plan_id"):
+        if not f.get("network_id"):  # Morpheus refuses a VM without a network, and it would only say so at the very end
+            raise ValueError("Elige la red de la VM nueva (bloque 3, campo Red). Morpheus la exige, y sin ella la "
+                             "migración fallaría al final, después de descargar y subir el disco.")
         m["reference_instance"] = {"synthetic": synthetic_reference(f)}
     opts = {"workdir": resolve_workdir(f), "shutdown_source": bool(f.get("shutdown")),
             "boot_sata": bool(f.get("boot_sata")), "inject_drivers": bool(f.get("inject_drivers")),
             "virtio_iso": (f.get("virtio_iso") or "").strip() or None, "keep_files": False, "multi_disk_bundle": bool(f.get("multi_disk_bundle")),
             "recreate_instance": bool(f.get("recreate_instance")),
-            "disk_indexes": [int(i) for i in f["disk_indexes"]] if f.get("disk_indexes") is not None else None}
+            "disk_indexes": [int(i) for i in f["disk_indexes"]] if f.get("disk_indexes") is not None else None,
+            "new_name": (f.get("new_vm_name") or "").strip() or None}
     return src, m, opts
 
 
@@ -378,6 +382,7 @@ small{color:#5d6b7b}
 <div id="diskpanel" style="display:none;margin-top:8px"><div id="diskinfo"></div><div id="disklist" style="margin:6px 0"></div><small id="diskhint"></small></div></fieldset>
 <fieldset><legend>2. Destino Morpheus</legend><div class="row">
 <div><label>URL (https://ip)</label><input id="morpheus_url"></div>
+<div><label>Nombre de la VM en Morpheus <small>(igual que la original si lo dejas)</small></label><input id="new_vm_name" oninput="newNameTouched=true" placeholder="igual que la original"></div>
 <div><label>Token API</label><input id="morpheus_token" type="password"></div>
 <div><label>imageType <small>(qcow2 por defecto, verifícalo)</small></label><input id="image_type" value="qcow2"></div>
 </div><div class="chk"><label><input type="checkbox" id="verify_ssl"> Verificar certificado TLS</label></div>
@@ -389,7 +394,7 @@ small{color:#5d6b7b}
 <button class="sec" data-busy onclick="refinfo()">Ver instancia de referencia (JSON)</button>
 <details open><summary><small>Sin instancia de referencia: crear desde cero (rellena nube, grupo, plan, red y layout)</small></summary>
 <div class="row"><div><label>Nube</label><select id="cloud_id"></select></div><div><label>Grupo</label><select id="group_id"></select></div>
-<div><label>Plan</label><select id="plan_id"></select></div><div><label>Red</label><select id="network_id"></select></div>
+<div><label>Plan</label><select id="plan_id"></select></div><div><label>Red <small>(obligatoria)</small></label><select id="network_id"></select></div>
 <div><label>Instance type (código)</label><input id="instance_type" value="mvm"></div><div><label>Layout <small>(automático: Single HVM)</small></label><select id="layout_id"><option value="">(automático)</option></select></div><div><label>Resource pool <small>(automático)</small></label><select id="resource_pool"><option value="">(automático)</option></select></div></div></details></fieldset>
 <fieldset><legend>4. Opciones</legend><div class="chk">
 <label><input type="checkbox" id="shutdown"> Apagar la VM de origen</label>
@@ -413,7 +418,7 @@ small{color:#5d6b7b}
 <div class="logbar"><b>Registro</b><span><button class="sec mini" onclick="copyLog()">Copiar</button><button class="sec mini" onclick="saveLog()">Guardar .txt</button><button class="sec mini" onclick="clearLog()">Limpiar</button></span></div>
 <div id="log" class="logbox" tabindex="0">Listo.</div></main>
 <script>
-const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","virtio_iso","vmware_method","ref_instance_id","ref_image_id","workdir"];
+const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","virtio_iso","vmware_method","new_vm_name","ref_instance_id","ref_image_id","workdir"];
 const chks=["verify_ssl","verify_source","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
 const EMBEDDED=__EMBEDDED__;
 let analyzedVm=null;
@@ -476,7 +481,9 @@ async function busy(text,fn){const w=document.getElementById("busywrap"),t=docum
 async function persist(){try{await post("/settings",form())}catch(e){}}
 let saved={};
 async function listvms(){try{await persist();const j=await busy("Conectando con el origen y listando las VM …",()=>post("/listvms",form()));const s=document.getElementById("vm_select");s.innerHTML='<option value="">(elige una VM)</option>'+j.vms.map(v=>`<option value="${v.name}">${v.name} — ${v.state=="on"?"encendida":"apagada"}, ${v.cpu} vCPU, ${(v.memory_mb/1024).toFixed(1)} GiB${v.host?" · host "+v.host:""}</option>`).join("");show("Conectado a "+j.kind+": "+j.vms.length+" VM(s) encontradas. Elige una en el desplegable.")}catch(e){show("ERROR: "+e.message)}}
-async function analyze(force){const vm=document.getElementById("vm").value.trim();
+let newNameTouched=false;
+function syncNewName(){if(!newNameTouched)document.getElementById("new_vm_name").value=document.getElementById("vm").value.trim()}
+async function analyze(force){const vm=document.getElementById("vm").value.trim();syncNewName();
  if(!vm||!document.getElementById("source_host").value.trim())return;
  if(!force&&analyzedVm===vm)return; // same VM: keep the disks the user ticked
  try{await persist();const j=await busy("Analizando la VM …",()=>post("/inspect",form()));analyzedVm=vm;renderDisks(j)}
@@ -502,7 +509,7 @@ setInterval(()=>fetch("/ping").catch(()=>{}),5000);fetch("/ping").catch(()=>{});
 async function refinfo(){try{show(JSON.stringify(await busy("Leyendo la instancia de referencia …",()=>post("/refinfo",form())),null,2))}catch(e){show("ERROR: "+e.message)}}
 async function lookups(){try{await persist();const j=await busy("Cargando datos de Morpheus …",()=>post("/lookups",form()));
  for(const [k,id] of [["clouds","cloud_id"],["groups","group_id"],["plans","plan_id"],["networks","network_id"],["instances","ref_instance_id"]]){
-  const s=document.getElementById(id);s.innerHTML=(id=="network_id"||id=="ref_instance_id"?'<option value="">(ninguna)</option>':'')+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id]}
+  const s=document.getElementById(id);s.innerHTML=(id=="ref_instance_id"?'<option value="">(ninguna)</option>':id=="network_id"?'<option value="">(elige una red)</option>':'')+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id];else if(id=="network_id"&&j[k].length===1)s.value=j[k][0][0]}
   for(const [k,id] of [["layouts","layout_id"],["pools","resource_pool"]]){const s=document.getElementById(id);s.innerHTML='<option value="">(automático)</option>'+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id]}
  show("Datos cargados.")}catch(e){show("ERROR: "+e.message)}}
 const SEP=String.fromCharCode(92);
@@ -538,6 +545,7 @@ async function run(p){try{await persist();const {job}=await post(p,form());curre
 srcHint();
 (async()=>{try{saved=await (await fetch("/settings")).json();
  ids.forEach(i=>{if(saved[i]!==undefined&&document.getElementById(i).tagName==="INPUT"||saved[i]!==undefined&&["source_type","os_family","vmware_method"].includes(i))document.getElementById(i).value=saved[i]});
+ newNameTouched=!!(saved.new_vm_name&&saved.new_vm_name!==saved.vm); // a name typed earlier is kept
  chks.forEach(i=>{if(saved[i]!==undefined)document.getElementById(i).checked=!!saved[i]});
  srcHint();
  if(saved.morpheus_url&&saved.morpheus_token)lookups()}catch(e){}})();

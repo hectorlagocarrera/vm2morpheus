@@ -157,6 +157,9 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             "'Recrear solo la instancia'.")
 
     bundle = bool(opts.get("multi_disk_bundle", True)) and len(vm.disks) > 1
+    target = (opts.get("new_name") or "").strip() or vm.name  # name shown in Morpheus (image and VM)
+    if target != vm.name:
+        log(f"Nombre en Morpheus: {target!r} (en el origen es {vm.name!r})")
     gib = sum(d.used_bytes or d.size_bytes for d in vm.disks) / 2**30
     tracker = Tracker(steps, done, on_progress, weights=timings.predict_weights(steps, gib))
 
@@ -271,14 +274,14 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             log(f"Empaquetando {len(converted)} discos en una sola imagen multidisco (zip + metadata.json) ...")
             zip_path = workdir / f"{vm.name}.zip"
             build_bundle(vm.name, [(f, d.size_bytes) for f, d in zip(converted, vm.disks)], zip_path)
-            images.append(publish(zip_path, vm.name))
+            images.append(publish(zip_path, target))
             if not opts.get("keep_files"):
                 zip_path.unlink(missing_ok=True)
                 for f in converted:
                     f.unlink(missing_ok=True)
         else:
             for i, f in enumerate(converted):
-                images.append(publish(f, vm.name if i == 0 else f"{vm.name}-disk{i}", i, len(converted)))
+                images.append(publish(f, target if i == 0 else f"{target}-disk{i}", i, len(converted)))
                 if not opts.get("keep_files"):
                     f.unlink(missing_ok=True)
         st.mark("upload", images=images, bundle=bundle)
@@ -291,9 +294,9 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         template = mcfg.get("instance")
         refcfg = mcfg.get("reference_instance")
         if refcfg or template:
-            existing = morpheus.find_instance(vm.name)
+            existing = morpheus.find_instance(target)
             if existing:  # checked before anything is built: a name clash is the commonest reason for a 400 here
-                raise RuntimeError(instance_exists_message(vm.name, existing))
+                raise RuntimeError(instance_exists_message(target, existing))
         if refcfg:
             if "synthetic" in refcfg:
                 ref = refcfg["synthetic"]
@@ -316,7 +319,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             def build(boot_sata: bool) -> dict:
                 try:
                     return payload_from_reference(
-                        ref, vm.name, int(refcfg["image_id"]) if refcfg.get("image_id") else None,
+                        ref, target, int(refcfg["image_id"]) if refcfg.get("image_id") else None,
                         st.d["images"][0]["id"], root_gb, extra_gb, uefi=vm.firmware == "uefi",
                         extra_name="data" if in_bundle else None, boot_sata=boot_sata)
                 except MorpheusError:
@@ -336,20 +339,20 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                     if want_sata else "un Windows necesita drivers VirtIO para arrancar desde VirtIO"))
             log("Creando la instancia en Morpheus ...")
             try:
-                inst = create_instance_clearly(morpheus, build(want_sata), vm.name)
+                inst = create_instance_clearly(morpheus, build(want_sata), target)
             except MorpheusError as e:
                 if not want_sata or not volume_related_rejection(e):
                     raise
                 log(f"Morpheus rechazó la petición del controlador SATA ({e}); se reintenta sin SATA. "
                     "Cambia el disco de arranque a SATA a mano si Windows no arranca.")
-                inst = create_instance_clearly(morpheus, build(False), vm.name)
+                inst = create_instance_clearly(morpheus, build(False), target)
             st.mark("instance", instance={"id": inst.get("id"), "name": inst.get("name")})
         elif template:
             vals = {"image_id": st.d["images"][0]["id"], "image_name": st.d["images"][0]["name"],
-                    "vm_name": vm.name, "cpu": vm.cpu, "memory_mb": vm.memory_mb,
+                    "vm_name": target, "cpu": vm.cpu, "memory_mb": vm.memory_mb,
                     "memory_bytes": vm.memory_mb * 1024 * 1024}
             log("Creando la instancia en Morpheus ...")
-            inst = create_instance_clearly(morpheus, render_template(template, vals), vm.name)
+            inst = create_instance_clearly(morpheus, render_template(template, vals), target)
             st.mark("instance", instance={"id": inst.get("id"), "name": inst.get("name")})
         else:
             log("No hay plantilla de instancia configurada: se termina tras subir la imagen")

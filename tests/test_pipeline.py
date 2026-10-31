@@ -1688,3 +1688,57 @@ def test_pipeline_vhdx_conversion_feeds_the_drivers_step_and_a_run_records_timin
                    for e in events)
     learned = timings.load()
     assert {"fetch", "convert", "drivers", "upload"} <= set(learned)   # this run was timed for the next one
+
+
+def test_network_is_mandatory_when_the_vm_is_created_from_scratch_and_checked_before_any_work():
+    from vm2morpheus.gui import make_cfgs
+    base = {"vm": "w2k16", "morpheus_url": "https://m", "morpheus_token": "t", "source_type": "esxi",
+            "source_host": "h", "source_user": "u", "source_password": "p",
+            "cloud_id": "1", "group_id": "1", "plan_id": "23"}
+    with pytest.raises(ValueError, match="Elige la red de la VM nueva"):
+        make_cfgs(dict(base))                                   # from scratch, no network: refuse up front
+    _, m, _ = make_cfgs({**base, "network_id": "1"})
+    assert m["reference_instance"]["synthetic"]["interfaces"] == [{"id": "network-1", "network": {"id": 1}}]
+    _, m2, _ = make_cfgs({**base, "ref_instance_id": "5"})      # a reference instance brings its own network
+    assert m2["reference_instance"]["instance_id"] == 5
+    _, m3, _ = make_cfgs({k: v for k, v in base.items() if k not in ("cloud_id", "group_id", "plan_id")})
+    assert "reference_instance" not in m3                       # image only: nothing to validate
+
+
+def test_the_new_name_is_used_for_the_image_and_the_vm_but_not_for_the_work_folder(tmp_path):
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    FakeMorpheus.log.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    msgs = []
+    migrate(FakeSource(disk), _client(srv), "vm1", {"workdir": str(tmp_path / "w31"), "shutdown_source": True,
+            "new_name": "  prod-w2k16  "}, {"image_type": "qcow2", "reference_instance": {"instance_id": 5, "image_id": 3}},
+            log=msgs.append)
+    srv.shutdown()
+    sent = dict(FakeMorpheus.log)
+    assert sent["image"]["virtualImage"]["name"] == "prod-w2k16"
+    assert sent["instance"]["instance"]["name"] == "prod-w2k16"
+    assert (tmp_path / "w31" / "vm1" / "state.json").exists()      # resume state stays keyed by the source name
+    assert any("Nombre en Morpheus: 'prod-w2k16' (en el origen es 'vm1')" in m for m in msgs)
+
+
+def test_without_a_new_name_the_original_is_kept(tmp_path):
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    FakeMorpheus.log.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    migrate(FakeSource(disk), _client(srv), "vm1", {"workdir": str(tmp_path / "w32"), "shutdown_source": True,
+            "new_name": None}, {"image_type": "qcow2", "reference_instance": {"instance_id": 5, "image_id": 3}},
+            log=lambda *_: None)
+    srv.shutdown()
+    assert dict(FakeMorpheus.log)["instance"]["instance"]["name"] == "vm1"
+
+
+def test_page_follows_the_source_name_until_the_user_types_their_own():
+    from vm2morpheus.gui import render_page
+    page = render_page()
+    for needle in ('id="new_vm_name"', "function syncNewName", "newNameTouched=true", "(elige una red)",
+                   "Red <small>(obligatoria)</small>"):
+        assert needle in page
