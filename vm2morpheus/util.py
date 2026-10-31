@@ -56,7 +56,12 @@ class Progress:
     """Callable (done, total) -> None that prints a throttled one-line progress bar with speed and time left.
 
     When the real total is unknown (an ESXi export is compressed on the fly) pass `estimate`, the expected size:
-    the time left is then shown as an estimate and the percentage never reaches 100% on its own."""
+    the time left is then shown as an estimate and the percentage never reaches 100% on its own.
+
+    `Progress.observer`, if set, is called as observer(label, done, total, unit) on every printed update (unit is
+    "bytes" or "percent"); the GUI uses it to draw the live throughput chart."""
+
+    observer = None
 
     def __init__(self, label: str, stream=None, percent: bool = False, cancel=None, on_progress=None,
                  estimate: float | None = None):
@@ -84,6 +89,8 @@ class Progress:
         fraction = done / total if total else (min(0.99, done / self.estimate) if self.estimate else None)
         if fraction is not None and self.on_progress:
             self.on_progress(min(1.0, fraction))
+        if Progress.observer is not None:
+            Progress.observer(self.label, done, total, "percent" if self.percent else "bytes")
         eta = self._eta(done, total, now)
         if total and self.percent:
             self.stream.write(f"\r  {self.label}: {done / total:6.1%}{eta}   ")

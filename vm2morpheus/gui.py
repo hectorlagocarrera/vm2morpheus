@@ -14,7 +14,7 @@ from .logo import LOGO_PNG
 from .morpheus import MorpheusClient
 from .pipeline import migrate
 from .sources import make_source
-from .util import CancelledError, browse, pick_workdir, redact
+from .util import CancelledError, Progress, browse, pick_workdir, redact
 
 STATE = {"server": None, "last_ping": None}
 IDLE_LIMIT = 180  # seconds without the page pinging us (tab closed) before the app exits
@@ -121,6 +121,8 @@ def resolve_workdir(f: dict) -> str:
 def run_job(job_id: str, f: dict, dry: bool):
     job, jl = JOBS[job_id], JobLog()
     job["jl"] = jl
+    Progress.observer = lambda label, done, total, unit: job.__setitem__(
+        "transfer", {"label": label, "done": done, "total": total, "unit": unit, "t": time.time()})
     with RUN_LOCK, contextlib.redirect_stderr(jl):
         try:
             src_cfg, m, opts = make_cfgs(f)
@@ -140,6 +142,8 @@ def run_job(job_id: str, f: dict, dry: bool):
         except Exception as e:  # shown to the user in the log panel
             jl.lines.append(f"ERROR: {e}")
             job["status"] = "error"
+        finally:
+            Progress.observer = None
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -185,7 +189,8 @@ class Handler(BaseHTTPRequestHandler):
             if not job:
                 return self._json({"error": "unknown job"}, 404)
             jl = job.get("jl")
-            self._json({"status": job["status"], "log": jl.text() if jl else "", "progress": job.get("progress")})
+            self._json({"status": job["status"], "log": jl.text() if jl else "", "progress": job.get("progress"),
+                        "transfer": job.get("transfer")})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -340,7 +345,21 @@ button:disabled{opacity:.55;cursor:wait}
 #bar.ok{background:#1e8e4e} #bar.err{background:#c0392b} #bar.stop{background:#7b8794}
 #barlabel{font-size:13px;margin-top:4px;color:#4a5665}
 button.danger{background:#c0392b}
-button.sec{background:#e5e9ee;color:#1b2430} pre{background:#0f172a;color:#d6e2f0;padding:12px;border-radius:8px;min-height:140px;max-height:420px;overflow:auto;white-space:pre-wrap}
+button.sec{background:#e5e9ee;color:#1b2430} .logbar{display:flex;justify-content:space-between;align-items:center;margin:14px 0 6px}
+.logbar b{font-size:14px} .logbar button.mini{padding:4px 10px;margin:0 0 0 6px;font-size:12px}
+.logbox{background:#0b1220;color:#d6e2f0;border-radius:10px;padding:10px 0;min-height:140px;max-height:440px;overflow:auto;
+ font:13px/1.5 Consolas,"Cascadia Mono",Menlo,monospace;user-select:text;-webkit-user-select:text;cursor:text;box-shadow:inset 0 0 0 1px #1e293b}
+.logbox .ln{padding:0 14px;white-space:pre-wrap;word-break:break-word;border-left:3px solid transparent}
+.logbox .ln:hover{background:#111b30}
+.logbox .step{color:#93c5fd;font-weight:600;border-left-color:#3b82f6;margin-top:4px}
+.logbox .prog{color:#9fb3c8} .logbox .ok{color:#86efac;border-left-color:#22c55e}
+.logbox .warn{color:#fcd34d;border-left-color:#f59e0b} .logbox .err{color:#fca5a5;font-weight:600;border-left-color:#ef4444;background:#2a1215}
+#chartwrap{display:none;margin:12px 0}
+#chartwrap .head{display:flex;justify-content:space-between;align-items:baseline;font-size:13px;margin-bottom:4px}
+#chartwrap .head b{font-size:14px} #chartinfo{color:#4a5665}
+#speedchart{width:100%;height:170px;background:#fff;border:1px solid #d5dbe2;border-radius:10px;display:block}
+#chartlegend{font-size:12px;color:#4a5665;margin-top:4px}
+#chartlegend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin:0 4px 0 12px;vertical-align:middle}
 small{color:#5d6b7b}
 </style><main>
 <div class="brand"><img src="/logo.png" alt="Redes · 25 años innovando el futuro"><button class="sec quit" onclick="quit()">Salir del programa</button></div>
@@ -386,14 +405,66 @@ small{color:#5d6b7b}
 <button class="sec" onclick="pickerUp()">Subir</button><button onclick="pickerUse()">Usar esta carpeta</button><button class="sec" onclick="closePicker()">Cerrar</button></div></fieldset>
 <button onclick="run('/dryrun')" class="sec">Simulación</button><button onclick="run('/migrate')">Migrar</button><button id="cancelbtn" class="danger" style="display:none" onclick="cancelJob()">Cancelar migración</button>
 <div id="barwrap"><div id="barline"><div id="bar"></div></div><div id="barlabel"></div></div>
-<pre id="log">Listo.</pre></main>
+<div id="chartwrap"><div class="head"><b>Transferencia en directo</b><span id="chartinfo"></span></div>
+<canvas id="speedchart"></canvas>
+<div id="chartlegend"><i style="background:#2563eb"></i>Descarga<i style="background:#16a34a"></i>Subida a Morpheus</div></div>
+<div class="logbar"><b>Registro</b><span><button class="sec mini" onclick="copyLog()">Copiar</button><button class="sec mini" onclick="saveLog()">Guardar .txt</button><button class="sec mini" onclick="clearLog()">Limpiar</button></span></div>
+<div id="log" class="logbox" tabindex="0">Listo.</div></main>
 <script>
 const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","virtio_iso","ref_instance_id","ref_image_id","workdir"];
 const chks=["verify_ssl","verify_source","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
 const EMBEDDED=__EMBEDDED__;
 let analyzedVm=null;
 const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);if(analyzedVm&&analyzedVm===document.getElementById("vm").value.trim()&&document.querySelector(".diskchk"))o.disk_indexes=[...document.querySelectorAll(".diskchk")].filter(c=>c.checked).map(c=>Number(c.value));else o.disk_indexes=null;return o};
-const show=t=>document.getElementById("log").textContent=t;
+let shown=[];
+function lineClass(l){
+ if(/^ERROR/.test(l))return"err";
+ if(/^(Aviso|Nota|Advertencia)/i.test(l))return"warn";
+ if(/terminado|^Terminado|Conectado a|encontradas|ya se migró|reutilizan/i.test(l))return"ok";
+ if(/^\s+\S.*(MiB|GiB|KiB|%)/.test(l))return"prog";
+ if(/^(Descargando|Convirtiendo|Subiendo|Creando|Inyectando|Empaquetando|Apagando|Añadiendo|Quitando|Simulación|Se contin)/.test(l))return"step";
+ return""}
+// Only the lines that changed are touched, so selecting text while a migration runs no longer gets wiped every second.
+function show(text){const box=document.getElementById("log"),lines=String(text).split("\n");
+ const atBottom=box.scrollHeight-box.scrollTop-box.clientHeight<40;
+ let i=0;while(i<lines.length&&i<shown.length&&lines[i]===shown[i])i++;
+ if(!shown.length)box.textContent="";
+ while(box.children.length>i)box.removeChild(box.lastChild);
+ for(let k=i;k<lines.length;k++){const d=document.createElement("div");d.className="ln "+lineClass(lines[k]);d.textContent=lines[k]||" ";box.appendChild(d)}
+ shown=lines;if(atBottom)box.scrollTop=box.scrollHeight}
+async function copyLog(){const text=shown.join("\n");
+ try{await navigator.clipboard.writeText(text)}catch(e){const a=document.createElement("textarea");a.value=text;document.body.appendChild(a);a.select();document.execCommand("copy");a.remove()}
+ const b=document.querySelector(".logbar button");const o=b.textContent;b.textContent="¡Copiado!";setTimeout(()=>b.textContent=o,1200)}
+function saveLog(){const a=document.createElement("a");a.href=URL.createObjectURL(new Blob([shown.join("\n")],{type:"text/plain"}));
+ a.download="vm2morpheus-"+new Date().toISOString().slice(0,19).replace(/[:T]/g,"-")+".txt";a.click();URL.revokeObjectURL(a.href)}
+function clearLog(){shown=[];document.getElementById("log").textContent=""}
+// ---- live throughput chart (bytes transfers only; conversions have no byte rate)
+let series=[],lastT=null,lastDone=0,lastLabel=null,t0=null;
+function resetChart(){series=[];lastT=null;lastLabel=null;t0=null;document.getElementById("chartwrap").style.display="none"}
+function feedChart(r){const t=r&&r.transfer;if(!t||t.unit!=="bytes")return;
+ if(t0===null)t0=t.t;
+ if(lastLabel===t.label&&lastT!==null&&t.t>lastT){
+  series.push({x:t.t-t0,y:Math.max(0,(t.done-lastDone)/(t.t-lastT)/1048576),up:/^subir/.test(t.label)});
+  lastT=t.t;lastDone=t.done}
+ else if(lastLabel!==t.label||lastT===null){lastLabel=t.label;lastT=t.t;lastDone=t.done}
+ drawChart()}
+function niceMax(v){const e=Math.pow(10,Math.floor(Math.log10(v))),f=v/e;return(f<=1?1:f<=2?2:f<=5?5:10)*e}
+function fmtSecs(s){s=Math.round(s);return s<60?s+" s":Math.floor(s/60)+" min "+String(s%60).padStart(2,"0")+" s"}
+function drawChart(){const wrap=document.getElementById("chartwrap");if(!series.length)return;wrap.style.display="block";
+ const c=document.getElementById("speedchart"),dpr=window.devicePixelRatio||1,W=c.clientWidth,H=c.clientHeight;
+ c.width=W*dpr;c.height=H*dpr;const x=c.getContext("2d");x.scale(dpr,dpr);x.clearRect(0,0,W,H);
+ const L=48,R=10,T=10,B=22,pw=W-L-R,ph=H-T-B;
+ const maxX=Math.max(10,series[series.length-1].x),maxY=niceMax(Math.max(1,...series.map(p=>p.y))*1.1);
+ const px=v=>L+v/maxX*pw,py=v=>T+ph-v/maxY*ph;
+ x.font="11px system-ui,sans-serif";x.fillStyle="#6b7788";x.strokeStyle="#e5e9ee";x.lineWidth=1;
+ for(let g=0;g<=5;g++){const v=maxY*g/5,y=py(v);x.beginPath();x.moveTo(L,y);x.lineTo(W-R,y);x.stroke();x.textAlign="right";x.fillText(Number.isInteger(v)?v:v.toFixed(1),L-6,y+4)}
+ x.textAlign="left";x.fillStyle="#9aa6b5";x.fillText("MiB/s",L+6,T+12);x.fillStyle="#6b7788";x.textAlign="center";x.fillText(fmtSecs(0),L,H-6);x.fillText(fmtSecs(maxX),W-R-18,H-6);
+ for(let k=1;k<series.length;k++){const a=series[k-1],b=series[k],col=b.up?"22,163,74":"37,99,235";
+  x.beginPath();x.moveTo(px(a.x),py(0));x.lineTo(px(a.x),py(a.y));x.lineTo(px(b.x),py(b.y));x.lineTo(px(b.x),py(0));x.closePath();
+  x.fillStyle=`rgba(${col},.18)`;x.fill();x.beginPath();x.moveTo(px(a.x),py(a.y));x.lineTo(px(b.x),py(b.y));
+  x.strokeStyle=`rgb(${col})`;x.lineWidth=2;x.stroke()}
+ const cur=series[series.length-1].y,avg=series.reduce((s,p)=>s+p.y,0)/series.length,max=Math.max(...series.map(p=>p.y));
+ document.getElementById("chartinfo").textContent=`Ahora ${cur.toFixed(1)} MiB/s · media ${avg.toFixed(1)} · máx ${max.toFixed(1)}`}
 async function post(p,b){const r=await fetch(p,{method:"POST",body:JSON.stringify(b)});const j=await r.json();if(j.error)throw new Error(j.error);return j}
 async function busy(text,fn){const w=document.getElementById("busywrap"),t=document.getElementById("busytxt");
  w.style.display="block";t.textContent=text;const t0=Date.now();
@@ -460,8 +531,8 @@ function drawBar(r){const w=document.getElementById("barwrap"),b=document.getEle
  l.textContent=txt}
 async function cancelJob(){if(!currentJob)return;document.getElementById("cancelbtn").disabled=true;try{await post("/cancel",{job:currentJob})}catch(e){show("ERROR: "+e.message)}}
 async function run(p){try{await persist();const {job}=await post(p,form());currentJob=job;show("Trabajo "+job+" en marcha...");
- const btn=document.getElementById("cancelbtn");btn.style.display="inline-block";btn.disabled=false;document.getElementById("barwrap").style.display="none";
- const t=setInterval(async()=>{const r=await (await fetch("/job/"+job)).json();show(r.log||"...");drawBar(r);if(r.status!=="running"){clearInterval(t);btn.style.display="none";currentJob=null}},1000)}catch(e){show("ERROR: "+e.message)}}
+ const btn=document.getElementById("cancelbtn");btn.style.display="inline-block";btn.disabled=false;resetChart();document.getElementById("barwrap").style.display="none";
+ const t=setInterval(async()=>{const r=await (await fetch("/job/"+job)).json();show(r.log||"...");drawBar(r);feedChart(r);if(r.status!=="running"){clearInterval(t);btn.style.display="none";currentJob=null}},1000)}catch(e){show("ERROR: "+e.message)}}
 srcHint();
 (async()=>{try{saved=await (await fetch("/settings")).json();
  ids.forEach(i=>{if(saved[i]!==undefined&&document.getElementById(i).tagName==="INPUT"||saved[i]!==undefined&&["source_type","os_family"].includes(i))document.getElementById(i).value=saved[i]});

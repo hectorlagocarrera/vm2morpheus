@@ -1293,3 +1293,36 @@ def test_complete_download_from_a_previous_run_is_reused(tmp_path):
     partial.write_bytes(b"data" * 5000)
     assert file_is_complete_vmdk(done) and not file_is_complete_vmdk(partial)
     assert not file_is_complete_vmdk(tmp_path / "missing.vmdk")
+
+
+def test_progress_observer_receives_label_bytes_and_unit(monkeypatch):
+    import io
+    from vm2morpheus import util
+    seen = []
+    monkeypatch.setattr(util.Progress, "observer", lambda label, done, total, unit: seen.append((label, done, total, unit)))
+    util.Progress("descargar x", io.StringIO())(1024, None)
+    util.Progress("convertir y", io.StringIO(), percent=True)(40, 100)
+    assert seen == [("descargar x", 1024, None, "bytes"), ("convertir y", 40, 100, "percent")]
+
+
+def test_job_endpoint_exposes_the_live_transfer(tmp_path):
+    import urllib.request
+    from vm2morpheus import gui
+    gui.JOBS["tjob"] = {"status": "running", "cancel": threading.Event(),
+                        "transfer": {"label": "descargar x", "done": 2048, "total": None, "unit": "bytes", "t": 1.5}}
+    srv = HTTPServer(("127.0.0.1", 0), gui.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        data = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{srv.server_port}/job/tjob").read())
+    finally:
+        srv.shutdown()
+        gui.JOBS.pop("tjob", None)
+    assert data["transfer"]["done"] == 2048 and data["transfer"]["unit"] == "bytes"
+
+
+def test_page_has_the_chart_and_the_log_toolbar():
+    from vm2morpheus import gui
+    page = gui.render_page()
+    for needle in ('id="speedchart"', 'id="chartinfo"', "function feedChart", "function drawChart",
+                   'onclick="copyLog()"', 'onclick="saveLog()"', 'onclick="clearLog()"', 'class="logbox"'):
+        assert needle in page
