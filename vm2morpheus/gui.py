@@ -318,6 +318,12 @@ input.diskchk{width:auto;margin:0 8px 0 0;vertical-align:middle}
 #picker{display:none;background:#fff;border:1px solid #b9c2cc;border-radius:8px;padding:10px;margin-top:8px}
 #picker .item{padding:5px 8px;cursor:pointer;border-radius:4px} #picker .item:hover{background:#e8eef7}
 #pickerlist{max-height:220px;overflow:auto;border:1px solid #e1e6ec;border-radius:6px;margin:6px 0}
+#busywrap{display:none;margin:0 0 10px;position:sticky;top:0;z-index:5;background:#f4f6f8;padding:8px 0}
+#busyline{height:8px;background:#dfe5ec;border-radius:6px;overflow:hidden;position:relative}
+#busyline::before{content:"";position:absolute;top:0;bottom:0;width:40%;background:#2563eb;border-radius:6px;animation:slide 1.1s infinite ease-in-out}
+@keyframes slide{0%{left:-40%}100%{left:100%}}
+#busytxt{font-size:13px;margin-top:4px;color:#4a5665}
+button:disabled{opacity:.55;cursor:wait}
 #barwrap{display:none;margin:10px 0}
 #barline{background:#dfe5ec;border-radius:6px;height:20px;overflow:hidden}
 #bar{height:100%;width:0;background:#2563eb;transition:width .4s}
@@ -329,6 +335,7 @@ small{color:#5d6b7b}
 </style><main>
 <div class="brand"><img src="/logo.png" alt="Redes · 25 años innovando el futuro"><button class="sec quit" onclick="quit()">Salir del programa</button></div>
 <h1>vm2morpheus <small>Hyper-V / VMware → Morpheus (KVM) · v__VERSION__</small></h1>
+<div id="busywrap"><div id="busyline"></div><div id="busytxt"></div></div>
 <fieldset><legend>1. Origen</legend><div class="row">
 <div><label>Tipo</label><select id="source_type" onchange="srcHint()"><option value="hyperv">Hyper-V</option><option value="vmware">VMware vCenter</option><option value="esxi">VMware ESXi (sin vCenter)</option></select></div>
 <div><label>Host / IP</label><input id="source_host"></div>
@@ -337,19 +344,19 @@ small{color:#5d6b7b}
 <div><label>Nombre de la VM</label><input id="vm" onchange="analyze()"></div>
 <div><label>VM del origen <small>(pulsa "Listar VMs")</small></label><select id="vm_select" onchange="if(this.value){document.getElementById('vm').value=this.value;analyze()}"><option value="">(sin listar)</option></select></div>
 <div><label>Sistema operativo (Hyper-V)</label><select id="os_family"><option value="windows">Windows</option><option value="linux">Linux</option><option value="other">Otro</option></select></div>
-</div><button class="sec" onclick="listvms()">Listar VMs del origen</button><button class="sec" onclick="inspect_()">Analizar VM</button>
+</div><button class="sec" data-busy onclick="listvms()">Listar VMs del origen</button><button class="sec" data-busy onclick="inspect_()">Analizar VM</button>
 <div id="diskpanel" style="display:none;margin-top:8px"><div id="diskinfo"></div><div id="disklist" style="margin:6px 0"></div><small id="diskhint"></small></div></fieldset>
 <fieldset><legend>2. Destino Morpheus</legend><div class="row">
 <div><label>URL (https://ip)</label><input id="morpheus_url"></div>
 <div><label>Token API</label><input id="morpheus_token" type="password"></div>
 <div><label>imageType <small>(qcow2 por defecto, verifícalo)</small></label><input id="image_type" value="qcow2"></div>
 </div><div class="chk"><label><input type="checkbox" id="verify_ssl"> Verificar certificado TLS</label></div>
-<button class="sec" onclick="lookups()">Cargar nubes, grupos, planes y redes</button></fieldset>
+<button class="sec" data-busy onclick="lookups()">Cargar nubes, grupos, planes y redes</button></fieldset>
 <fieldset><legend>3. Crear la VM en Morpheus (opcional)</legend>
 <small>Crea antes a mano UNA instancia HPE HVM con cualquier imagen (Provisioning → Instances → Add). Elígela en el desplegable: el programa la clona cambiando solo la imagen. Vacío = solo se sube la imagen.</small>
 <div class="row"><div><label>Instancia de referencia (pulsa "Cargar" arriba)</label><select id="ref_instance_id"><option value="">(ninguna: solo subir la imagen)</option></select></div>
 <div><label>ID de su imagen <small>(opcional; se detecta sola)</small></label><input id="ref_image_id"></div></div>
-<button class="sec" onclick="refinfo()">Ver instancia de referencia (JSON)</button>
+<button class="sec" data-busy onclick="refinfo()">Ver instancia de referencia (JSON)</button>
 <details open><summary><small>Sin instancia de referencia: crear desde cero (rellena nube, grupo, plan, red y layout)</small></summary>
 <div class="row"><div><label>Nube</label><select id="cloud_id"></select></div><div><label>Grupo</label><select id="group_id"></select></div>
 <div><label>Plan</label><select id="plan_id"></select></div><div><label>Red</label><select id="network_id"></select></div>
@@ -378,13 +385,18 @@ let analyzedVm=null;
 const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);if(analyzedVm&&analyzedVm===document.getElementById("vm").value.trim()&&document.querySelector(".diskchk"))o.disk_indexes=[...document.querySelectorAll(".diskchk")].filter(c=>c.checked).map(c=>Number(c.value));else o.disk_indexes=null;return o};
 const show=t=>document.getElementById("log").textContent=t;
 async function post(p,b){const r=await fetch(p,{method:"POST",body:JSON.stringify(b)});const j=await r.json();if(j.error)throw new Error(j.error);return j}
+async function busy(text,fn){const w=document.getElementById("busywrap"),t=document.getElementById("busytxt");
+ w.style.display="block";t.textContent=text;const t0=Date.now();
+ const tick=setInterval(()=>{t.textContent=text+" ("+Math.round((Date.now()-t0)/1000)+" s)"},1000);
+ document.querySelectorAll("button[data-busy]").forEach(b=>b.disabled=true);
+ try{return await fn()}finally{clearInterval(tick);w.style.display="none";document.querySelectorAll("button[data-busy]").forEach(b=>b.disabled=false)}}
 async function persist(){try{await post("/settings",form())}catch(e){}}
 let saved={};
-async function listvms(){try{await persist();const j=await post("/listvms",form());const s=document.getElementById("vm_select");s.innerHTML='<option value="">(elige una VM)</option>'+j.vms.map(v=>`<option value="${v.name}">${v.name} — ${v.state=="on"?"encendida":"apagada"}, ${v.cpu} vCPU, ${(v.memory_mb/1024).toFixed(1)} GiB${v.host?" · host "+v.host:""}</option>`).join("");show("Conectado a "+j.kind+": "+j.vms.length+" VM(s) encontradas. Elige una en el desplegable.")}catch(e){show("ERROR: "+e.message)}}
+async function listvms(){try{await persist();const j=await busy("Conectando con el origen y listando las VM …",()=>post("/listvms",form()));const s=document.getElementById("vm_select");s.innerHTML='<option value="">(elige una VM)</option>'+j.vms.map(v=>`<option value="${v.name}">${v.name} — ${v.state=="on"?"encendida":"apagada"}, ${v.cpu} vCPU, ${(v.memory_mb/1024).toFixed(1)} GiB${v.host?" · host "+v.host:""}</option>`).join("");show("Conectado a "+j.kind+": "+j.vms.length+" VM(s) encontradas. Elige una en el desplegable.")}catch(e){show("ERROR: "+e.message)}}
 async function analyze(force){const vm=document.getElementById("vm").value.trim();
  if(!vm||!document.getElementById("source_host").value.trim())return;
  if(!force&&analyzedVm===vm)return; // same VM: keep the disks the user ticked
- try{await persist();const j=await post("/inspect",form());analyzedVm=vm;renderDisks(j)}
+ try{await persist();const j=await busy("Analizando la VM …",()=>post("/inspect",form()));analyzedVm=vm;renderDisks(j)}
  catch(e){document.getElementById("diskpanel").style.display="none";analyzedVm=null;show("ERROR: "+e.message)}}
 function renderDisks(j){document.getElementById("diskpanel").style.display="block";
  document.getElementById("diskinfo").innerHTML=`<b>${j.name}</b>: ${j.cpu} vCPU, ${(j.memory_mb/1024).toFixed(1)} GiB RAM, ${j.firmware.toUpperCase()}, ${j.power_state==="on"?"encendida":"apagada"}, ${j.disks.length} disco(s)`;
@@ -399,8 +411,8 @@ async function quit(){if(currentJob&&!confirm("Hay una migración en curso. ¿Sa
  document.body.innerHTML="<main><h1>Programa cerrado</h1><p>Ya puedes cerrar esta pestaña.</p></main>"}
 if(EMBEDDED){const q=document.querySelector(".quit");if(q)q.style.display="none"}
 setInterval(()=>fetch("/ping").catch(()=>{}),5000);fetch("/ping").catch(()=>{});
-async function refinfo(){try{show(JSON.stringify(await post("/refinfo",form()),null,2))}catch(e){show("ERROR: "+e.message)}}
-async function lookups(){try{await persist();const j=await post("/lookups",form());
+async function refinfo(){try{show(JSON.stringify(await busy("Leyendo la instancia de referencia …",()=>post("/refinfo",form())),null,2))}catch(e){show("ERROR: "+e.message)}}
+async function lookups(){try{await persist();const j=await busy("Cargando datos de Morpheus …",()=>post("/lookups",form()));
  for(const [k,id] of [["clouds","cloud_id"],["groups","group_id"],["plans","plan_id"],["networks","network_id"],["instances","ref_instance_id"]]){
   const s=document.getElementById(id);s.innerHTML=(id=="network_id"||id=="ref_instance_id"?'<option value="">(ninguna)</option>':'')+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id]}
   for(const [k,id] of [["layouts","layout_id"],["pools","resource_pool"]]){const s=document.getElementById(id);s.innerHTML='<option value="">(automático)</option>'+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id]}

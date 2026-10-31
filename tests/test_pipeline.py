@@ -1073,3 +1073,12 @@ def test_progress_shows_the_transfer_speed(monkeypatch):
     bar(0)
     bar(200 * 1024 * 1024)  # 200 MiB in 10 s
     assert "20.0 MiB/s" in out.getvalue()
+
+
+def test_slow_actions_show_a_busy_indicator():
+    from vm2morpheus import gui
+    page = gui.render_page()
+    assert 'id="busywrap"' in page and page.count("data-busy onclick") == 4
+    for call in ('busy("Conectando con el origen', 'busy("Analizando la VM', 'busy("Cargando datos de Morpheus',
+                 'busy("Leyendo la instancia de referencia'):
+        assert call in page
