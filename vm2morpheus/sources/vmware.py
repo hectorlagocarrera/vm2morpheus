@@ -31,9 +31,29 @@ class LeaseKeepAlive:
 READ_TIMEOUT = 120  # seconds without a single byte from the ESXi before giving up
 
 
+def vmdk_stream_complete(tail: bytes) -> bool:
+    """A stream-optimized VMDK ends with: footer marker, footer (a copy of the header, starting with 'KDMV') and a
+    512-byte end-of-stream marker of zeros. Seeing that tail means every byte has arrived, even if the server never
+    closes the connection (the export does not announce its length)."""
+    return len(tail) >= 1024 and tail[-1024:-1020] == b"KDMV" and not any(tail[-512:])
+
+
+def file_is_complete_vmdk(path: Path) -> bool:
+    try:
+        size = path.stat().st_size
+        if size < 1024:
+            return False
+        with open(path, "rb") as f:
+            f.seek(size - 1024)
+            return vmdk_stream_complete(f.read(1024))
+    except OSError:
+        return False
+
+
 def download_to(url: str, local: Path, cookie: str, verify: bool, cb, tick=lambda: None, getter=requests.get) -> int:
-    """Stream one exported disk to a file. A stalled connection raises after READ_TIMEOUT instead of waiting forever."""
-    done = 0
+    """Stream one exported disk to a file. It stops as soon as the end-of-stream marker has arrived, and a stalled
+    connection raises after READ_TIMEOUT instead of waiting forever."""
+    done, tail = 0, b""
     try:
         with getter(url, stream=True, verify=verify, headers={"Cookie": cookie}, timeout=(15, READ_TIMEOUT)) as r:
             r.raise_for_status()
@@ -41,9 +61,14 @@ def download_to(url: str, local: Path, cookie: str, verify: bool, cb, tick=lambd
                 for chunk in r.iter_content(CHUNK):
                     f.write(chunk)
                     done += len(chunk)
+                    tail = (tail + chunk)[-1024:]
                     cb(done, None)
                     tick()
+                    if vmdk_stream_complete(tail):
+                        break  # the server may keep the connection open: do not wait for more
     except requests.exceptions.ReadTimeout as e:
+        if vmdk_stream_complete(tail):
+            return done
         raise RuntimeError(f"El ESXi dejó de enviar datos durante {READ_TIMEOUT} s (se habían descargado "
                            f"{done / 2**30:.1f} GiB). Revisa la red o el estado del host y vuelve a intentarlo.") from e
     return done
@@ -280,6 +305,12 @@ class VMwareSource(Source):
     def _fetch_disks(self, vm: VMInfo, dest: Path, progress) -> list[Path]:
         from pyVmomi import vim
         mo = self._find(vm.name)
+        wanted = {d.index for d in vm.disks}
+        reusable = {i: dest / f"{vm.name}-disk{i}.vmdk" for i in wanted}
+        if all(file_is_complete_vmdk(p) for p in reusable.values()):  # e.g. a previous run that hung at the very end
+            print("Los discos ya estaban descargados por completo: se reutilizan sin volver a bajarlos.",
+                  file=sys.stderr)
+            return [reusable[d.index] for d in vm.disks]
         lease = mo.ExportVm()
         while lease.state == vim.HttpNfcLease.State.initializing:
             time.sleep(1)

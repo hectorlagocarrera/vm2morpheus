@@ -1244,3 +1244,52 @@ def test_speedtest_endpoint_reports_both_routes(tmp_path):
         gui.make_source = original
         srv.shutdown()
     assert data["export"]["mib_s"] == 8.6 and data["flat"]["mib_s"] == 22.0
+
+
+FOOTER_AND_EOS = b"x" * 512 + b"KDMV" + b"\x01" * 508 + b"\x00" * 512  # footer marker, footer header, end-of-stream
+
+
+def test_download_stops_at_the_end_of_stream_marker_without_waiting_for_the_server(tmp_path):
+    from vm2morpheus.sources.vmware import download_to
+
+    class Hanging(_FakeResponse):
+        def iter_content(self, size):
+            yield b"grain-data" * 1000
+            yield FOOTER_AND_EOS[:700]  # the end arrives split in two chunks
+            yield FOOTER_AND_EOS[700:]
+            raise AssertionError("kept reading after the end-of-stream marker (the real server never closes)")
+
+    size = download_to("https://esxi/x", tmp_path / "d.vmdk", "c", False, lambda d, t: None,
+                       getter=lambda *a, **k: Hanging([]))
+    assert size == 10000 + len(FOOTER_AND_EOS)
+
+
+def test_timeout_after_a_complete_stream_is_success_not_an_error(tmp_path):
+    import requests
+    from vm2morpheus.sources.vmware import download_to
+
+    class Late(_FakeResponse):
+        def iter_content(self, size):
+            yield FOOTER_AND_EOS
+            raise requests.exceptions.ReadTimeout("idle")
+
+    assert download_to("https://esxi/x", tmp_path / "d.vmdk", "c", False, lambda d, t: None,
+                       getter=lambda *a, **k: Late([])) == len(FOOTER_AND_EOS)
+
+
+def test_ordinary_data_is_never_mistaken_for_the_end(tmp_path):
+    from vm2morpheus.sources.vmware import vmdk_stream_complete
+    assert vmdk_stream_complete(FOOTER_AND_EOS)
+    assert not vmdk_stream_complete(b"\x00" * 2048)               # zeros but no footer header
+    assert not vmdk_stream_complete(b"KDMV" + b"\x01" * 2044)      # header-like bytes but no end marker
+    assert not vmdk_stream_complete(FOOTER_AND_EOS[:-1] + b"\x01")  # EOS marker not entirely zero
+    assert not vmdk_stream_complete(b"short")
+
+
+def test_complete_download_from_a_previous_run_is_reused(tmp_path):
+    from vm2morpheus.sources.vmware import file_is_complete_vmdk
+    done, partial = tmp_path / "a.vmdk", tmp_path / "b.vmdk"
+    done.write_bytes(b"data" * 5000 + FOOTER_AND_EOS)
+    partial.write_bytes(b"data" * 5000)
+    assert file_is_complete_vmdk(done) and not file_is_complete_vmdk(partial)
+    assert not file_is_complete_vmdk(tmp_path / "missing.vmdk")
