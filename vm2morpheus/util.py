@@ -117,7 +117,9 @@ class Progress:
         if not target or done >= target:
             return ""
         remaining = (target - done) / (done / elapsed)
-        return f" · ≈ {format_duration(remaining)} restantes" + (" (estimado)" if guessed else "")
+        if guessed:  # the real size is unknown and usually smaller (compressed), so this is a ceiling
+            return f" · como mucho ≈ {format_duration(remaining)} más (estimación)"
+        return f" · ≈ {format_duration(remaining)} restantes"
 
     def finish(self):
         """Close the line with a summary, so it is clear the transfer ended (and how fast it was)."""

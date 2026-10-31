@@ -1173,9 +1173,9 @@ def test_eta_from_an_estimate_is_flagged_and_disappears_when_exceeded(monkeypatc
     bar, out = _timed_progress(monkeypatch, [0.0, 10.0, 20.0], estimate=1000, on_progress=seen.append)
     bar(0)
     bar(100)
-    assert "≈ 1 min 30 s restantes (estimado)" in out.getvalue().split("\r")[-1]
+    assert "como mucho ≈ 1 min 30 s más (estimación)" in out.getvalue().split("\r")[-1]
     bar(1200)  # the export turned out larger than guessed: no more promises
-    assert "restantes" not in out.getvalue().split("\r")[-1]
+    assert "como mucho" not in out.getvalue().split("\r")[-1]
     assert seen[-1] == 0.99  # the global bar never claims 100% before the transfer really ends
 
 
