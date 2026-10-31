@@ -1,6 +1,8 @@
+import re
 import ssl
 import sys
 import time
+import urllib.parse
 from pathlib import Path
 
 import requests
@@ -54,6 +56,28 @@ def spread_committed(disks, committed: int) -> None:
     if committed and total:
         for d in disks:
             d.used_bytes = int(committed * d.size_bytes / total)
+
+
+def flat_url(host: str, backing_file: str, dc_path: str) -> str:
+    """Datastore-browser URL of a disk's raw extent: '[ds1] dir/vm.vmdk' -> https://host/folder/dir/vm-flat.vmdk?..."""
+    m = re.match(r"\[(.+?)\]\s*(.+)\.vmdk$", backing_file)
+    if not m:
+        raise RuntimeError(f"No se entiende la ruta del disco en el almacén: {backing_file}")
+    datastore, rel = m.groups()
+    q = urllib.parse.quote
+    return f"https://{host}/folder/{q(rel)}-flat.vmdk?dcPath={q(dc_path)}&dsName={q(datastore)}"
+
+
+def measure_download(getter, url: str, seconds: float = 20, clock=time.monotonic, **kw) -> tuple[int, float]:
+    """Read from `url` for about `seconds`, discarding the data. Returns (bytes, seconds)."""
+    start, total = clock(), 0
+    with getter(url, stream=True, timeout=(15, READ_TIMEOUT), **kw) as r:
+        r.raise_for_status()
+        for chunk in r.iter_content(CHUNK):
+            total += len(chunk)
+            if clock() - start >= seconds:
+                break
+    return total, max(clock() - start, 1e-6)
 
 
 def note_unverified_tls(verify: bool, host: str, stream=None) -> bool:
@@ -133,6 +157,51 @@ class VMwareSource(Source):
                                "Renombra una o usa un nombre único para poder elegirla sin ambigüedad.")
         self._vms[name] = matches[0]
         return matches[0]
+
+    def _datacenter_path(self, mo) -> str:
+        """dcPath for the datastore browser: 'ha-datacenter' on a standalone ESXi, the datacenter name on vCenter."""
+        from pyVmomi import vim
+        node = mo
+        while node is not None and not isinstance(node, vim.Datacenter):
+            node = getattr(node, "parent", None)
+        return node.name if node is not None else "ha-datacenter"
+
+    def speed_test(self, name: str, seconds: float = 20) -> dict:
+        """Compare what the program does (compressed export) with a plain datastore download, same code, no disk."""
+        from pyVmomi import vim
+        vm = self.get_vm(name)
+        mo = self._find(name)
+        out = {}
+        try:
+            url = flat_url(self.host, vm.disks[0].path, self._datacenter_path(mo))
+            b, t = measure_download(requests.get, url, seconds, auth=(self.user, self.password), verify=self.verify)
+            out["flat"] = {"mib_s": b / t / 2**20, "mib": b / 2**20}
+        except Exception as e:
+            out["flat"] = {"error": str(e)}
+        if vm.power_state == "on":
+            out["export"] = {"error": "la VM está encendida: la exportación solo funciona con la VM apagada"}
+            return out
+        lease = None
+        try:
+            lease = mo.ExportVm()
+            while lease.state == vim.HttpNfcLease.State.initializing:
+                time.sleep(1)
+            if lease.state == vim.HttpNfcLease.State.error:
+                raise RuntimeError(str(lease.error))
+            du = next(d for d in lease.info.deviceUrl if d.disk)
+            esxi = str(getattr(mo.runtime.host, "name", "") or "")
+            b, t = measure_download(requests.get, lease_url(du.url, self.api_type, esxi, self.host), seconds,
+                                    headers={"Cookie": self.si._stub.cookie}, verify=self.verify)
+            out["export"] = {"mib_s": b / t / 2**20, "mib": b / 2**20}
+        except Exception as e:
+            out["export"] = {"error": str(explain_error(e))}
+        finally:
+            if lease is not None:
+                try:
+                    lease.HttpNfcLeaseAbort()
+                except Exception:
+                    pass
+        return out
 
     def kind(self) -> str:
         return "vCenter" if self.api_type == "VirtualCenter" else "ESXi"

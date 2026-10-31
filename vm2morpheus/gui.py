@@ -231,6 +231,16 @@ class Handler(BaseHTTPRequestHandler):
             if self.path == "/settings":
                 settings.save(f)
                 return self._json({"ok": True})
+            if self.path == "/speedtest":
+                _need(f, "vm", "el nombre de la VM")
+                s = make_source(source_cfg(f))
+                if not hasattr(s, "speed_test"):
+                    raise ValueError("La prueba de velocidad solo está disponible para VMware (vCenter o ESXi)")
+                s.connect()
+                try:
+                    return self._json(s.speed_test(f["vm"]))
+                finally:
+                    s.close()
             if self.path == "/inspect":
                 _need(f, "vm", "el nombre de la VM")
                 s = make_source(source_cfg(f))
@@ -344,7 +354,7 @@ small{color:#5d6b7b}
 <div><label>Nombre de la VM</label><input id="vm" onchange="analyze()"></div>
 <div><label>VM del origen <small>(pulsa "Listar VMs")</small></label><select id="vm_select" onchange="if(this.value){document.getElementById('vm').value=this.value;analyze()}"><option value="">(sin listar)</option></select></div>
 <div><label>Sistema operativo (Hyper-V)</label><select id="os_family"><option value="windows">Windows</option><option value="linux">Linux</option><option value="other">Otro</option></select></div>
-</div><button class="sec" data-busy onclick="listvms()">Listar VMs del origen</button><button class="sec" data-busy onclick="inspect_()">Analizar VM</button>
+</div><button class="sec" data-busy onclick="listvms()">Listar VMs del origen</button><button class="sec" data-busy onclick="inspect_()">Analizar VM</button><button class="sec" data-busy onclick="speedtest()">Probar velocidad de descarga</button>
 <div id="diskpanel" style="display:none;margin-top:8px"><div id="diskinfo"></div><div id="disklist" style="margin:6px 0"></div><small id="diskhint"></small></div></fieldset>
 <fieldset><legend>2. Destino Morpheus</legend><div class="row">
 <div><label>URL (https://ip)</label><input id="morpheus_url"></div>
@@ -405,6 +415,11 @@ function renderDisks(j){document.getElementById("diskpanel").style.display="bloc
 function disksChanged(){const n=document.querySelectorAll(".diskchk:checked").length,t=document.querySelectorAll(".diskchk").length;
  document.getElementById("multi_disk_bundle").checked=n>1;
  document.getElementById("diskhint").textContent=n===0?"Selecciona al menos un disco.":n>1?`${n} discos: se activa "Varios discos en una sola imagen". El primero marcado se trata como disco de arranque.`:`1 disco seleccionado${t>1?" (los demás no se migrarán)":""}.`}
+async function speedtest(){try{await persist();
+ const j=await busy("Midiendo la velocidad (unos 20 s por cada vía) …",()=>post("/speedtest",form()));
+ const line=(n,r)=>r.error?`${n}: no se pudo medir (${r.error})`:`${n}: ${r.mib_s.toFixed(1)} MiB/s (${r.mib.toFixed(0)} MiB leídos)`;
+ show(line("Exportación (la que usa el programa)",j.export)+"\n"+line("Disco plano (como el navegador)",j.flat)+"\n\nSi la exportación va mucho más lenta que el disco plano, el límite es la compresión del ESXi, no el programa.")}
+ catch(e){show("ERROR: "+e.message)}}
 async function inspect_(){await analyze(true);if(analyzedVm)show("VM analizada: revisa el panel de discos.")}
 async function quit(){if(currentJob&&!confirm("Hay una migración en curso. ¿Salir igualmente?"))return;
  try{await post("/shutdown",{})}catch(e){}

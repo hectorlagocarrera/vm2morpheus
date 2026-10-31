@@ -1078,7 +1078,7 @@ def test_progress_shows_the_transfer_speed(monkeypatch):
 def test_slow_actions_show_a_busy_indicator():
     from vm2morpheus import gui
     page = gui.render_page()
-    assert 'id="busywrap"' in page and page.count("data-busy onclick") == 4
+    assert 'id="busywrap"' in page and page.count("data-busy onclick") == 5
     for call in ('busy("Conectando con el origen', 'busy("Analizando la VM', 'busy("Cargando datos de Morpheus',
                  'busy("Leyendo la instancia de referencia'):
         assert call in page
@@ -1195,3 +1195,52 @@ def test_committed_space_is_spread_over_the_disks():
     other = [DiskInfo("a", 30, "x")]
     spread_committed(other, 0)  # unknown: leave it alone
     assert other[0].used_bytes is None
+
+
+def test_flat_url_from_the_disk_backing_file():
+    from vm2morpheus.sources.vmware import flat_url
+    url = flat_url("esxi1.lab", "[datastore 1] w2k16 sin virtio/w2k16_sin_virtio.vmdk", "ha-datacenter")
+    assert url == ("https://esxi1.lab/folder/w2k16%20sin%20virtio/w2k16_sin_virtio-flat.vmdk"
+                   "?dcPath=ha-datacenter&dsName=datastore%201")
+    with pytest.raises(RuntimeError, match="No se entiende"):
+        flat_url("h", "no-datastore.vmdk", "dc")
+
+
+def test_measure_download_stops_after_the_requested_time_and_reports_bytes():
+    from vm2morpheus.sources.vmware import measure_download
+    t = {"now": 0.0}
+
+    class Resp(_FakeResponse):
+        def iter_content(self, size):
+            for _ in range(1000):
+                t["now"] += 1.0  # each chunk takes one "second"
+                yield b"x" * 1024
+
+    total, secs = measure_download(lambda *a, **k: Resp([]), "https://x", seconds=5, clock=lambda: t["now"])
+    assert total == 5 * 1024 and secs == 5.0  # stopped as soon as 5 s had passed, not after 1000 chunks
+
+
+def test_speedtest_endpoint_reports_both_routes(tmp_path):
+    import urllib.request
+    from vm2morpheus import gui
+
+    class Fake:
+        def connect(self): pass
+        def close(self): pass
+
+        def speed_test(self, name, seconds=20):
+            return {"export": {"mib_s": 8.6, "mib": 172.0}, "flat": {"mib_s": 22.0, "mib": 440.0}}
+
+    original = gui.make_source
+    gui.make_source = lambda cfg: Fake()
+    srv = HTTPServer(("127.0.0.1", 0), gui.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        body = json.dumps({"source_type": "esxi", "source_host": "h", "source_user": "u", "source_password": "p",
+                           "vm": "w2k16"}).encode()
+        data = json.loads(urllib.request.urlopen(urllib.request.Request(
+            f"http://127.0.0.1:{srv.server_port}/speedtest", data=body, method="POST")).read())
+    finally:
+        gui.make_source = original
+        srv.shutdown()
+    assert data["export"]["mib_s"] == 8.6 and data["flat"]["mib_s"] == 22.0
