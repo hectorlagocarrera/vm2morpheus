@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "vm2morpheus"
-version = "0.14.3"
+version = "0.14.4"
 description = "Migrate VMs from Hyper-V / VMware to HPE Morpheus (VM Essentials, KVM) in one command"
 requires-python = ">=3.10"
 dependencies = ["requests>=2.31", "PyYAML>=6"]

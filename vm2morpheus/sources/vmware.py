@@ -26,6 +26,27 @@ class LeaseKeepAlive:
             self.last = now
 
 
+READ_TIMEOUT = 120  # seconds without a single byte from the ESXi before giving up
+
+
+def download_to(url: str, local: Path, cookie: str, verify: bool, cb, tick=lambda: None, getter=requests.get) -> int:
+    """Stream one exported disk to a file. A stalled connection raises after READ_TIMEOUT instead of waiting forever."""
+    done = 0
+    try:
+        with getter(url, stream=True, verify=verify, headers={"Cookie": cookie}, timeout=(15, READ_TIMEOUT)) as r:
+            r.raise_for_status()
+            with open(local, "wb") as f:
+                for chunk in r.iter_content(CHUNK):
+                    f.write(chunk)
+                    done += len(chunk)
+                    cb(done, None)
+                    tick()
+    except requests.exceptions.ReadTimeout as e:
+        raise RuntimeError(f"El ESXi dejó de enviar datos durante {READ_TIMEOUT} s (se habían descargado "
+                           f"{done / 2**30:.1f} GiB). Revisa la red o el estado del host y vuelve a intentarlo.") from e
+    return done
+
+
 def note_unverified_tls(verify: bool, host: str, stream=None) -> bool:
     """ESXi/vCenter normally use a self-signed certificate, so verification is off unless the user asks for it.
     Say so once, in Spanish, instead of letting urllib3 print its English warning for every request."""
@@ -198,15 +219,9 @@ class VMwareSource(Source):
                 url = lease_url(du.url, self.api_type, esxi_host, self.host)
                 local = dest / f"{vm.name}-disk{i}.vmdk"
                 cb = progress(f"descargar {local.name}")
-                done = 0
-                with requests.get(url, stream=True, verify=self.verify, headers={"Cookie": cookie}) as r:
-                    r.raise_for_status()
-                    with open(local, "wb") as f:
-                        for chunk in r.iter_content(CHUNK):
-                            f.write(chunk)
-                            done += len(chunk)
-                            cb(done, None)
-                            keep_alive.tick(min(99, int(100 * (i + 0.5) / len(disk_urls))))
+                pct = min(99, int(100 * (i + 0.5) / len(disk_urls)))
+                download_to(url, local, cookie, self.verify, cb, lambda pct=pct: keep_alive.tick(pct))
+                cb.finish()
                 out.append(local)
             lease.HttpNfcLeaseComplete()
         except Exception:

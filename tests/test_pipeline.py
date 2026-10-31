@@ -1082,3 +1082,64 @@ def test_slow_actions_show_a_busy_indicator():
     for call in ('busy("Conectando con el origen', 'busy("Analizando la VM', 'busy("Cargando datos de Morpheus',
                  'busy("Leyendo la instancia de referencia'):
         assert call in page
+
+
+class _FakeResponse:
+    def __init__(self, chunks, stall=False):
+        self.chunks, self.stall = chunks, stall
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, size):
+        import requests
+        yield from self.chunks
+        if self.stall:
+            raise requests.exceptions.ReadTimeout("no bytes for 120 s")
+
+
+def test_download_to_writes_the_stream_and_pings_per_chunk(tmp_path):
+    from vm2morpheus.sources.vmware import download_to
+    seen, ticks = [], []
+    size = download_to("https://esxi/x", tmp_path / "d.vmdk", "c=1", False, lambda d, t: seen.append(d),
+                       lambda: ticks.append(1), getter=lambda *a, **k: _FakeResponse([b"aaaa", b"bb"]))
+    assert size == 6 and (tmp_path / "d.vmdk").read_bytes() == b"aaaabb" and seen == [4, 6] and len(ticks) == 2
+
+
+def test_stalled_download_fails_with_a_clear_message_instead_of_hanging(tmp_path):
+    from vm2morpheus.sources.vmware import download_to
+    with pytest.raises(RuntimeError, match="dejó de enviar datos durante 120 s"):
+        download_to("https://esxi/x", tmp_path / "d.vmdk", "c=1", False, lambda d, t: None,
+                    getter=lambda *a, **k: _FakeResponse([b"x" * 10], stall=True))
+
+
+def test_download_asks_requests_for_a_read_timeout(tmp_path):
+    from vm2morpheus.sources.vmware import READ_TIMEOUT, download_to
+    captured = {}
+
+    def getter(url, **kw):
+        captured.update(kw)
+        return _FakeResponse([b"x"])
+
+    download_to("https://esxi/x", tmp_path / "d.vmdk", "c=1", False, lambda d, t: None, getter=getter)
+    assert captured["timeout"] == (15, READ_TIMEOUT) and captured["stream"] is True and captured["verify"] is False
+
+
+def test_progress_finish_reports_total_and_speed(monkeypatch):
+    import io
+    from vm2morpheus import util
+    clock = iter([5.0, 15.0, 15.0])
+    monkeypatch.setattr(util.time, "monotonic", lambda: next(clock))
+    out = io.StringIO()
+    bar = util.Progress("descargar x", out)
+    bar(0)
+    bar(300 * 1024 * 1024)
+    bar.finish()
+    last = out.getvalue().splitlines()[-1]
+    assert "300.0 MiB" in last and "30.0 MiB/s" in last and "terminado en 10 s" in last

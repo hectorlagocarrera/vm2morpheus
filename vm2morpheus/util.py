@@ -54,6 +54,8 @@ class Progress:
         self.stream = stream or sys.stderr
         self._last = 0.0
         self._start = None
+        self._done = 0.0
+        self._total = None
 
     def __call__(self, done: float, total: float | None = None):
         if self.cancel is not None and self.cancel.is_set():
@@ -61,6 +63,7 @@ class Progress:
         now = time.monotonic()
         if self._start is None:
             self._start = now
+        self._done, self._total = done, total
         if now - self._last < 0.5 and not (total and done >= total):
             return
         self._last = now
@@ -79,7 +82,15 @@ class Progress:
         return f" · {human(done / elapsed)}/s" if elapsed >= 1 else ""
 
     def finish(self):
-        self.stream.write("\n")
+        """Close the line with a summary, so it is clear the transfer ended (and how fast it was)."""
+        elapsed = time.monotonic() - self._start if self._start is not None else 0
+        if self._start is None:
+            self.stream.write("\n")
+        elif self.percent:
+            self.stream.write(f"\r  {self.label}: 100% · terminado en {elapsed:.0f} s   \n")
+        else:
+            speed = f" · {human(self._done / elapsed)}/s" if elapsed >= 1 else ""
+            self.stream.write(f"\r  {self.label}: {human(self._done)}{speed} · terminado en {elapsed:.0f} s   \n")
         self.stream.flush()
 
 

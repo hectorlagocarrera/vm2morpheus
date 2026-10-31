@@ -150,5 +150,6 @@ $snaps = @(Get-VMSnapshot -VM $vm).Count
                     dst.write(chunk)
                     done += len(chunk)
                     cb(done, total)
+            cb.finish()
             out.append(local)
         return out
