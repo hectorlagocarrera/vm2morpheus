@@ -80,7 +80,7 @@ def download_to(url: str, local: Path, cookie: str | None, verify: bool, cb, tic
     has arrived; a stalled connection raises after READ_TIMEOUT instead of waiting forever."""
     done, tail = 0, b""
     kw = {"auth": auth} if auth is not None else {}
-    watchdog = StallWatchdog(f"la descarga de {local.name}").start()
+    watchdog = StallWatchdog(f"la descarga de {local.name}", min_rate=128 * 1024).start()
     try:
         with getter(url, stream=True, verify=verify, headers={"Cookie": cookie} if cookie else {},
                     timeout=(15, READ_TIMEOUT), **kw) as r:

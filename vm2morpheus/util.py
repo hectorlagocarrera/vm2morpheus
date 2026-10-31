@@ -52,8 +52,10 @@ class StallWatchdog:
     a SOAP call...) tells which of them it is. Reports are written to stderr, so they reach the GUI log."""
 
     def __init__(self, label: str, after: float = 45.0, repeat: float = 60.0, poll: float = 5.0, stream=None,
-                 clock=time.monotonic, frames=sys._current_frames):
+                 clock=time.monotonic, frames=sys._current_frames, min_rate: float = 0.0, slow_window: float = 30.0):
         self.label, self.after, self.repeat, self.poll = label, after, repeat, poll
+        self.min_rate, self.slow_window = min_rate, slow_window  # min_rate in units/s; 0 disables the crawl warning
+        self._samples: list[tuple[float, float]] = []
         self.stream, self.clock, self.frames = stream, clock, frames
         self.value, self.tid = None, None
         self.changed = clock()
@@ -72,15 +74,33 @@ class StallWatchdog:
     def stop(self) -> None:
         self._stop.set()
 
+    def _crawl_rate(self, now: float) -> float | None:
+        """Units/s over the last slow_window seconds if the counter moved but below min_rate, else None."""
+        if not self.min_rate or self.value is None:
+            return None
+        self._samples = [(t, v) for t, v in self._samples if now - t <= self.slow_window] + [(now, self.value)]
+        t0, v0 = self._samples[0]
+        span = now - t0
+        if span < self.slow_window - self.poll:
+            return None
+        rate = (self.value - v0) / span
+        return rate if 0 < rate < self.min_rate else None
+
     def check(self) -> bool:
         now = self.clock()
-        if now - self.changed < self.after or now - self.reported < self.repeat:
+        crawl = self._crawl_rate(now)
+        stalled = now - self.changed >= self.after
+        if not (stalled or crawl is not None) or now - self.reported < self.repeat:
             return False
         self.reported = now
         frame = self.frames().get(self.tid)
         where = "".join(traceback.format_stack(frame)[-3:]).rstrip() if frame is not None else "(no se pudo leer)"
-        print(f"Aviso: {self.label} lleva {now - self.changed:.0f} s sin recibir datos. El programa está esperando en:\n"
-              f"{where}", file=self.stream or sys.stderr)
+        if stalled:
+            why = f"{self.label} lleva {now - self.changed:.0f} s sin recibir datos"
+        else:
+            why = (f"{self.label} va muy lenta: {human(crawl)}/s en los últimos {self.slow_window:.0f} s "
+                   f"({human(self.value)} recibidos)")
+        print(f"Aviso: {why}. El programa está esperando en:\n{where}", file=self.stream or sys.stderr)
         return True
 
     def _run(self) -> None:
@@ -120,6 +140,7 @@ class Progress:
         self._start = None
         self._done = 0.0
         self._total = None
+        self._recent: list[tuple[float, float]] = []  # (time, done) samples of the last seconds
 
     def __call__(self, done: float, total: float | None = None):
         if self.cancel is not None and self.cancel.is_set():
@@ -150,8 +171,16 @@ class Progress:
         return now - (self._start if self._start is not None else now)
 
     def _speed(self, done: float, now: float) -> str:
+        """Average speed, plus the speed of the last ~10 s so a slowdown is visible (the average hides it)."""
         elapsed = self._elapsed(now)
-        return f" · {human(done / elapsed)}/s" if elapsed >= 1 else ""
+        self._recent = [(t, d) for t, d in self._recent if now - t <= 10] + [(now, done)]
+        if elapsed < 1:
+            return ""
+        text = f" · media {human(done / elapsed)}/s"
+        t0, d0 = self._recent[0]
+        if now - t0 >= 3:
+            text += f" · ahora {human(max(0.0, done - d0) / (now - t0))}/s"
+        return text
 
     def _eta(self, done: float, total: float | None, now: float) -> str:
         """' · ≈ 3 min restantes' once there are a few seconds of data to extrapolate from."""

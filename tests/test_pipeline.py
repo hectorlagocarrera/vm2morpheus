@@ -1548,3 +1548,67 @@ def test_a_same_name_image_only_produces_a_warning(tmp_path):
     msgs, err = _migrate_with_reference(tmp_path, "w22", existing_image_name="vm1")
     assert err is None
     assert any("Aviso: ya hay una imagen llamada 'vm1' en Morpheus (id 5)" in m for m in msgs)
+
+
+def test_progress_line_shows_average_and_current_speed(monkeypatch):
+    import io
+    from vm2morpheus import util
+    clock = iter([0.0, 10.0, 20.0, 21.0, 25.0])
+    monkeypatch.setattr(util.time, "monotonic", lambda: next(clock))
+    out = io.StringIO()
+    bar = util.Progress("descargar x", out)
+    mib = 1024 * 1024
+    bar(0)                   # t=0
+    bar(100 * mib)           # t=10: 10 MiB/s
+    bar(200 * mib)           # t=20: still 10 MiB/s
+    bar(200 * mib + 1024)    # t=21: throttled (< 0.5 s since... no: 1 s later) -> printed
+    bar(200 * mib + 2048)    # t=25: the last 4 s moved almost nothing
+    last = out.getvalue().split("\r")[-1]
+    assert "media 8.0 MiB/s" in last and "ahora 409.6 B/s" in last  # the last 5 s moved 2 KiB: the average hides it
+
+
+def test_watchdog_warns_when_the_transfer_crawls_but_does_not_stop(tmp_path):
+    import io
+    from vm2morpheus.util import StallWatchdog
+    done = threading.Event()
+    ready = threading.Event()
+
+    def worker():
+        ready.set()
+        done.wait()
+
+    th = threading.Thread(target=worker, daemon=True)
+    th.start()
+    ready.wait()
+    t = {"now": 0.0}
+    out = io.StringIO()
+    wd = StallWatchdog("la descarga de x", after=45, repeat=60, poll=5, stream=out, clock=lambda: t["now"],
+                       min_rate=128 * 1024, slow_window=30)
+    wd.tid = th.ident
+    value = 0
+    fired = []
+    for sec in range(0, 70, 5):          # ~10 KiB/s: bytes keep arriving, so it is never "silent"
+        t["now"] = float(sec)
+        value += 50 * 1024
+        wd.beat(value)
+        fired.append(wd.check())
+    text = out.getvalue()
+    assert any(fired) and "va muy lenta" in text and "KiB/s en los últimos 30 s" in text
+    assert "sin recibir datos" not in text
+    done.set()
+
+
+def test_watchdog_stays_quiet_at_a_healthy_rate():
+    import io
+    from vm2morpheus.util import StallWatchdog
+    t = {"now": 0.0}
+    out = io.StringIO()
+    wd = StallWatchdog("x", stream=out, clock=lambda: t["now"], min_rate=128 * 1024, slow_window=30)
+    wd.tid = threading.get_ident()
+    value = 0
+    for sec in range(0, 120, 5):
+        t["now"] = float(sec)
+        value += 40 * 1024 * 1024        # 8 MiB/s
+        wd.beat(value)
+        assert wd.check() is False
+    assert out.getvalue() == ""
