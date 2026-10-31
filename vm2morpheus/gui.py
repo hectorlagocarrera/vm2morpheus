@@ -108,7 +108,7 @@ def make_cfgs(f: dict):
             "recreate_instance": bool(f.get("recreate_instance")),
             "disk_indexes": [int(i) for i in f["disk_indexes"]] if f.get("disk_indexes") is not None else None,
             "new_name": (f.get("new_vm_name") or "").strip() or None,
-            "compress_image": bool(f.get("compress_image"))}
+            "compress_image": bool(f.get("compress_image")), "hot_copy": bool(f.get("hot_copy"))}
     return src, m, opts
 
 
@@ -135,7 +135,7 @@ def done_info(job: dict) -> dict | None:
     result = c["result"] or {}
     if result.get("dry_run") or not result.get("instance") or not result.get("images"):
         return None
-    return {"instance": result["instance"], "images": result["images"], "vm": c["vm"],
+    return {"instance": result["instance"], "images": result["images"], "vm": c["vm"], "hot": bool(result.get("hot")),
             "morpheus_url": c["morpheus"]["url"].rstrip("/"), "history_id": job.get("history_id")}
 
 
@@ -180,7 +180,7 @@ def run_job(job_id: str, f: dict, dry: bool):
     job["jl"] = jl
     recorder = None if dry else history.Recorder({
         "vm": (f.get("vm") or "").strip(), "target_name": (f.get("new_vm_name") or f.get("vm") or "").strip(),
-        "source_type": f.get("source_type"), "source_host": (f.get("source_host") or "").strip(),
+        "hot": bool(f.get("hot_copy")), "source_type": f.get("source_type"), "source_host": (f.get("source_host") or "").strip(),
         "morpheus_url": (f.get("morpheus_url") or "").strip(), "version": __version__})
 
     def observe(label, done, total, unit):
@@ -224,6 +224,8 @@ def run_job(job_id: str, f: dict, dry: bool):
                     recorder.meta.update(vcpu=vm.cpu, memory_mb=vm.memory_mb, os=vm.os_family,
                                          disks=[{"name": d.name, "size_bytes": d.size_bytes, "used_bytes": d.used_bytes}
                                                 for d in vm.disks])
+                if result and not result.get("dry_run"):
+                    recorder.meta["hot"] = bool(result.get("hot"))  # what really happened, not just what was asked
                 entry = recorder.finish(status, tracker.snapshot() if tracker else {}, error,
                                         result if result and not result.get("dry_run") else None)
                 job["history_id"] = entry["id"]
@@ -540,6 +542,7 @@ small{color:#5d6b7b}
 <label><input type="checkbox" id="multi_disk_bundle" checked> Varios discos en una sola imagen (zip + metadata.json)</label>
 <label><input type="checkbox" id="recreate_instance"> Recrear solo la instancia (borra antes la anterior en Morpheus)</label>
 <label><input type="checkbox" id="verify_source"> Verificar el certificado del origen (VMware; déjalo apagado si es autofirmado)</label>
+<label id="hotlbl"><input type="checkbox" id="hot_copy" onchange="if(this.checked)document.getElementById('shutdown').checked=false"> Copia en caliente: no apagar la VM de origen (solo Hyper-V; crea un checkpoint temporal y copia el disco base)</label>
 <label><input type="checkbox" id="compress_image"> Comprimir el disco convertido (se sube y se copia más rápido; la VM puede leer algo más lento)</label>
 <label><input type="checkbox" id="remember_secrets"> Recordar contraseñas y token (se guardan en texto plano en este equipo)</label>
 <label><input type="checkbox" id="direct_read"> Conversión directa, sin copiar el disco antes (Hyper-V, solo Windows)</label>
@@ -569,7 +572,7 @@ small{color:#5d6b7b}
 </main>
 <script>
 const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","virtio_iso","vmware_method","new_vm_name","ref_instance_id","ref_image_id","workdir"];
-const chks=["verify_ssl","verify_source","compress_image","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
+const chks=["verify_ssl","verify_source","compress_image","hot_copy","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
 const EMBEDDED=__EMBEDDED__;
 let analyzedVm=null;
 const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);if(analyzedVm&&analyzedVm===document.getElementById("vm").value.trim()&&document.querySelector(".diskchk"))o.disk_indexes=[...document.querySelectorAll(".diskchk")].filter(c=>c.checked).map(c=>Number(c.value));else o.disk_indexes=null;return o};
@@ -680,7 +683,8 @@ async function lookups(){try{await persist();const j=await busy("Cargando datos 
 const SEP=String.fromCharCode(92);
 function srcHint(){const t=document.getElementById("source_type").value;
  document.getElementById("source_user").placeholder={hyperv:"Administrador",vmware:"usuario@vsphere.local",esxi:"root"}[t]||"";
- document.getElementById("os_family").closest("div").style.display=t==="hyperv"?"":"none"}
+ document.getElementById("os_family").closest("div").style.display=t==="hyperv"?"":"none";
+ const hot=document.getElementById("hotlbl");hot.style.display=t==="hyperv"?"":"none";if(t!=="hyperv")document.getElementById("hot_copy").checked=false}
 let pickerState={path:"",parent:null};
 const gib=b=>b==null?"?":b<1073741824?Math.max(1,Math.round(b/1048576))+" MiB":(b/1073741824).toFixed(1)+" GiB";
 async function openPicker(path){try{const r=await fetch("/browse?path="+encodeURIComponent(path||""));const j=await r.json();if(j.error)throw new Error(j.error);
@@ -718,7 +722,7 @@ async function showDetail(id){const e=await (await fetch("/history/"+id)).json()
  <div><span>Origen:</span> ${esc(e.source_type)} ${esc(e.source_host)}</div><div><span>Destino:</span> ${esc(e.morpheus_url)}</div>
  <div><span>Nombre en Morpheus:</span> ${esc(e.target_name)}</div><div><span>Recursos:</span> ${esc(e.vcpu||"?")} vCPU · ${esc(e.memory_mb||"?")} MiB · ${esc(e.os||"")}</div>
  <div><span>Discos:</span> ${(e.disks||[]).map(d=>esc(d.name)+" ("+(d.size_bytes/1073741824).toFixed(0)+" GiB)").join(", ")||"–"}</div><div><span>Instancia creada:</span> ${e.instance&&e.instance.id?"id "+esc(e.instance.id):"no"}</div>
- <div><span>Imagen borrada de la biblioteca:</span> ${e.image_deleted?"sí":"no"}</div><div><span>Versión:</span> ${esc(e.version||"?")}</div></div>
+ <div><span>Imagen borrada de la biblioteca:</span> ${e.image_deleted?"sí":"no"}</div><div><span>Versión:</span> ${esc(e.version||"?")}</div><div><span>Copia en caliente:</span> ${e.hot?"sí":"no"}</div></div>
  ${steps.length?`<div class="stack">${steps.map(([k,v])=>`<i title="${STEPLBL[k]||k}: ${fmtDur(v)}" style="width:${100*v/total}%;background:${STEPCOL[k]||"#64748b"}"></i>`).join("")}</div><div class="legend">${steps.map(([k,v])=>`<em style="--c:${STEPCOL[k]||"#64748b"}">${STEPLBL[k]||k}: ${fmtDur(v)}</em>`).join("")}</div>`:""}
  ${(e.series||[]).length?`<canvas id="histchart"></canvas><div id="histchartinfo" style="font-size:12px;color:#4a5665;margin-top:4px"></div><div class="legend" style="margin-top:4px"><em style="--c:#2563eb">Descarga</em><em style="--c:#16a34a">Subida</em></div>`:""}
  ${e.error?`<div class="errbox">${esc(e.error)}</div>`:""}
@@ -734,6 +738,7 @@ function showDoneDialog(jobId,d){const imgs=d.images.map(i=>esc(i.name)+" (id "+
  <p>La VM <b>${esc(d.instance.name||d.vm)}</b> ya está creada en Morpheus. <b>Antes de limpiar nada, compruébala:</b></p>
  <ul><li>Arranca y puedes entrar con tu usuario (usa la consola de Morpheus).</li><li>Tiene red y sus servicios responden.</li><li>Los discos y los datos están completos.</li></ul>
  <p style="font-size:13px;color:#4a5665">Cuando funcione, puedes borrar de la biblioteca de Morpheus la imagen que se subió solo para crearla (${imgs}). <b>El borrado no se puede deshacer.</b> Si Morpheus la considera en uso, te enseñaré lo que conteste.</p>
+ ${d.hot?`<p style="background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:8px 12px;font-size:13px"><b>Copia en caliente:</b> la VM de origen sigue encendida y la copia no incluye lo que cambió después del checkpoint. <b>Apaga el origen antes de arrancar la VM de Morpheus</b> para no tener dos máquinas iguales en la red (nombre, IP, dominio).</p>`:""}
  <label class="inl"><input type="checkbox" id="dlgwork" checked> Borrar también la carpeta de trabajo de esta VM (solo guarda el progreso)</label>
  <div id="dlgres"></div>
  <div class="actions"><a class="btnlink" href="${link}" target="_blank" rel="noopener">Abrir la instancia en Morpheus</a>

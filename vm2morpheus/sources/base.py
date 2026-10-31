@@ -27,6 +27,17 @@ class Source(ABC):
     def fetch_disks(self, vm: VMInfo, dest: Path, progress: Callable[[str], ProgressCb]) -> list[Path]:
         """Copy every disk of the (powered-off) VM into dest; returns the local files, boot disk first."""
 
+    supports_hot = False  # can copy the disks without powering the VM off (checkpoint/snapshot based)
+    hot_type = ""         # what kind of consistency the hot copy gives, for the log
+
+    def hot_prepare(self, vm: VMInfo) -> list:
+        """Freeze a consistent point in time (a temporary checkpoint) and return the disks to copy, which no
+        longer change while it exists. Only sources with supports_hot implement it."""
+        raise NotImplementedError
+
+    def hot_release(self, log=print) -> None:
+        """Remove whatever hot_prepare created. Must be safe to call when nothing was created."""
+
     timing_kind = "default"  # which history the progress bar learns from (see timings.py)
     direct = False  # True when fetch_disks returns paths on the source instead of local copies
 

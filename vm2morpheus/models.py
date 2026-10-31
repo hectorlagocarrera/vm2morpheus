@@ -21,3 +21,4 @@ class VMInfo:
     disks: list[DiskInfo]
     networks: list[str] = field(default_factory=list)
     has_snapshots: bool = False
+    snapshot_names: list[str] = field(default_factory=list)

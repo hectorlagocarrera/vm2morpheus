@@ -2171,3 +2171,221 @@ def test_page_has_the_history_tab_and_the_two_step_delete_dialog():
                    "function showDoneDialog", "Pulsa otra vez para confirmar el borrado", "Reintentar el borrado",
                    "El borrado no se puede deshacer", 'href="/history.csv"', "function drawSeriesChart"):
         assert needle in page
+
+
+# ------------------------------------------------------------ hot copy (Hyper-V checkpoint, source stays on)
+def _hv(**cfg):
+    from vm2morpheus.sources.hyperv import HyperVSource
+    return HyperVSource({"host": "h", "username": "u", "password": "p", **cfg})
+
+
+def test_hyperv_hot_prepare_checkpoints_the_vm_and_returns_the_frozen_base_disks():
+    src = _hv()
+    scripts = []
+
+    def ps(script):
+        scripts.append(script)
+        return json.dumps({"Type": "Production", "Disks": [
+            {"Path": r"D:\VMs\w2k16\w2k16.vhdx", "Size": 85899345920, "FileSize": 9663676416},
+            {"Path": r"E:\Datos\datos.vhdx", "Size": 107374182400, "FileSize": 45056}]})
+
+    src._ps = ps
+    vm = VMInfo("w2k16", 2, 8192, "bios", "windows", "on", [DiskInfo("w2k16-checkpoint.avhdx", 1, "x", index=0)])
+    disks = src.hot_prepare(vm)
+    script = scripts[0]
+    assert "Checkpoint-VM" in script and "Get-VMHardDiskDrive -VMSnapshot" in script and "'w2k16'" in script
+    assert "-eq 'Disabled'" in script                              # refuses VMs with checkpoints turned off
+    assert [d.path for d in disks] == [r"D:\VMs\w2k16\w2k16.vhdx", r"E:\Datos\datos.vhdx"]
+    assert [d.name for d in disks] == ["w2k16.vhdx", "datos.vhdx"] and [d.index for d in disks] == [0, 1]
+    assert disks[0].used_bytes == 9663676416 and "VSS" in src.hot_type
+    assert src._hot[0] == "w2k16" and src._hot[1].startswith("vm2morpheus-")
+
+
+def test_hyperv_hot_release_removes_only_our_checkpoint_and_is_safe_to_call_twice():
+    src = _hv()
+    src._ps = lambda script: json.dumps({"Type": "Standard", "Disks": []})
+    vm = VMInfo("w2k16", 1, 1024, "bios", "windows", "on", [])
+    src.hot_prepare(vm)
+    name = src._hot[1]
+    scripts, logs = [], []
+    src._ps = lambda script: scripts.append(script) or ""
+    src.hot_release(logs.append)
+    assert "Remove-VMSnapshot" in scripts[0] and f"'{name}'" in scripts[0] and "'w2k16'" in scripts[0]
+    assert src._hot is None and any("Checkpoint temporal eliminado" in m for m in logs)
+    src.hot_release(logs.append)                                    # nothing left to do
+    assert len(scripts) == 1
+
+
+def test_hyperv_hot_release_failure_keeps_the_checkpoint_known_and_raises():
+    src = _hv()
+    src._ps = lambda script: json.dumps({"Type": "Standard", "Disks": []})
+    src.hot_prepare(VMInfo("w2k16", 1, 1024, "bios", "windows", "on", []))
+
+    def boom(script):
+        raise RuntimeError("Falló PowerShell en h: acceso denegado")
+
+    src._ps = boom
+    with pytest.raises(RuntimeError, match="acceso denegado"):
+        src.hot_release()
+    assert src._hot is not None                                     # so a later attempt can still clean it
+
+
+def test_a_half_done_checkpoint_attempt_is_still_remembered_for_cleanup():
+    src = _hv()
+
+    def fails_after_creating(script):
+        raise RuntimeError("Falló PowerShell en h: Get-VHD no pudo leer el disco")
+
+    src._ps = fails_after_creating
+    with pytest.raises(RuntimeError):
+        src.hot_prepare(VMInfo("w2k16", 1, 1024, "bios", "windows", "on", []))
+    assert src._hot and src._hot[0] == "w2k16"                      # hot_release will remove it if it exists
+
+
+def test_hyperv_hot_copy_explains_disabled_checkpoints():
+    src = _hv()
+
+    def disabled(script):
+        raise RuntimeError("Falló PowerShell en h: CHECKPOINTS_DISABLED")
+
+    src._ps = disabled
+    with pytest.raises(RuntimeError, match=r"Set-VM -Name 'w2k16' -CheckpointType Production"):
+        src.hot_prepare(VMInfo("w2k16", 1, 1024, "bios", "windows", "on", []))
+
+
+def test_hyperv_get_vm_reports_the_names_of_existing_checkpoints():
+    src = _hv()
+    src._ps = lambda script: json.dumps({"Name": "w2k16", "Cpu": 1, "MemoryMB": 1024, "Generation": 1, "State": "Running",
+                                         "Disks": [], "Nets": [], "Snapshots": 2,
+                                         "SnapshotNames": ["antes de actualizar", "vm2morpheus-20261031-1010"]})
+    vm = src.get_vm("w2k16")
+    assert vm.has_snapshots and vm.snapshot_names == ["antes de actualizar", "vm2morpheus-20261031-1010"]
+
+
+class HotSource(FakeSource):
+    supports_hot = True
+    hot_type = "estándar, consistente ante fallos"
+
+    def __init__(self, disk, running=True, fetch_error=None, release_error=None, snapshots=None):
+        super().__init__(disk)
+        self.running, self.fetch_error, self.release_error, self.snapshots = running, fetch_error, release_error, snapshots
+        self.calls = []
+
+    def get_vm(self, name):
+        vm = VMInfo(name, 2, 2048, "bios", "windows", "on" if self.running else "off",
+                    [DiskInfo("w2k16.vhdx", 8 << 20, "x", index=0)])
+        vm.has_snapshots, vm.snapshot_names = bool(self.snapshots), list(self.snapshots or [])
+        return vm
+
+    def power_off(self, name):
+        self.calls.append("power_off")
+
+    def hot_prepare(self, vm):
+        self.calls.append("hot_prepare")
+        return [DiskInfo("frozen-parent.vhdx", d.size_bytes, "frozen", index=d.index) for d in vm.disks]
+
+    def fetch_disks(self, vm, dest, progress):
+        self.calls.append("fetch:" + ",".join(d.name for d in vm.disks))
+        if self.fetch_error:
+            raise self.fetch_error
+        out = dest / "d.vmdk"
+        shutil.copy(self.disk, out)
+        return [out]
+
+    def hot_release(self, log=print):
+        self.calls.append("hot_release")
+        if self.release_error:
+            raise self.release_error
+
+
+def _hot_run(tmp_path, source, name, opts_extra=None, dry_run=False):
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    msgs = []
+    try:
+        res = migrate(source, _client(srv), "vm1", {"workdir": str(tmp_path / name), "hot_copy": True, **(opts_extra or {})},
+                      {"image_type": "qcow2"}, log=msgs.append, dry_run=dry_run)
+        return res, msgs, None
+    except BaseException as e:  # noqa: BLE001 - the tests inspect CancelledError too
+        return None, msgs, e
+    finally:
+        srv.shutdown()
+
+
+def _disk(tmp_path):
+    d = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(d), "8M"], check=True, capture_output=True)
+    return d
+
+
+def test_hot_copy_keeps_the_vm_on_copies_the_frozen_disks_and_releases_the_checkpoint(tmp_path):
+    src = HotSource(_disk(tmp_path))
+    res, msgs, err = _hot_run(tmp_path, src, "h1")
+    assert err is None and res["hot"] is True
+    assert src.calls == ["hot_prepare", "fetch:frozen-parent.vhdx", "hot_release"]   # never powered off
+    assert any("Checkpoint estándar, consistente ante fallos" in m and "sigue encendida" in m for m in msgs)
+
+
+def test_hot_copy_releases_the_checkpoint_when_the_copy_fails_or_is_cancelled(tmp_path):
+    from vm2morpheus.util import CancelledError
+    for name, error in (("h2", RuntimeError("El disco se corrompió")), ("h3", CancelledError("cancelled"))):
+        src = HotSource(_disk(tmp_path), fetch_error=error)
+        res, msgs, err = _hot_run(tmp_path, src, name)
+        assert err is error and src.calls[-1] == "hot_release"       # released, and the original error still surfaces
+
+
+def test_failing_to_release_the_checkpoint_is_reported_loudly_but_does_not_hide_the_result(tmp_path):
+    src = HotSource(_disk(tmp_path), release_error=RuntimeError("acceso denegado"))
+    res, msgs, err = _hot_run(tmp_path, src, "h4")
+    assert err is None and res["hot"] is True
+    warning = next(m for m in msgs if m.startswith("AVISO: no se pudo eliminar el checkpoint temporal"))
+    assert "acceso denegado" in warning and "Administrador de Hyper-V" in warning
+
+
+def test_a_vm_that_is_already_off_needs_no_checkpoint_and_the_run_is_not_marked_hot(tmp_path):
+    src = HotSource(_disk(tmp_path), running=False)
+    res, msgs, err = _hot_run(tmp_path, src, "h5")
+    assert err is None and res["hot"] is False and "hot_prepare" not in src.calls and "hot_release" not in src.calls
+
+
+def test_hot_copy_is_refused_for_sources_that_cannot_do_it(tmp_path):
+    src = FakeSource(_disk(tmp_path))                                  # supports_hot is False
+    res, msgs, err = _hot_run(tmp_path, src, "h6")
+    assert isinstance(err, RuntimeError) and "solo está disponible para Hyper-V" in str(err)
+
+
+def test_existing_checkpoints_block_a_hot_copy_and_leftovers_of_ours_are_called_out(tmp_path):
+    src = HotSource(_disk(tmp_path), snapshots=["antes de actualizar", "vm2morpheus-20261031-1010"])
+    res, msgs, err = _hot_run(tmp_path, src, "h7")
+    text = str(err)
+    assert "(antes de actualizar, vm2morpheus-20261031-1010)" in text and "interrumpida" in text
+    assert src.calls == []                                             # nothing was touched
+
+
+def test_running_vm_without_hot_copy_still_asks_to_shut_down_and_mentions_the_alternative(tmp_path):
+    src = HotSource(_disk(tmp_path))
+    res, msgs, err = _hot_run(tmp_path, src, "h8", {"hot_copy": False})
+    assert "Apagar la VM de origen" in str(err) and "Copia en caliente" in str(err)
+
+
+def test_hot_copy_turns_off_in_place_reading_and_dry_run_explains_the_plan(tmp_path):
+    src = HotSource(_disk(tmp_path))
+    src.direct = True
+    res, msgs, err = _hot_run(tmp_path, src, "h9", dry_run=True)
+    assert err is None and src.direct is False and src.calls == []     # a dry run creates no checkpoint
+    assert any("se crearía un checkpoint temporal" in m for m in msgs)
+
+
+def test_gui_passes_the_hot_copy_option_and_warns_about_the_running_source():
+    from vm2morpheus import gui
+    base = {"vm": "w2k16", "morpheus_url": "https://m", "morpheus_token": "t", "source_type": "hyperv",
+            "source_host": "h", "source_user": "u", "source_password": "p"}
+    assert gui.make_cfgs({**base, "hot_copy": True})[2]["hot_copy"] is True
+    assert gui.make_cfgs(dict(base))[2]["hot_copy"] is False
+    page = gui.render_page()
+    for needle in ('id="hot_copy"', 'id="hotlbl"', "Copia en caliente: no apagar la VM de origen",
+                   "Apaga el origen antes de arrancar la VM de Morpheus"):
+        assert needle in page
+    job = {"status": "done", "cleanup": {"morpheus": {"url": "https://m"}, "vm": "w", "workdir": "x",
+           "result": {"instance": {"id": 1}, "images": [{"id": 2, "name": "n"}], "hot": True}}}
+    assert gui.done_info(job)["hot"] is True

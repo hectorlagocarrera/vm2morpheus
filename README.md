@@ -71,3 +71,12 @@ Every migration started from the GUI is written to `~/.vm2morpheus/history.json`
 durations, average download/upload speed, a throughput curve, the error if it failed). The "Histórico" tab lists them,
 shows a detail view with a chart, and exports CSV. When a migration has created the VM, a dialog asks you to test it
 and only then, on explicit confirmation, deletes the library image it uploaded (and optionally the work folder).
+
+
+## Hot copy (Hyper-V)
+
+With "Copia en caliente" a running Hyper-V VM is not powered off: a temporary checkpoint (`vm2morpheus-<date>`) freezes
+the original VHDX files, which are copied as plain files while the VM keeps running; the checkpoint is removed as soon
+as the copy ends (also after an error or a cancel). The copy is a point in time: what the VM writes after the
+checkpoint is not in it, and the source keeps running, so power it off before starting the migrated VM. Requires that
+the VM has no checkpoints of its own and that checkpoints are enabled on it (`Set-VM -CheckpointType Production`).

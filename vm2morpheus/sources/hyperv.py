@@ -27,6 +27,7 @@ class HyperVSource(Source):
     Needs: WinRM enabled on the host, SMB access to the admin shares (C$ ...), and an
     account that is local admin / Hyper-V administrator.
     """
+    supports_hot = True
     timing_kind = "hyperv"  # progress-bar timings are learned per kind of source
 
     def __init__(self, cfg: dict):
@@ -44,6 +45,7 @@ class HyperVSource(Source):
             print("La lectura directa solo funciona en Windows: se copiarán los discos", file=sys.stderr)
         self.session = None
         self._shares: set[str] = set()
+        self._hot: tuple[str, str] | None = None  # (VM, temporary checkpoint) created by hot_prepare
 
     def connect(self) -> None:
         import winrm
@@ -77,8 +79,9 @@ $ErrorActionPreference='Stop'
 $vm = Get-VM -Name {n}
 $disks = @(Get-VMHardDiskDrive -VM $vm | ForEach-Object {{ $v = Get-VHD -Path $_.Path; [pscustomobject]@{{Path=$_.Path; Size=[int64]$v.Size; FileSize=[int64]$v.FileSize}} }})
 $nets = @(Get-VMNetworkAdapter -VM $vm | ForEach-Object {{ $_.SwitchName }})
-$snaps = @(Get-VMSnapshot -VM $vm).Count
-[pscustomobject]@{{Name=$vm.Name; Cpu=[int](Get-VMProcessor -VM $vm).Count; MemoryMB=[int64]($vm.MemoryStartup/1MB); Generation=[int]$vm.Generation; State=$vm.State.ToString(); Disks=$disks; Nets=$nets; Snapshots=[int]$snaps}} | ConvertTo-Json -Depth 4 -Compress
+$snapNames = @(Get-VMSnapshot -VM $vm | ForEach-Object {{ $_.Name }})
+$snaps = $snapNames.Count
+[pscustomobject]@{{Name=$vm.Name; Cpu=[int](Get-VMProcessor -VM $vm).Count; MemoryMB=[int64]($vm.MemoryStartup/1MB); Generation=[int]$vm.Generation; State=$vm.State.ToString(); Disks=$disks; Nets=$nets; Snapshots=[int]$snaps; SnapshotNames=$snapNames}} | ConvertTo-Json -Depth 4 -Compress
 """)
         d = json.loads(out)
         disks = [DiskInfo(name=PureWindowsPath(x["Path"]).name, size_bytes=int(x["Size"]), path=x["Path"],
@@ -90,8 +93,54 @@ $snaps = @(Get-VMSnapshot -VM $vm).Count
             os_family=self.os_family,
             power_state="on" if d["State"] == "Running" else "off",
             disks=disks, networks=[x for x in as_list(d.get("Nets")) if x],
-            has_snapshots=d.get("Snapshots", 0) > 0,
+            has_snapshots=d.get("Snapshots", 0) > 0 or bool(as_list(d.get("SnapshotNames"))),
+            snapshot_names=[str(x) for x in as_list(d.get("SnapshotNames"))],
         )
+
+    def hot_prepare(self, vm: VMInfo) -> list[DiskInfo]:
+        """Checkpoint the running VM: from then on its changes go to a differencing disk and the original VHDX files
+        stay untouched (read-only), so they can be copied while the VM keeps running."""
+        snap = "vm2morpheus-" + time.strftime("%Y%m%d-%H%M%S")
+        n, sn = ps_quote(vm.name), ps_quote(snap)
+        self._hot = (vm.name, snap)  # remembered before running: even a half-done attempt must be cleaned up
+        try:
+            out = self._ps(f"""
+$ErrorActionPreference='Stop'
+$vm = Get-VM -Name {n}
+$ctype = $vm.CheckpointType.ToString()
+if ($ctype -eq 'Disabled') {{ throw 'CHECKPOINTS_DISABLED' }}
+Checkpoint-VM -VM $vm -SnapshotName {sn}
+$s = Get-VMSnapshot -VM $vm -Name {sn}
+$disks = @(Get-VMHardDiskDrive -VMSnapshot $s | ForEach-Object {{ $v = Get-VHD -Path $_.Path; [pscustomobject]@{{Path=$_.Path; Size=[int64]$v.Size; FileSize=[int64]$v.FileSize}} }})
+[pscustomobject]@{{Type=$ctype; Disks=$disks}} | ConvertTo-Json -Depth 4 -Compress
+""")
+        except RuntimeError as e:
+            if "CHECKPOINTS_DISABLED" in str(e):
+                raise RuntimeError(f"Los checkpoints están desactivados en la VM {vm.name!r} y la copia en caliente los "
+                                   f"necesita. Actívalos en el host con: Set-VM -Name '{vm.name}' -CheckpointType "
+                                   "Production") from e
+            raise
+        d = json.loads(out)
+        self.hot_type = {"Production": "de producción, consistente con las aplicaciones si el invitado lo permite (VSS)",
+                         "ProductionOnly": "de producción, consistente con las aplicaciones (VSS)",
+                         "Standard": "estándar, consistente ante fallos"}.get(d.get("Type"), str(d.get("Type")))
+        return [DiskInfo(name=PureWindowsPath(x["Path"]).name, size_bytes=int(x["Size"]), path=x["Path"],
+                         used_bytes=int(x["FileSize"]) if x.get("FileSize") else None, index=i)
+                for i, x in enumerate(as_list(d.get("Disks")))]
+
+    def hot_release(self, log=print) -> None:
+        """Delete the temporary checkpoint (Hyper-V merges its changes back into the disk while the VM runs)."""
+        if not self._hot:
+            return
+        name, snap = self._hot
+        self._ps(f"""
+$ErrorActionPreference='Stop'
+$s = @(Get-VMSnapshot -VMName {ps_quote(name)} -Name {ps_quote(snap)} -ErrorAction SilentlyContinue)
+if ($s.Count -gt 0) {{ $s | Remove-VMSnapshot }}
+""")
+        self._hot = None
+        log("Checkpoint temporal eliminado. Hyper-V fusiona los cambios en segundo plano; puede haber actividad de "
+            "disco un rato.")
 
     def power_off(self, name: str) -> None:
         n = ps_quote(name)

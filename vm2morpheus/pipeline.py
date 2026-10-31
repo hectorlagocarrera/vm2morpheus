@@ -106,6 +106,11 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         log(f"Discos seleccionados: {len(vm.disks)} de {total_disks} "
             f"({', '.join(d.name for d in vm.disks)}); el primero se trata como disco de arranque")
     fmt = opts.get("output_format", "qcow2")
+    hot = bool(opts.get("hot_copy"))
+    use_hot = hot and vm.power_state == "on" and source.supports_hot  # an already stopped VM needs no checkpoint
+    if use_hot and source.direct:
+        source.direct = False  # read the checkpoint's parent disks as plain files, not in place
+        log("La copia en caliente copia los discos como ficheros: se desactiva la lectura directa")
     windows_inject = bool(opts.get("inject_drivers")) and _is_windows() and vm.os_family == "windows"
     if windows_inject and source.direct:
         source.direct = False  # drivers are written into the disk, so it must be a private copy, never the original
@@ -116,15 +121,22 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         f"{human(total)} provisionados")
 
     problems = []
+    if hot and not source.supports_hot:
+        problems.append("La copia en caliente solo está disponible para Hyper-V por ahora: desmarca la opción")
     if vm.has_snapshots:
-        problems.append("La VM tiene snapshots o checkpoints: consolídalos primero")
+        names = ", ".join(vm.snapshot_names)
+        ours = any(n.startswith("vm2morpheus-") for n in vm.snapshot_names)
+        problems.append("La VM tiene snapshots o checkpoints" + (f" ({names})" if names else "") + ": consolídalos primero"
+                        + (" (los 'vm2morpheus-…' quedaron de una copia en caliente interrumpida: bórralos a mano)"
+                           if ours else ""))
     if not vm.disks:
         problems.append("La VM no tiene discos")
     if windows_inject and not is_admin():
         problems.append("La inyección de drivers necesita permisos de administrador: cierra el programa y ábrelo con "
                         "clic derecho > Ejecutar como administrador (o desmarca la opción de drivers)")
-    if vm.power_state == "on" and not opts.get("shutdown_source"):
-        problems.append("La VM está encendida: marca 'Apagar la VM de origen' (--shutdown) para hacer una copia consistente")
+    if vm.power_state == "on" and not opts.get("shutdown_source") and not use_hot:
+        problems.append("La VM está encendida: marca 'Apagar la VM de origen' (--shutdown) para hacer una copia consistente"
+                        + (", o 'Copia en caliente' para no apagarla" if source.supports_hot else ""))
     workdir = Path(opts.get("workdir", "/var/tmp/vm2morpheus")).resolve() / vm.name
     probe = workdir
     while not probe.exists():
@@ -140,6 +152,9 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             log(f"  fallaría: {p}")
         steps = " → ".join(STEP_LABELS[x] for x in relevant_steps(opts, mcfg))
         log(f"Simulación: se harían estos pasos: {steps}. No se ha modificado nada.")
+        if use_hot:
+            log("Copia en caliente: se crearía un checkpoint temporal y la VM de origen seguiría encendida; la copia "
+                "no incluiría lo que cambie después del checkpoint.")
         return {"dry_run": True, "problems": problems}
     if problems:
         raise RuntimeError("; ".join(problems))
@@ -178,7 +193,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
 
     check()
     if not st.done("fetch"):
-        if vm.power_state == "on":
+        if vm.power_state == "on" and not use_hot:
             log("Apagando la VM de origen ...")
             source.power_off(vm.name)
         log("Descargando discos ...")
@@ -192,8 +207,23 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             return Progress(label, cancel=cancel, estimate=estimate,
                             on_progress=lambda f, i=i: tracker.update("fetch", min(1.0, (i + f) / n_disks)))
 
-        files = source.fetch_disks(vm, workdir, fetch_bar)
-        st.mark("fetch", fetched=[str(f) for f in files])
+        try:
+            if use_hot:
+                log("Copia en caliente: creando un checkpoint temporal para copiar los discos sin apagar la VM ...")
+                frozen = {d.index: d for d in source.hot_prepare(vm)}
+                vm.disks = [frozen[d.index] for d in vm.disks]
+                log(f"Checkpoint {source.hot_type}. La VM de origen sigue encendida: lo que cambie a partir de ahora "
+                    "no estará en la copia.")
+            files = source.fetch_disks(vm, workdir, fetch_bar)
+        finally:
+            if use_hot:  # also after an error or a cancel: never leave the source VM running on a checkpoint chain
+                try:
+                    source.hot_release(log)
+                except Exception as e:
+                    log(f"AVISO: no se pudo eliminar el checkpoint temporal de la VM de origen ({e}). Elimínalo a "
+                        "mano en el Administrador de Hyper-V: mientras exista, la VM sigue escribiendo en un disco "
+                        "diferencial que crece.")
+        st.mark("fetch", fetched=[str(f) for f in files], hot=use_hot)
         tracker.finish("fetch")
 
     check()
@@ -301,7 +331,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         tracker.finish("upload")
 
     check()
-    result = {"images": st.d["images"]}
+    result = {"images": st.d["images"], "hot": bool(st.d.get("hot"))}
     if not st.done("instance"):
         tracker.begin("instance")
         template = mcfg.get("instance")
