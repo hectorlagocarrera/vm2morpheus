@@ -9,6 +9,7 @@ from pathlib import Path
 import requests
 
 from ..models import DiskInfo, VMInfo
+from ..util import StallWatchdog
 from .base import Source
 
 CHUNK = 8 * 1024 * 1024
@@ -79,6 +80,7 @@ def download_to(url: str, local: Path, cookie: str | None, verify: bool, cb, tic
     has arrived; a stalled connection raises after READ_TIMEOUT instead of waiting forever."""
     done, tail = 0, b""
     kw = {"auth": auth} if auth is not None else {}
+    watchdog = StallWatchdog(f"la descarga de {local.name}").start()
     try:
         with getter(url, stream=True, verify=verify, headers={"Cookie": cookie} if cookie else {},
                     timeout=(15, READ_TIMEOUT), **kw) as r:
@@ -88,6 +90,7 @@ def download_to(url: str, local: Path, cookie: str | None, verify: bool, cb, tic
                     f.write(chunk)
                     done += len(chunk)
                     tail = (tail + chunk)[-1024:]
+                    watchdog.beat(done)
                     cb(done, total)
                     tick()
                     if end_marker and vmdk_stream_complete(tail):
@@ -99,6 +102,8 @@ def download_to(url: str, local: Path, cookie: str | None, verify: bool, cb, tic
         raise RuntimeError(f"El ESXi dejó de enviar datos durante {READ_TIMEOUT} s (se habían descargado "
                            f"{done / 2**30:.2f} GiB, {done} bytes). Últimos bytes recibidos: {last}. "
                            "Revisa la red o el estado del host y vuelve a intentarlo.") from e
+    finally:
+        watchdog.stop()
     return done
 
 

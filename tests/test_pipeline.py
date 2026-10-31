@@ -1425,3 +1425,62 @@ def test_raw_img_from_the_flat_download_converts_to_qcow2(tmp_path):
     assert out.read_bytes()[:4] == b"QFI\xfb"
     info = subprocess.run(["qemu-img", "info", "--output=json", str(out)], capture_output=True, text=True).stdout
     assert json.loads(info)["virtual-size"] == 4 * 1024 * 1024
+
+
+def test_stall_watchdog_reports_where_the_frozen_thread_is_waiting():
+    import io
+    from vm2morpheus.util import StallWatchdog
+    release = threading.Event()
+    ready = threading.Event()
+
+    def frozen_worker():
+        ready.set()
+        release.wait()  # stands in for a hung socket read / SOAP call / file write
+
+    worker = threading.Thread(target=frozen_worker, daemon=True)
+    worker.start()
+    ready.wait()
+    t = {"now": 0.0}
+    out = io.StringIO()
+    wd = StallWatchdog("la descarga de x.vmdk", after=45, repeat=60, stream=out, clock=lambda: t["now"])
+    wd.tid = worker.ident
+    wd.beat(100)
+    t["now"] = 30.0
+    assert wd.check() is False and out.getvalue() == ""       # still within the grace period
+    t["now"] = 50.0
+    assert wd.check() is True
+    text = out.getvalue()
+    assert "la descarga de x.vmdk lleva 50 s sin recibir datos" in text and "esperando en" in text
+    assert "frozen_worker" in text or "release.wait" in text   # the stack names the blocked call site
+    t["now"] = 80.0
+    assert wd.check() is False                                 # not repeated before `repeat` seconds
+    t["now"] = 115.0
+    assert wd.check() is True
+    wd.beat(200)                                               # data flows again: quiet
+    t["now"] = 120.0
+    assert wd.check() is False
+    release.set()
+
+
+def test_download_starts_and_stops_its_watchdog(tmp_path, monkeypatch):
+    from vm2morpheus import util
+    from vm2morpheus.sources import vmware
+    events = []
+
+    class Spy(util.StallWatchdog):
+        def start(self):
+            events.append("start")
+            return super().start()
+
+        def beat(self, value):
+            events.append(("beat", value))
+            super().beat(value)
+
+        def stop(self):
+            events.append("stop")
+            super().stop()
+
+    monkeypatch.setattr(vmware, "StallWatchdog", Spy)
+    vmware.download_to("https://esxi/x", tmp_path / "d.vmdk", "c", False, lambda d, t: None,
+                       getter=lambda *a, **k: _FakeResponse([b"aaaa", b"bb"]))
+    assert events == ["start", ("beat", 4), ("beat", 6), "stop"]

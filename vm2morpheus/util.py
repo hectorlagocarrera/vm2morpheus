@@ -3,7 +3,9 @@ import shutil
 import string
 import sys
 import tempfile
+import threading
 import time
+import traceback
 from pathlib import Path
 
 
@@ -41,6 +43,49 @@ def resolve_secret(value):
             raise SystemExit(f"La variable de entorno {name} no está definida")
         return os.environ[name]
     return value
+
+
+class StallWatchdog:
+    """Reports where a worker thread is waiting when its progress counter stops moving.
+
+    A transfer that freezes gives no error and no clue; the stack of the frozen thread (network read, file write,
+    a SOAP call...) tells which of them it is. Reports are written to stderr, so they reach the GUI log."""
+
+    def __init__(self, label: str, after: float = 45.0, repeat: float = 60.0, poll: float = 5.0, stream=None,
+                 clock=time.monotonic, frames=sys._current_frames):
+        self.label, self.after, self.repeat, self.poll = label, after, repeat, poll
+        self.stream, self.clock, self.frames = stream, clock, frames
+        self.value, self.tid = None, None
+        self.changed = clock()
+        self.reported = float("-inf")  # nothing reported yet: the first report is due as soon as `after` passes
+        self._stop = threading.Event()
+
+    def start(self):
+        self.tid = threading.get_ident()  # the thread that is being watched
+        threading.Thread(target=self._run, daemon=True).start()
+        return self
+
+    def beat(self, value) -> None:
+        if value != self.value:
+            self.value, self.changed = value, self.clock()
+
+    def stop(self) -> None:
+        self._stop.set()
+
+    def check(self) -> bool:
+        now = self.clock()
+        if now - self.changed < self.after or now - self.reported < self.repeat:
+            return False
+        self.reported = now
+        frame = self.frames().get(self.tid)
+        where = "".join(traceback.format_stack(frame)[-3:]).rstrip() if frame is not None else "(no se pudo leer)"
+        print(f"Aviso: {self.label} lleva {now - self.changed:.0f} s sin recibir datos. El programa está esperando en:\n"
+              f"{where}", file=self.stream or sys.stderr)
+        return True
+
+    def _run(self) -> None:
+        while not self._stop.wait(self.poll):
+            self.check()
 
 
 def format_duration(seconds: float) -> str:
