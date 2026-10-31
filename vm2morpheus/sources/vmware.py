@@ -47,6 +47,15 @@ def download_to(url: str, local: Path, cookie: str, verify: bool, cb, tick=lambd
     return done
 
 
+def spread_committed(disks, committed: int) -> None:
+    """Datastore space the VM really uses (summary.storage.committed) shared over its disks by size. It is the best
+    guess available for how much an export will carry; stream-optimized VMDKs are compressed, so it is an upper bound."""
+    total = sum(d.size_bytes for d in disks)
+    if committed and total:
+        for d in disks:
+            d.used_bytes = int(committed * d.size_bytes / total)
+
+
 def note_unverified_tls(verify: bool, host: str, stream=None) -> bool:
     """ESXi/vCenter normally use a self-signed certificate, so verification is off unless the user asks for it.
     Say so once, in Spanish, instead of letting urllib3 print its English warning for every request."""
@@ -152,6 +161,7 @@ class VMwareSource(Source):
                                       path=dev.backing.fileName, index=len(disks)))
             elif isinstance(dev, vim.vm.device.VirtualEthernetCard):
                 nets.append(dev.deviceInfo.summary)
+        spread_committed(disks, int(getattr(getattr(vm.summary, "storage", None), "committed", 0) or 0))
         guest = (cfg.guestId or "").lower()
         os_family = "windows" if guest.startswith("windows") else "other" if not guest else "linux"
         return VMInfo(
@@ -218,7 +228,8 @@ class VMwareSource(Source):
                     continue
                 url = lease_url(du.url, self.api_type, esxi_host, self.host)
                 local = dest / f"{vm.name}-disk{i}.vmdk"
-                cb = progress(f"descargar {local.name}")
+                disk = next(d for d in vm.disks if d.index == i)
+                cb = progress(f"descargar {local.name}", estimate=disk.used_bytes)
                 pct = min(99, int(100 * (i + 0.5) / len(disk_urls)))
                 download_to(url, local, cookie, self.verify, cb, lambda pct=pct: keep_alive.tick(pct))
                 cb.finish()

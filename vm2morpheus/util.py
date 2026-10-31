@@ -43,14 +43,28 @@ def resolve_secret(value):
     return value
 
 
-class Progress:
-    """Callable (done, total) -> None that prints a throttled one-line progress bar."""
+def format_duration(seconds: float) -> str:
+    seconds = int(round(seconds))
+    if seconds < 60:
+        return f"{seconds} s"
+    if seconds < 3600:
+        return f"{seconds // 60} min {seconds % 60:02d} s" if seconds % 60 else f"{seconds // 60} min"
+    return f"{seconds // 3600} h {seconds % 3600 // 60:02d} min"
 
-    def __init__(self, label: str, stream=None, percent: bool = False, cancel=None, on_progress=None):
+
+class Progress:
+    """Callable (done, total) -> None that prints a throttled one-line progress bar with speed and time left.
+
+    When the real total is unknown (an ESXi export is compressed on the fly) pass `estimate`, the expected size:
+    the time left is then shown as an estimate and the percentage never reaches 100% on its own."""
+
+    def __init__(self, label: str, stream=None, percent: bool = False, cancel=None, on_progress=None,
+                 estimate: float | None = None):
         self.label = label
         self.cancel = cancel
         self.on_progress = on_progress
         self.percent = percent
+        self.estimate = estimate
         self.stream = stream or sys.stderr
         self._last = 0.0
         self._start = None
@@ -67,19 +81,36 @@ class Progress:
         if now - self._last < 0.5 and not (total and done >= total):
             return
         self._last = now
-        if total and self.on_progress:
-            self.on_progress(min(1.0, done / total))
+        fraction = done / total if total else (min(0.99, done / self.estimate) if self.estimate else None)
+        if fraction is not None and self.on_progress:
+            self.on_progress(min(1.0, fraction))
+        eta = self._eta(done, total, now)
         if total and self.percent:
-            self.stream.write(f"\r  {self.label}: {done / total:6.1%}   ")
+            self.stream.write(f"\r  {self.label}: {done / total:6.1%}{eta}   ")
         elif total:
-            self.stream.write(f"\r  {self.label}: {done / total:6.1%} ({human(done)} / {human(total)}){self._speed(done, now)}   ")
+            self.stream.write(f"\r  {self.label}: {done / total:6.1%} ({human(done)} / {human(total)})"
+                              f"{self._speed(done, now)}{eta}   ")
         else:
-            self.stream.write(f"\r  {self.label}: {human(done)}{self._speed(done, now)}   ")
+            self.stream.write(f"\r  {self.label}: {human(done)}{self._speed(done, now)}{eta}   ")
         self.stream.flush()
 
+    def _elapsed(self, now: float) -> float:
+        return now - (self._start if self._start is not None else now)
+
     def _speed(self, done: float, now: float) -> str:
-        elapsed = now - (self._start if self._start is not None else now)
+        elapsed = self._elapsed(now)
         return f" · {human(done / elapsed)}/s" if elapsed >= 1 else ""
+
+    def _eta(self, done: float, total: float | None, now: float) -> str:
+        """' · ≈ 3 min restantes' once there are a few seconds of data to extrapolate from."""
+        elapsed = self._elapsed(now)
+        if elapsed < 5 or done <= 0:
+            return ""
+        target, guessed = (total, False) if total else (self.estimate, True)
+        if not target or done >= target:
+            return ""
+        remaining = (target - done) / (done / elapsed)
+        return f" · ≈ {format_duration(remaining)} restantes" + (" (estimado)" if guessed else "")
 
     def finish(self):
         """Close the line with a summary, so it is clear the transfer ended (and how fast it was)."""
@@ -87,10 +118,11 @@ class Progress:
         if self._start is None:
             self.stream.write("\n")
         elif self.percent:
-            self.stream.write(f"\r  {self.label}: 100% · terminado en {elapsed:.0f} s   \n")
+            self.stream.write(f"\r  {self.label}: 100% · terminado en {format_duration(elapsed)}   \n")
         else:
             speed = f" · {human(self._done / elapsed)}/s" if elapsed >= 1 else ""
-            self.stream.write(f"\r  {self.label}: {human(self._done)}{speed} · terminado en {elapsed:.0f} s   \n")
+            self.stream.write(f"\r  {self.label}: {human(self._done)}{speed} · terminado en "
+                              f"{format_duration(elapsed)}   \n")
         self.stream.flush()
 
 

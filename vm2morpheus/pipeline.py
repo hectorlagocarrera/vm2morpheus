@@ -145,10 +145,11 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         n_disks = len(vm.disks)
         counter = iter(range(n_disks + 1))
 
-        def fetch_bar(label):
+        def fetch_bar(label, estimate=None):
             i = next(counter)
             tracker.update("fetch", i / n_disks)
-            return Progress(label, cancel=cancel, on_progress=lambda f, i=i: tracker.update("fetch", (i + f) / n_disks))
+            return Progress(label, cancel=cancel, estimate=estimate,
+                            on_progress=lambda f, i=i: tracker.update("fetch", (i + f) / n_disks))
 
         files = source.fetch_disks(vm, workdir, fetch_bar)
         st.mark("fetch", fetched=[str(f) for f in files])
