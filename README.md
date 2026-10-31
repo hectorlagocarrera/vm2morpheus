@@ -63,3 +63,11 @@ and a hidden console are not used in the .exe: both made antivirus engines more 
 The icon (exe, Explorer, taskbar) and the browser favicon come from the Redes globe in `assets/globe-source.png`,
 turned into a transparent globe on a white rounded tile. Regenerate them with `python tools/make_icons.py`
 (needs Pillow); it rewrites `assets/*.ico`, `assets/icon-192.png` and `vm2morpheus/icon_data.py`.
+
+
+## History and clean-up
+
+Every migration started from the GUI is written to `~/.vm2morpheus/history.json` (date, VM, source, steps and their
+durations, average download/upload speed, a throughput curve, the error if it failed). The "Histórico" tab lists them,
+shows a detail view with a chart, and exports CSV. When a migration has created the VM, a dialog asks you to test it
+and only then, on explicit confirmation, deletes the library image it uploaded (and optionally the work folder).

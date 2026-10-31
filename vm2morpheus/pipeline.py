@@ -88,7 +88,7 @@ class State:
 
 
 def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, mcfg: dict,
-            dry_run=False, log=print, cancel=None, on_progress=None) -> dict:
+            dry_run=False, log=print, cancel=None, on_progress=None, run_info: dict | None = None) -> dict:
     def check():
         if cancel is not None and cancel.is_set():
             raise CancelledError("cancelled")
@@ -173,6 +173,8 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         log(f"Nombre en Morpheus: {target!r} (en el origen es {vm.name!r})")
     gib = sum(d.used_bytes or d.size_bytes for d in vm.disks) / 2**30
     tracker = Tracker(steps, done, on_progress, weights=timings.predict_weights(steps, gib, source.timing_kind))
+    if run_info is not None:  # lets the caller (history) read the timings even if this run later fails
+        run_info.update(tracker=tracker, gib=gib, vm=vm, target=target)
 
     check()
     if not st.done("fetch"):

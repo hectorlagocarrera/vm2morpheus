@@ -41,6 +41,13 @@ class Tracker:
             self.durations[self.current] = self.durations.get(self.current, 0.0) + (now - self._since)
         self._since = None
 
+    def snapshot(self) -> dict:
+        """Durations so far, including the step that is running now (for a run that failed or was cancelled)."""
+        d = dict(self.durations)
+        if self.current is not None and self._since is not None:
+            d[self.current] = d.get(self.current, 0.0) + (self.clock() - self._since)
+        return d
+
     def begin(self, step: str) -> None:
         self._stop_clock()
         self._since = self.clock()

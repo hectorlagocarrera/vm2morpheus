@@ -1,15 +1,17 @@
 """Local web GUI (stdlib only). Binds to 127.0.0.1; credentials are never written to disk."""
 import contextlib
 import json
+import shutil
 import time
 import urllib.parse
 import threading
 import uuid
 import webbrowser
 from dataclasses import asdict
+from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import __version__, settings
+from . import __version__, history, settings
 from .icon_data import FAVICON_ICO, ICON_PNG
 from .logo import LOGO_PNG
 from .morpheus import MorpheusClient
@@ -125,11 +127,70 @@ def resolve_workdir(f: dict) -> str:
     return wd
 
 
+def done_info(job: dict) -> dict | None:
+    """What the page needs for the 'test the VM, then clean up' dialog; None unless a VM was really created."""
+    c = job.get("cleanup")
+    if not c or job.get("status") != "done":
+        return None
+    result = c["result"] or {}
+    if result.get("dry_run") or not result.get("instance") or not result.get("images"):
+        return None
+    return {"instance": result["instance"], "images": result["images"], "vm": c["vm"],
+            "morpheus_url": c["morpheus"]["url"].rstrip("/"), "history_id": job.get("history_id")}
+
+
+def cleanup(f: dict) -> dict:
+    """After the user has tested the VM: delete the library image(s) this run created and, optionally, the work
+    folder. Reports what Morpheus answered for each image: a refusal is shown, never hidden."""
+    job = JOBS.get(f.get("job"))
+    info = done_info(job) if job else None
+    if not info:
+        raise ValueError("No hay nada que limpiar en este trabajo")
+    m = job["cleanup"]["morpheus"]
+    client = MorpheusClient(m["url"], m["token"], verify=m["verify_ssl"])
+    outcome = []
+    for img in info["images"]:
+        try:
+            client.delete_image(img["id"])
+            outcome.append({"id": img["id"], "name": img["name"], "ok": True})
+        except Exception as e:  # Morpheus may refuse (image in use): pass its message on
+            outcome.append({"id": img["id"], "name": img["name"], "ok": False, "error": str(e)})
+    deleted = bool(outcome) and all(o["ok"] for o in outcome)
+    removed = False
+    if f.get("delete_workdir") and deleted:
+        removed = safe_remove_workdir(job["cleanup"]["workdir"], job["cleanup"]["vm"])
+    if info.get("history_id"):
+        history.update(info["history_id"], image_deleted=deleted, workdir_removed=removed)
+    return {"images": outcome, "image_deleted": deleted, "workdir_removed": removed}
+
+
+def safe_remove_workdir(workdir: str, vm_name: str) -> bool:
+    """Delete <workdir>/<vm_name> after a finished migration. Only that one folder, only if it is a direct child of
+    the work folder and holds our state.json: never a source disk, never anything else."""
+    root = Path(workdir).resolve()
+    target = (root / vm_name).resolve()
+    if target.parent != root or not (target / "state.json").is_file():
+        return False
+    shutil.rmtree(target)
+    return True
+
+
 def run_job(job_id: str, f: dict, dry: bool):
     job, jl = JOBS[job_id], JobLog()
     job["jl"] = jl
-    Progress.observer = lambda label, done, total, unit: job.__setitem__(
-        "transfer", {"label": label, "done": done, "total": total, "unit": unit, "t": time.time()})
+    recorder = None if dry else history.Recorder({
+        "vm": (f.get("vm") or "").strip(), "target_name": (f.get("new_vm_name") or f.get("vm") or "").strip(),
+        "source_type": f.get("source_type"), "source_host": (f.get("source_host") or "").strip(),
+        "morpheus_url": (f.get("morpheus_url") or "").strip(), "version": __version__})
+
+    def observe(label, done, total, unit):
+        job["transfer"] = {"label": label, "done": done, "total": total, "unit": unit, "t": time.time()}
+        if recorder:
+            recorder.sample(label, done, total, unit)
+
+    Progress.observer = observe
+    info: dict = {}
+    result, status, error = None, "error", None
     with RUN_LOCK, contextlib.redirect_stderr(jl):
         try:
             src_cfg, m, opts = make_cfgs(f)
@@ -137,20 +198,35 @@ def run_job(job_id: str, f: dict, dry: bool):
             source.connect()
             try:
                 client = MorpheusClient(m["url"], m["token"], verify=m["verify_ssl"])
-                migrate(source, client, f["vm"], opts, m, dry_run=dry, log=lambda s: jl.lines.append(str(s)),
-                        cancel=job["cancel"], on_progress=lambda p: job.__setitem__("progress", p))
+                result = migrate(source, client, f["vm"], opts, m, dry_run=dry, log=lambda s: jl.lines.append(str(s)),
+                                 cancel=job["cancel"], on_progress=lambda p: job.__setitem__("progress", p),
+                                 run_info=info)
             finally:
                 source.close()
+            status = "ok"
             job["status"] = "done"
+            job["cleanup"] = {"morpheus": m, "workdir": opts["workdir"], "vm": f["vm"].strip(), "result": result}
         except CancelledError:
             jl.lines.append("Migración cancelada. Lo ya descargado o convertido se conserva: al volver a pulsar "
                             "Migrar se reanuda desde ahí.")
+            status = "cancelled"
             job["status"] = "cancelled"
         except Exception as e:  # shown to the user in the log panel
             jl.lines.append(f"ERROR: {e}")
+            error = str(e)
             job["status"] = "error"
         finally:
             Progress.observer = None
+            if recorder:
+                tracker, vm = info.get("tracker"), info.get("vm")
+                recorder.meta.update(gib=round(info.get("gib", 0.0), 2), target_name=info.get("target", recorder.meta["target_name"]))
+                if vm is not None:
+                    recorder.meta.update(vcpu=vm.cpu, memory_mb=vm.memory_mb, os=vm.os_family,
+                                         disks=[{"name": d.name, "size_bytes": d.size_bytes, "used_bytes": d.used_bytes}
+                                                for d in vm.disks])
+                entry = recorder.finish(status, tracker.snapshot() if tracker else {}, error,
+                                        result if result and not result.get("dry_run") else None)
+                job["history_id"] = entry["id"]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -199,13 +275,28 @@ class Handler(BaseHTTPRequestHandler):
                 self._json({"error": str(e)}, 400)
         elif self.path == "/settings":
             self._json(settings.load())
+        elif self.path == "/history":
+            entries = history.load()
+            self._json({"entries": [history.summary_of(e) for e in reversed(entries)],
+                        "summary": history.summarize(entries)})
+        elif self.path.startswith("/history/") and self.path != "/history.csv":
+            entry = history.get(self.path[len("/history/"):])
+            self._json(entry if entry else {"error": "registro desconocido"}, 200 if entry else 404)
+        elif self.path == "/history.csv":
+            data = ("\ufeff" + history.to_csv(history.load())).encode("utf-8")  # BOM: Excel opens it as UTF-8
+            self.send_response(200)
+            self.send_header("Content-Type", "text/csv; charset=utf-8")
+            self.send_header("Content-Disposition", 'attachment; filename="vm2morpheus-historico.csv"')
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
         elif self.path.startswith("/job/"):
             job = JOBS.get(self.path[5:])
             if not job:
                 return self._json({"error": "unknown job"}, 404)
             jl = job.get("jl")
             self._json({"status": job["status"], "log": jl.text() if jl else "", "progress": job.get("progress"),
-                        "transfer": job.get("transfer")})
+                        "transfer": job.get("transfer"), "done": done_info(job)})
         else:
             self._json({"error": "not found"}, 404)
 
@@ -242,6 +333,13 @@ class Handler(BaseHTTPRequestHandler):
                     s.close()
             if self.path == "/shutdown":
                 threading.Timer(0.3, STATE["server"].shutdown).start()  # after this response has been sent
+                return self._json({"ok": True})
+            if self.path == "/cleanup":
+                return self._json(cleanup(f))
+            if self.path == "/history/delete":
+                return self._json({"ok": history.delete(f.get("id", ""))})
+            if self.path == "/history/clear":
+                history.clear()
                 return self._json({"ok": True})
             if self.path == "/cancel":
                 job = JOBS.get(f.get("job"))
@@ -351,6 +449,32 @@ input.diskchk{width:auto;margin:0 8px 0 0;vertical-align:middle}
 #picker{display:none;background:#fff;border:1px solid #b9c2cc;border-radius:8px;padding:10px;margin-top:8px}
 #picker .item{padding:5px 8px;cursor:pointer;border-radius:4px} #picker .item:hover{background:#e8eef7}
 #pickerlist{max-height:220px;overflow:auto;border:1px solid #e1e6ec;border-radius:6px;margin:6px 0}
+nav.tabs{display:flex;gap:4px;border-bottom:2px solid #d5dbe2;margin:6px 0 14px}
+button.tab{background:none;color:#4a5665;border-radius:8px 8px 0 0;margin:0;padding:8px 18px;font-size:14px;border-bottom:3px solid transparent}
+button.tab.on{color:#1d4ed8;border-bottom-color:#2563eb;font-weight:600}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:10px;margin-bottom:12px}
+.card{background:#fff;border:1px solid #d5dbe2;border-radius:10px;padding:10px 14px}
+.card b{display:block;font-size:20px;color:#1b2430} .card span{font-size:12px;color:#5d6b7b}
+.histbar{display:flex;gap:8px;align-items:center;margin-bottom:8px}
+.btnlink{font-size:12px;padding:5px 10px;border-radius:6px;background:#e5e9ee;color:#1b2430;text-decoration:none}
+table#histtable{width:100%;border-collapse:collapse;background:#fff;border:1px solid #d5dbe2;border-radius:10px;overflow:hidden;font-size:13px}
+#histtable th{text-align:left;background:#f1f4f8;padding:8px 10px;color:#4a5665;font-weight:600}
+#histtable td{padding:8px 10px;border-top:1px solid #edf0f4} #histtable tbody tr{cursor:pointer} #histtable tbody tr:hover{background:#f5f8fd}
+.badge{padding:2px 8px;border-radius:10px;font-size:12px;font-weight:600} .badge.ok{background:#dcfce7;color:#166534}
+.badge.error{background:#fee2e2;color:#991b1b} .badge.cancelled{background:#e5e7eb;color:#374151}
+#histdetail{background:#fff;border:1px solid #d5dbe2;border-radius:10px;padding:14px;margin-top:12px}
+#histdetail h3{margin:0 0 8px;font-size:16px} .facts{display:grid;grid-template-columns:repeat(auto-fit,minmax(220px,1fr));gap:4px 16px;font-size:13px;margin-bottom:10px}
+.facts span{color:#5d6b7b} .stack{display:flex;height:22px;border-radius:6px;overflow:hidden;margin:8px 0 4px}
+.stack i{display:block;height:100%} .legend{font-size:12px;color:#4a5665;margin-bottom:10px} .legend em{font-style:normal;margin-right:14px}
+.legend em::before{content:"";display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;background:var(--c)}
+#histdetail canvas{width:100%;height:170px;border:1px solid #e5e9ee;border-radius:8px;display:block}
+.errbox{background:#2a1215;color:#fca5a5;border-radius:8px;padding:8px 12px;font:12px Consolas,monospace;white-space:pre-wrap;margin:8px 0}
+#modal{position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:20;display:none;align-items:center;justify-content:center;padding:16px}
+.dialog{background:#fff;border-radius:14px;max-width:560px;width:100%;padding:22px 24px;box-shadow:0 20px 50px rgba(0,0,0,.35);max-height:90vh;overflow:auto}
+.dialog h2{margin:0 0 8px;font-size:19px} .dialog ul{margin:8px 0 12px 18px;padding:0;line-height:1.55;font-size:14px}
+.dialog .res{font-size:13px;margin:8px 0} .dialog .res.err{color:#b91c1c} .dialog .res.ok{color:#166534}
+.dialog .actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px} .dialog .actions button,.dialog .actions a{margin:0}
+.dialog label.inl{display:flex;gap:8px;align-items:center;font-size:13px;color:#1b2430;margin:6px 0} .dialog label.inl input{width:auto}
 #busywrap{display:none;margin:0 0 10px;position:sticky;top:0;z-index:5;background:#f4f6f8;padding:8px 0}
 #busyline{height:8px;background:#dfe5ec;border-radius:6px;overflow:hidden;position:relative}
 #busyline::before{content:"";position:absolute;top:0;bottom:0;width:40%;background:#2563eb;border-radius:6px;animation:slide 1.1s infinite ease-in-out}
@@ -383,6 +507,8 @@ small{color:#5d6b7b}
 <div class="brand"><img src="/logo.png" alt="Redes · 25 años innovando el futuro"><button class="sec quit" onclick="quit()">Salir del programa</button></div>
 <h1>vm2morpheus <small>Hyper-V / VMware → Morpheus (KVM) · v__VERSION__</small></h1>
 <div id="busywrap"><div id="busyline"></div><div id="busytxt"></div></div>
+<nav class="tabs"><button class="tab on" id="tabbtn-migrar" onclick="showTab('migrar')">Migrar</button><button class="tab" id="tabbtn-historico" onclick="showTab('historico')">Histórico</button></nav>
+<div id="tab-migrar">
 <fieldset><legend>1. Origen</legend><div class="row">
 <div><label>Tipo</label><select id="source_type" onchange="srcHint()"><option value="hyperv">Hyper-V</option><option value="vmware">VMware vCenter</option><option value="esxi">VMware ESXi (sin vCenter)</option></select></div>
 <div><label>Host / IP</label><input id="source_host"></div>
@@ -430,7 +556,17 @@ small{color:#5d6b7b}
 <canvas id="speedchart"></canvas>
 <div id="chartlegend"><i style="background:#2563eb"></i>Descarga<i style="background:#16a34a"></i>Subida a Morpheus</div></div>
 <div class="logbar"><b>Registro</b><span><button class="sec mini" onclick="copyLog()">Copiar</button><button class="sec mini" onclick="saveLog()">Guardar .txt</button><button class="sec mini" onclick="clearLog()">Limpiar</button></span></div>
-<div id="log" class="logbox" tabindex="0">Listo.</div></main>
+<div id="log" class="logbox" tabindex="0">Listo.</div>
+</div>
+<div id="tab-historico" style="display:none">
+<div id="histcards" class="cards"></div>
+<div class="histbar"><button class="sec mini" onclick="loadHistory()">Actualizar</button><a class="btnlink" href="/history.csv">Exportar CSV</a><button class="sec mini" onclick="clearHistory()">Borrar histórico</button></div>
+<div id="histempty" style="display:none">Todavía no hay migraciones registradas. Cada migración que lances desde la pestaña Migrar aparecerá aquí.</div>
+<table id="histtable" style="display:none"><thead><tr><th>Fecha</th><th>VM</th><th>Origen</th><th>Tamaño</th><th>Duración</th><th>Descarga</th><th>Subida</th><th>Estado</th></tr></thead><tbody></tbody></table>
+<div id="histdetail" style="display:none"></div>
+</div>
+<div id="modal" style="display:none"><div class="dialog" id="dialog"></div></div>
+</main>
 <script>
 const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","virtio_iso","vmware_method","new_vm_name","ref_instance_id","ref_image_id","workdir"];
 const chks=["verify_ssl","verify_source","compress_image","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
@@ -471,8 +607,8 @@ function feedChart(r){const t=r&&r.transfer;if(!t||t.unit!=="bytes")return;
  drawChart()}
 function niceMax(v){const e=Math.pow(10,Math.floor(Math.log10(v))),f=v/e;return(f<=1?1:f<=2?2:f<=5?5:10)*e}
 function fmtSecs(s){s=Math.round(s);return s<60?s+" s":Math.floor(s/60)+" min "+String(s%60).padStart(2,"0")+" s"}
-function drawChart(){const wrap=document.getElementById("chartwrap");if(!series.length)return;wrap.style.display="block";
- const c=document.getElementById("speedchart"),dpr=window.devicePixelRatio||1,W=c.clientWidth,H=c.clientHeight;
+function drawSeriesChart(c,series,info){if(!series.length)return;
+ const dpr=window.devicePixelRatio||1,W=c.clientWidth,H=c.clientHeight;
  c.width=W*dpr;c.height=H*dpr;const x=c.getContext("2d");x.scale(dpr,dpr);x.clearRect(0,0,W,H);
  const L=48,R=10,T=10,B=22,pw=W-L-R,ph=H-T-B;
  const maxX=Math.max(10,series[series.length-1].x),maxY=niceMax(Math.max(1,...series.map(p=>p.y))*1.1);
@@ -485,7 +621,9 @@ function drawChart(){const wrap=document.getElementById("chartwrap");if(!series.
   x.fillStyle=`rgba(${col},.18)`;x.fill();x.beginPath();x.moveTo(px(a.x),py(a.y));x.lineTo(px(b.x),py(b.y));
   x.strokeStyle=`rgb(${col})`;x.lineWidth=2;x.stroke()}
  const cur=series[series.length-1].y,avg=series.reduce((s,p)=>s+p.y,0)/series.length,max=Math.max(...series.map(p=>p.y));
- document.getElementById("chartinfo").textContent=`Ahora ${cur.toFixed(1)} MiB/s · media ${avg.toFixed(1)} · máx ${max.toFixed(1)}`}
+ if(info)info.textContent=`Ahora ${cur.toFixed(1)} MiB/s · media ${avg.toFixed(1)} · máx ${max.toFixed(1)}`}
+function drawChart(){if(!series.length)return;document.getElementById("chartwrap").style.display="block";
+ drawSeriesChart(document.getElementById("speedchart"),series,document.getElementById("chartinfo"))}
 async function post(p,b){const r=await fetch(p,{method:"POST",body:JSON.stringify(b)});const j=await r.json();if(j.error)throw new Error(j.error);return j}
 async function busy(text,fn){const w=document.getElementById("busywrap"),t=document.getElementById("busytxt");
  w.style.display="block";t.textContent=text;const t0=Date.now();
@@ -556,6 +694,60 @@ async function openPicker(path){try{const r=await fetch("/browse?path="+encodeUR
 function pickerUp(){openPicker(pickerState.parent||"")}
 function pickerUse(){if(pickerState.path){document.getElementById("workdir").value=pickerState.path;closePicker()}else show("Entra primero en un disco o carpeta.")}
 function closePicker(){document.getElementById("picker").style.display="none"}
+
+function showTab(name){for(const t of["migrar","historico"]){document.getElementById("tab-"+t).style.display=t===name?"block":"none";document.getElementById("tabbtn-"+t).classList.toggle("on",t===name)}
+ if(name==="historico")loadHistory()}
+const fmtDur=s=>{s=Math.round(s||0);return s<60?s+" s":s<3600?Math.floor(s/60)+" min "+String(s%60).padStart(2,"0")+" s":Math.floor(s/3600)+" h "+String(Math.floor(s%3600/60)).padStart(2,"0")+" min"};
+const fmtMibs=v=>v?v.toFixed(1)+" MiB/s":"–";
+const esc=t=>String(t==null?"":t).replace(/[&<>"]/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const STATUS={ok:["✔ Correcta","ok"],error:["✖ Error","error"],cancelled:["■ Cancelada","cancelled"]};
+const STEPLBL={fetch:"Descarga",convert:"Conversión",drivers:"Drivers",upload:"Subida",instance:"Crear VM"};
+const STEPCOL={fetch:"#2563eb",convert:"#7c3aed",drivers:"#d97706",upload:"#16a34a",instance:"#0891b2"};
+async function loadHistory(){try{const j=await (await fetch("/history")).json();renderCards(j.summary);
+ const rows=j.entries;document.getElementById("histempty").style.display=rows.length?"none":"block";
+ const tbl=document.getElementById("histtable");tbl.style.display=rows.length?"table":"none";
+ tbl.querySelector("tbody").innerHTML=rows.map(e=>{const st=STATUS[e.status]||[e.status,""],sp=e.speeds_mib_s||{};
+  return `<tr onclick="showDetail('${esc(e.id)}')"><td>${esc((e.started||"").replace("T"," "))}</td><td>${esc(e.vm)}${e.target_name&&e.target_name!==e.vm?" → "+esc(e.target_name):""}</td><td>${esc(e.source_type)} ${esc(e.source_host)}</td><td>${e.gib?e.gib.toFixed(1)+" GiB":"–"}</td><td>${fmtDur(e.total_seconds)}</td><td>${fmtMibs(sp.fetch)}</td><td>${fmtMibs(sp.upload)}</td><td><span class="badge ${st[1]}">${st[0]}</span></td></tr>`}).join("");
+ document.getElementById("histdetail").style.display="none"}catch(e){show("ERROR: "+e.message)}}
+function renderCards(s){const c=(v,l)=>`<div class="card"><b>${v}</b><span>${l}</span></div>`;
+ document.getElementById("histcards").innerHTML=c(s.runs,"migraciones registradas")+c(s.ok+" ("+(s.runs?Math.round(100*s.ok/s.runs):0)+"%)","correctas")+c(s.gib_moved.toFixed(1)+" GiB","datos subidos a Morpheus")+c(fmtMibs(s.avg_download),"descarga media")+c(fmtMibs(s.avg_upload),"subida media")+c(s.avg_seconds?fmtDur(s.avg_seconds):"–","duración media")}
+async function showDetail(id){const e=await (await fetch("/history/"+id)).json(),box=document.getElementById("histdetail");
+ const st=STATUS[e.status]||[e.status,""],steps=Object.entries(e.steps||{}).filter(([,v])=>v>0),total=steps.reduce((a,[,v])=>a+v,0)||1;
+ box.innerHTML=`<h3>${esc(e.vm)} <span class="badge ${st[1]}">${st[0]}</span></h3>
+ <div class="facts"><div><span>Inicio:</span> ${esc((e.started||"").replace("T"," "))}</div><div><span>Duración total:</span> ${fmtDur(e.total_seconds)}</div>
+ <div><span>Origen:</span> ${esc(e.source_type)} ${esc(e.source_host)}</div><div><span>Destino:</span> ${esc(e.morpheus_url)}</div>
+ <div><span>Nombre en Morpheus:</span> ${esc(e.target_name)}</div><div><span>Recursos:</span> ${esc(e.vcpu||"?")} vCPU · ${esc(e.memory_mb||"?")} MiB · ${esc(e.os||"")}</div>
+ <div><span>Discos:</span> ${(e.disks||[]).map(d=>esc(d.name)+" ("+(d.size_bytes/1073741824).toFixed(0)+" GiB)").join(", ")||"–"}</div><div><span>Instancia creada:</span> ${e.instance&&e.instance.id?"id "+esc(e.instance.id):"no"}</div>
+ <div><span>Imagen borrada de la biblioteca:</span> ${e.image_deleted?"sí":"no"}</div><div><span>Versión:</span> ${esc(e.version||"?")}</div></div>
+ ${steps.length?`<div class="stack">${steps.map(([k,v])=>`<i title="${STEPLBL[k]||k}: ${fmtDur(v)}" style="width:${100*v/total}%;background:${STEPCOL[k]||"#64748b"}"></i>`).join("")}</div><div class="legend">${steps.map(([k,v])=>`<em style="--c:${STEPCOL[k]||"#64748b"}">${STEPLBL[k]||k}: ${fmtDur(v)}</em>`).join("")}</div>`:""}
+ ${(e.series||[]).length?`<canvas id="histchart"></canvas><div id="histchartinfo" style="font-size:12px;color:#4a5665;margin-top:4px"></div><div class="legend" style="margin-top:4px"><em style="--c:#2563eb">Descarga</em><em style="--c:#16a34a">Subida</em></div>`:""}
+ ${e.error?`<div class="errbox">${esc(e.error)}</div>`:""}
+ <button class="sec mini" onclick="deleteEntry('${esc(e.id)}')">Eliminar este registro</button>`;
+ box.style.display="block";if((e.series||[]).length)drawSeriesChart(document.getElementById("histchart"),e.series,document.getElementById("histchartinfo"));
+ box.scrollIntoView({behavior:"smooth",block:"nearest"})}
+async function deleteEntry(id){if(!confirm("¿Eliminar este registro del histórico?"))return;await post("/history/delete",{id});loadHistory()}
+async function clearHistory(){if(!confirm("¿Borrar TODO el histórico? No se puede deshacer."))return;await post("/history/clear",{});loadHistory()}
+// ---- after a migration that created a VM: test it, then (only if the user says so) delete the library image
+const doneShown=new Set();let delArmed=false;
+function showDoneDialog(jobId,d){const imgs=d.images.map(i=>esc(i.name)+" (id "+i.id+")").join(", "),link=esc(d.morpheus_url+"/provisioning/instances/"+d.instance.id);
+ document.getElementById("dialog").innerHTML=`<h2>✔ Migración terminada: prueba la VM</h2>
+ <p>La VM <b>${esc(d.instance.name||d.vm)}</b> ya está creada en Morpheus. <b>Antes de limpiar nada, compruébala:</b></p>
+ <ul><li>Arranca y puedes entrar con tu usuario (usa la consola de Morpheus).</li><li>Tiene red y sus servicios responden.</li><li>Los discos y los datos están completos.</li></ul>
+ <p style="font-size:13px;color:#4a5665">Cuando funcione, puedes borrar de la biblioteca de Morpheus la imagen que se subió solo para crearla (${imgs}). <b>El borrado no se puede deshacer.</b> Si Morpheus la considera en uso, te enseñaré lo que conteste.</p>
+ <label class="inl"><input type="checkbox" id="dlgwork" checked> Borrar también la carpeta de trabajo de esta VM (solo guarda el progreso)</label>
+ <div id="dlgres"></div>
+ <div class="actions"><a class="btnlink" href="${link}" target="_blank" rel="noopener">Abrir la instancia en Morpheus</a>
+ <button class="danger" id="dlgdel" onclick="confirmDelete('${esc(jobId)}')">La VM funciona: borrar la imagen</button>
+ <button class="sec" onclick="closeDialog()">Todavía no, mantener la imagen</button></div>`;
+ delArmed=false;document.getElementById("modal").style.display="flex"}
+async function confirmDelete(jobId){const b=document.getElementById("dlgdel");
+ if(!delArmed){delArmed=true;b.textContent="Pulsa otra vez para confirmar el borrado";return}
+ b.disabled=true;
+ try{const r=await post("/cleanup",{job:jobId,delete_workdir:document.getElementById("dlgwork").checked});
+  document.getElementById("dlgres").innerHTML=r.images.map(i=>i.ok?`<div class="res ok">✔ Imagen ${esc(i.name)} (id ${i.id}) borrada de la biblioteca.</div>`:`<div class="res err">✖ No se pudo borrar ${esc(i.name)} (id ${i.id}): ${esc(i.error)}</div>`).join("")+(r.workdir_removed?`<div class="res ok">✔ Carpeta de trabajo borrada.</div>`:"");
+  delArmed=false;if(r.image_deleted)b.style.display="none";else{b.disabled=false;b.textContent="Reintentar el borrado"}}
+ catch(e){document.getElementById("dlgres").innerHTML=`<div class="res err">${esc(e.message)}</div>`;b.disabled=false;delArmed=false}}
+function closeDialog(){document.getElementById("modal").style.display="none";delArmed=false}
 let currentJob=null;
 function drawBar(r){const w=document.getElementById("barwrap"),b=document.getElementById("bar"),l=document.getElementById("barlabel");
  const p=r.progress;if(!p&&r.status==="running"){return}w.style.display="block";
@@ -568,7 +760,7 @@ function drawBar(r){const w=document.getElementById("barwrap"),b=document.getEle
 async function cancelJob(){if(!currentJob)return;document.getElementById("cancelbtn").disabled=true;try{await post("/cancel",{job:currentJob})}catch(e){show("ERROR: "+e.message)}}
 async function run(p){try{await persist();const {job}=await post(p,form());currentJob=job;show("Trabajo "+job+" en marcha...");
  const btn=document.getElementById("cancelbtn");btn.style.display="inline-block";btn.disabled=false;resetChart();document.getElementById("barwrap").style.display="none";
- const t=setInterval(async()=>{const r=await (await fetch("/job/"+job)).json();show(r.log||"...");drawBar(r);feedChart(r);if(r.status!=="running"){clearInterval(t);btn.style.display="none";currentJob=null}},1000)}catch(e){show("ERROR: "+e.message)}}
+ const t=setInterval(async()=>{const r=await (await fetch("/job/"+job)).json();show(r.log||"...");drawBar(r);feedChart(r);if(r.status==="done"&&r.done&&!doneShown.has(job)){doneShown.add(job);showDoneDialog(job,r.done)}if(r.status!=="running"){clearInterval(t);btn.style.display="none";currentJob=null}},1000)}catch(e){show("ERROR: "+e.message)}}
 srcHint();
 (async()=>{try{saved=await (await fetch("/settings")).json();
  ids.forEach(i=>{if(saved[i]!==undefined&&document.getElementById(i).tagName==="INPUT"||saved[i]!==undefined&&["source_type","os_family","vmware_method"].includes(i))document.getElementById(i).value=saved[i]});

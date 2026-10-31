@@ -57,6 +57,17 @@ class FakeMorpheus(BaseHTTPRequestHandler):
             return self._send({"success": True, "instance": {"id": 42, "name": "vm1"}})
         self._send({"success": False, "msg": "nope"}, 404)
 
+    refuse_delete = False
+    deleted = []
+
+    def do_DELETE(self):
+        if self.path.startswith("/api/virtual-images/"):
+            if self.refuse_delete:
+                return self._send({"success": False, "msg": "Image is in use by instance 37"}, 400)
+            type(self).deleted.append(self.path)
+            return self._send({"success": True})
+        self._send({"success": False, "msg": "nope"}, 404)
+
     def do_GET(self):
         if self.path.startswith("/api/library/instance-types"):
             if self.no_library:
@@ -1909,3 +1920,254 @@ def test_page_uses_the_globe_as_favicon_and_the_build_embeds_it_in_the_exe():
     assert '<link rel="icon" href="/logo.png">' not in page   # the wide logo is no longer used as the tab icon
     wf = open(".github/workflows/build-exe.yml", encoding="utf-8").read()
     assert "--icon assets/vm2morpheus.ico" in wf
+
+
+# ---------------------------------------------------------------- history
+def _clock(values):
+    it = iter(values)
+    return lambda: next(it)
+
+
+def test_recorder_turns_samples_into_speeds_bytes_and_a_curve():
+    from vm2morpheus import history
+    MiB = 1024 * 1024
+    # started at t=1000; a download at 10 MiB/s for 2 samples, then an upload at 40 MiB/s
+    rec = history.Recorder({"vm": "w2k16", "gib": 1.0}, clock=_clock([1000.0, 1002.0, 1004.0, 1010.0, 1011.0, 1012.0, 1020.0]))
+    rec.sample("descargar d.vmdk", 0, None, "bytes")        # t=1002
+    rec.sample("descargar d.vmdk", 20 * MiB, None, "bytes")  # t=1004
+    rec.sample("convertir d", 50, 100, "percent")            # t=1010 (not a byte transfer: ignored)
+    rec.sample("subir d.qcow2", 0, 100 * MiB, "bytes")       # t=1011
+    rec.sample("subir d.qcow2", 40 * MiB, 100 * MiB, "bytes")  # t=1012
+    entry = rec.finish("ok", {"fetch": 4.0, "upload": 2.0, "convert": 3.0}, result={"instance": {"id": 7}, "images": [{"id": 1}]})
+    assert entry["status"] == "ok" and entry["vm"] == "w2k16" and entry["total_seconds"] == 20.0
+    assert entry["bytes"] == {"fetch": 20 * MiB, "upload": 40 * MiB}
+    assert entry["speeds_mib_s"] == {"fetch": 5.0, "upload": 20.0}          # bytes / time spent in that step
+    assert [p["up"] for p in entry["series"]] == [False, True]
+    assert entry["series"][0]["y"] == pytest.approx(10.0) and entry["series"][1]["y"] == pytest.approx(40.0)
+    assert entry["instance"] == {"id": 7} and history.get(entry["id"])["vm"] == "w2k16"   # persisted
+
+
+def test_failed_runs_are_recorded_with_their_error():
+    from vm2morpheus import history
+    rec = history.Recorder({"vm": "x"}, clock=_clock([0.0, 5.0]))
+    e = rec.finish("error", {"fetch": 3.0}, error="Falló PowerShell: algo")
+    assert e["status"] == "error" and e["error"] == "Falló PowerShell: algo" and e["speeds_mib_s"] == {}
+    assert history.load()[-1]["id"] == e["id"]
+
+
+def test_history_is_capped_deletable_and_survives_a_corrupt_file():
+    from vm2morpheus import history
+    for i in range(history.MAX_ENTRIES + 5):
+        history.add({"id": f"e{i}", "status": "ok"})
+    entries = history.load()
+    assert len(entries) == history.MAX_ENTRIES and entries[0]["id"] == "e5"       # oldest dropped first
+    assert history.delete("e10") is True and history.delete("nope") is False
+    assert history.update("e11", image_deleted=True) and history.get("e11")["image_deleted"] is True
+    history.clear()
+    assert history.load() == []
+    history.PATH.write_text("{not json")
+    assert history.load() == []                                                   # corrupt file: start empty
+    history.add({"id": "again"})
+    assert [e["id"] for e in history.load()] == ["again"]
+
+
+def test_downsample_keeps_the_phase_and_the_overall_shape():
+    from vm2morpheus.history import downsample
+    pts = [{"x": float(i), "y": 10.0 if i < 500 else 40.0, "up": i >= 500} for i in range(1000)]
+    out = downsample(pts, 100)
+    assert len(out) <= 100 and out[0]["up"] is False and out[-1]["up"] is True
+    assert out[0]["y"] == pytest.approx(10.0) and out[-1]["y"] == pytest.approx(40.0)
+    assert downsample(pts[:50], 100) == pts[:50]                                   # short curves untouched
+
+
+def test_summary_and_csv():
+    from vm2morpheus import history
+    GiB = 1024 ** 3
+    entries = [
+        {"id": "a", "status": "ok", "started": "2026-10-31T10:00:00", "vm": "w2k16", "target_name": "w2k16", "source_type": "esxi",
+         "source_host": "esxi1", "gib": 5.3, "total_seconds": 2400, "bytes": {"upload": 10 * GiB},
+         "speeds_mib_s": {"fetch": 4.0, "upload": 26.0}, "instance": {"id": 37}, "image_deleted": True},
+        {"id": "b", "status": "error", "vm": "w2k19", "error": "boom; con punto y coma", "total_seconds": 60},
+    ]
+    s = history.summarize(entries)
+    assert s["runs"] == 2 and s["ok"] == 1 and s["gib_moved"] == pytest.approx(10.0)
+    assert s["avg_download"] == 4.0 and s["avg_upload"] == 26.0 and s["avg_seconds"] == 2400
+    rows = history.to_csv(entries).strip().splitlines()
+    assert rows[0].startswith("fecha;estado;vm_origen") and "w2k16;w2k16;esxi:esxi1;5.30;2400;4.0;26.0;37;sí" in rows[1]
+    assert '"boom; con punto y coma"' in rows[2]                                  # quoted, so the CSV stays valid
+
+
+def test_migrate_exposes_the_tracker_even_when_the_run_fails(tmp_path):
+    from vm2morpheus import pipeline
+    info = {}
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    with pytest.raises(Exception):
+        pipeline.migrate(FakeSource(disk), MorpheusClient("http://127.0.0.1:1", "t"), "vm1",
+                         {"workdir": str(tmp_path / "w50"), "shutdown_source": True}, {"image_type": "qcow2"},
+                         log=lambda *_: None, run_info=info)                      # no Morpheus listening: the upload fails
+    assert info["vm"].name == "vm1" and info["target"] == "vm1" and info["gib"] > 0
+    assert set(info["tracker"].snapshot()) >= {"fetch", "convert"}                # the finished steps were timed
+
+
+# ------------------------------------------------- GUI: history recording and the clean-up after a migration
+def _form(tmp_path, port, **extra):
+    return {"vm": "vm1", "morpheus_url": f"http://127.0.0.1:{port}", "morpheus_token": "tok", "source_type": "esxi",
+            "source_host": "esxi1", "source_user": "root", "source_password": "pw", "shutdown": True,
+            "ref_instance_id": "5", "workdir": str(tmp_path / "work"), **extra}
+
+
+def _run_job(tmp_path, monkeypatch, **extra):
+    """Run gui.run_job against the fake source and the fake Morpheus; returns (job_id, job)."""
+    from vm2morpheus import gui
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    monkeypatch.setattr(gui, "make_source", lambda cfg: FakeSource(disk))
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    jid = uuid_hex()
+    gui.JOBS[jid] = {"status": "running", "cancel": threading.Event()}
+    cancel_first = extra.pop("_cancel", False)
+    if cancel_first:
+        gui.JOBS[jid]["cancel"].set()
+    try:
+        gui.run_job(jid, _form(tmp_path, srv.server_port, **extra), False)
+    finally:
+        srv.shutdown()
+    return jid, gui.JOBS[jid]
+
+
+def uuid_hex():
+    import uuid
+    return uuid.uuid4().hex[:8]
+
+
+def test_a_successful_gui_run_is_written_to_the_history(tmp_path, monkeypatch):
+    from vm2morpheus import gui, history
+    FakeMorpheus.log.clear()
+    jid, job = _run_job(tmp_path, monkeypatch)
+    assert job["status"] == "done"
+    entry = history.get(job["history_id"])
+    assert entry["status"] == "ok" and entry["vm"] == "vm1" and entry["source_host"] == "esxi1"
+    assert entry["instance"]["id"] == 42 and entry["images"] and entry["bytes"]["upload"] > 0
+    assert {"fetch", "convert", "upload"} <= set(entry["steps"]) and entry["vcpu"] == 2 and entry["disks"]
+    info = gui.done_info(job)
+    assert info["instance"]["id"] == 42 and info["history_id"] == entry["id"] and info["vm"] == "vm1"
+
+
+def test_failed_and_cancelled_gui_runs_are_recorded_too(tmp_path, monkeypatch):
+    from vm2morpheus import history
+    jid, job = _run_job(tmp_path, monkeypatch, vm="   ")        # a missing VM name fails before anything starts
+    assert job["status"] == "error"
+    failed = history.get(job["history_id"])
+    assert failed["status"] == "error" and "nombre de la VM" in failed["error"]
+    jid2, job2 = _run_job(tmp_path, monkeypatch, _cancel=True)
+    cancelled = history.get(job2["history_id"])
+    assert job2["status"] == "cancelled" and cancelled["status"] == "cancelled"
+
+
+def test_done_info_is_only_offered_when_a_vm_was_really_created():
+    from vm2morpheus import gui
+    base = {"morpheus": {"url": "https://m/"}, "vm": "vm1", "workdir": "x"}
+    ok = {"status": "done", "cleanup": {**base, "result": {"instance": {"id": 1}, "images": [{"id": 2, "name": "n"}]}}}
+    assert gui.done_info(ok)["morpheus_url"] == "https://m"
+    assert gui.done_info({**ok, "status": "error"}) is None
+    assert gui.done_info({"status": "done", "cleanup": {**base, "result": {"dry_run": True}}}) is None
+    assert gui.done_info({"status": "done", "cleanup": {**base, "result": {"instance": None, "images": [{"id": 2}]}}}) is None
+    assert gui.done_info({"status": "done"}) is None
+
+
+def test_cleanup_deletes_the_image_and_the_work_folder_and_updates_the_history(tmp_path, monkeypatch):
+    from vm2morpheus import gui, history
+    FakeMorpheus.log.clear()
+    FakeMorpheus.deleted.clear()
+    FakeMorpheus.refuse_delete = False
+    jid, job = _run_job(tmp_path, monkeypatch)
+    port = job["cleanup"]["morpheus"]["url"].rsplit(":", 1)[1]
+    srv = HTTPServer(("127.0.0.1", int(port)), FakeMorpheus)  # same URL again: the run's server was shut down
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        out = gui.cleanup({"job": jid, "delete_workdir": True})
+    finally:
+        srv.shutdown()
+    assert out["image_deleted"] is True and out["workdir_removed"] is True and out["images"][0]["ok"]
+    assert FakeMorpheus.deleted == ["/api/virtual-images/7"]
+    assert not (tmp_path / "work" / "vm1").exists()
+    entry = history.get(job["history_id"])
+    assert entry["image_deleted"] is True and entry["workdir_removed"] is True
+
+
+def test_cleanup_reports_a_refusal_from_morpheus_and_keeps_the_work_folder(tmp_path, monkeypatch):
+    from vm2morpheus import gui, history
+    FakeMorpheus.deleted.clear()
+    jid, job = _run_job(tmp_path, monkeypatch)
+    port = int(job["cleanup"]["morpheus"]["url"].rsplit(":", 1)[1])
+    FakeMorpheus.refuse_delete = True
+    srv = HTTPServer(("127.0.0.1", port), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        out = gui.cleanup({"job": jid, "delete_workdir": True})
+    finally:
+        srv.shutdown()
+        FakeMorpheus.refuse_delete = False
+    assert out["image_deleted"] is False and out["workdir_removed"] is False
+    assert "Image is in use by instance 37" in out["images"][0]["error"]        # Morpheus' own words, not hidden
+    assert (tmp_path / "work" / "vm1" / "state.json").exists()
+    assert history.get(job["history_id"])["image_deleted"] is False
+
+
+def test_cleanup_refuses_when_there_is_nothing_to_clean():
+    from vm2morpheus import gui
+    with pytest.raises(ValueError, match="nada que limpiar"):
+        gui.cleanup({"job": "does-not-exist"})
+
+
+def test_safe_remove_workdir_only_touches_the_one_state_folder(tmp_path):
+    from vm2morpheus.gui import safe_remove_workdir
+    work = tmp_path / "work"
+    (work / "vm1").mkdir(parents=True)
+    (work / "vm1" / "state.json").write_text("{}")
+    (work / "keepme").mkdir()
+    (work / "keepme" / "important.vhdx").write_text("source disk")
+    (tmp_path / "outside").mkdir()
+    (tmp_path / "outside" / "state.json").write_text("{}")
+    assert safe_remove_workdir(str(work), "keepme") is False          # no state.json: not ours
+    assert safe_remove_workdir(str(work), "../outside") is False      # not a direct child of the work folder
+    assert safe_remove_workdir(str(work), "missing") is False
+    assert (work / "keepme" / "important.vhdx").exists() and (tmp_path / "outside" / "state.json").exists()
+    assert safe_remove_workdir(str(work), "vm1") is True and not (work / "vm1").exists()
+
+
+def test_history_endpoints_over_http(tmp_path):
+    import urllib.request
+    from vm2morpheus import gui, history
+    history.add({"id": "aa11", "status": "ok", "vm": "w2k16", "started": "2026-10-31T10:00:00", "total_seconds": 60,
+                 "gib": 5.3, "speeds_mib_s": {"fetch": 4.0, "upload": 26.0}, "bytes": {"upload": 10 * 1024 ** 3},
+                 "series": [{"x": 1.0, "y": 5.0, "up": False}]})
+    history.add({"id": "bb22", "status": "error", "vm": "w2k19", "error": "boom"})
+    srv = HTTPServer(("127.0.0.1", 0), gui.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    base = f"http://127.0.0.1:{srv.server_port}"
+    try:
+        listing = json.loads(urllib.request.urlopen(base + "/history").read())
+        assert [e["id"] for e in listing["entries"]] == ["bb22", "aa11"]          # newest first
+        assert all("series" not in e for e in listing["entries"]) and listing["summary"]["runs"] == 2
+        assert json.loads(urllib.request.urlopen(base + "/history/aa11").read())["series"][0]["y"] == 5.0
+        csv_resp = urllib.request.urlopen(base + "/history.csv")
+        assert csv_resp.headers["Content-Type"].startswith("text/csv") and csv_resp.read().startswith(b"\xef\xbb\xbffecha;")
+        post = lambda path, body: json.loads(urllib.request.urlopen(urllib.request.Request(  # noqa: E731
+            base + path, data=json.dumps(body).encode(), method="POST")).read())
+        assert post("/history/delete", {"id": "bb22"}) == {"ok": True} and post("/history/delete", {"id": "zz"}) == {"ok": False}
+        assert [e["id"] for e in history.load()] == ["aa11"]
+        assert post("/history/clear", {}) == {"ok": True} and history.load() == []
+    finally:
+        srv.shutdown()
+
+
+def test_page_has_the_history_tab_and_the_two_step_delete_dialog():
+    from vm2morpheus import gui
+    page = gui.render_page()
+    for needle in ('id="tab-historico"', 'id="tabbtn-historico"', "function loadHistory", "function showDetail",
+                   "function showDoneDialog", "Pulsa otra vez para confirmar el borrado", "Reintentar el borrado",
+                   "El borrado no se puede deshacer", 'href="/history.csv"', "function drawSeriesChart"):
+        assert needle in page
