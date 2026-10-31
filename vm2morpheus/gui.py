@@ -212,7 +212,8 @@ class Handler(BaseHTTPRequestHandler):
                     "layouts": layouts, "pools": pools,
                     "clouds": [(z["id"], z["name"]) for z in c.clouds()],
                     "groups": [(g["id"], g["name"]) for g in c._req("GET", "/api/groups", params={"max": 200}).get("groups", [])],
-                    "plans": [(p["id"], p["name"]) for p in plans.get("servicePlans", [])],
+                    "plans": [(p["id"], p["name"], p.get("maxCores"), p.get("maxMemory")) for p in plans.get("servicePlans", [])
+                              if "discover" not in f'{p.get("code", "")} {p.get("name", "")}'.lower()],
                     "instances": [(i["id"], i["name"]) for i in c._req("GET", "/api/instances", params={"max": 200}).get("instances", [])],
                     "networks": [(n["id"], n["name"]) for n in c._req("GET", "/api/networks", params={"max": 200}).get("networks", [])],
                 })
@@ -394,7 +395,7 @@ small{color:#5d6b7b}
 <button class="sec" data-busy onclick="refinfo()">Ver instancia de referencia (JSON)</button>
 <details open><summary><small>Sin instancia de referencia: crear desde cero (rellena nube, grupo, plan, red y layout)</small></summary>
 <div class="row"><div><label>Nube</label><select id="cloud_id"></select></div><div><label>Grupo</label><select id="group_id"></select></div>
-<div><label>Plan</label><select id="plan_id"></select></div><div><label>Red <small>(obligatoria)</small></label><select id="network_id"></select></div>
+<div><label>Plan <small id="planhint"></small></label><select id="plan_id" onchange="planTouched=true"></select></div><div><label>Red <small>(obligatoria)</small></label><select id="network_id"></select></div>
 <div><label>Instance type (código)</label><input id="instance_type" value="mvm"></div><div><label>Layout <small>(automático: Single HVM)</small></label><select id="layout_id"><option value="">(automático)</option></select></div><div><label>Resource pool <small>(automático)</small></label><select id="resource_pool"><option value="">(automático)</option></select></div></div></details></fieldset>
 <fieldset><legend>4. Opciones</legend><div class="chk">
 <label><input type="checkbox" id="shutdown"> Apagar la VM de origen</label>
@@ -488,7 +489,17 @@ async function analyze(force){const vm=document.getElementById("vm").value.trim(
  if(!force&&analyzedVm===vm)return; // same VM: keep the disks the user ticked
  try{await persist();const j=await busy("Analizando la VM …",()=>post("/inspect",form()));analyzedVm=vm;renderDisks(j)}
  catch(e){document.getElementById("diskpanel").style.display="none";analyzedVm=null;show("ERROR: "+e.message)}}
-function renderDisks(j){document.getElementById("diskpanel").style.display="block";
+let planTouched=false,lastSpec=null;
+// Choose the plan that matches the source VM (exact cores+memory, else the smallest one that is big enough).
+function pickPlan(){const sel=document.getElementById("plan_id"),hint=document.getElementById("planhint");if(!lastSpec)return;
+ const need=lastSpec.mem*1048576,opts=[...sel.options].filter(o=>o.dataset.cores);
+ if(!opts.length){hint.textContent="";return}
+ let best=opts.find(o=>+o.dataset.cores===lastSpec.cpu&&+o.dataset.mem===need);
+ const exact=!!best;
+ if(!best)best=opts.filter(o=>+o.dataset.cores>=lastSpec.cpu&&+o.dataset.mem>=need).sort((a,b)=>(+a.dataset.mem-+b.dataset.mem)||(+a.dataset.cores-+b.dataset.cores))[0];
+ if(best){sel.value=best.value;hint.textContent=exact?"(coincide con la VM original)":"(el más pequeño que cubre la VM original)"}
+ else hint.textContent="(ningún plan cubre "+lastSpec.cpu+" vCPU y "+lastSpec.mem+" MiB: elige uno)"}
+function renderDisks(j){lastSpec={cpu:j.cpu,mem:j.memory_mb};if(!planTouched)pickPlan();document.getElementById("diskpanel").style.display="block";
  document.getElementById("diskinfo").innerHTML=`<b>${j.name}</b>: ${j.cpu} vCPU, ${(j.memory_mb/1024).toFixed(1)} GiB RAM, ${j.firmware.toUpperCase()}, ${j.power_state==="on"?"encendida":"apagada"}, ${j.disks.length} disco(s)`;
  document.getElementById("disklist").innerHTML=j.disks.map(d=>`<label style="display:block;color:#1b2430;font-size:14px"><input type="checkbox" class="diskchk" value="${d.index}" checked onchange="disksChanged()"> ${d.name} — ${gib(d.size_bytes)} provisionados${d.used_bytes?` (${gib(d.used_bytes)} usados)`:""}</label>`).join("");
  disksChanged()}
@@ -509,7 +520,8 @@ setInterval(()=>fetch("/ping").catch(()=>{}),5000);fetch("/ping").catch(()=>{});
 async function refinfo(){try{show(JSON.stringify(await busy("Leyendo la instancia de referencia …",()=>post("/refinfo",form())),null,2))}catch(e){show("ERROR: "+e.message)}}
 async function lookups(){try{await persist();const j=await busy("Cargando datos de Morpheus …",()=>post("/lookups",form()));
  for(const [k,id] of [["clouds","cloud_id"],["groups","group_id"],["plans","plan_id"],["networks","network_id"],["instances","ref_instance_id"]]){
-  const s=document.getElementById(id);s.innerHTML=(id=="ref_instance_id"?'<option value="">(ninguna)</option>':id=="network_id"?'<option value="">(elige una red)</option>':'')+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id];else if(id=="network_id"&&j[k].length===1)s.value=j[k][0][0]}
+  const s=document.getElementById(id);s.innerHTML=(id=="ref_instance_id"?'<option value="">(ninguna)</option>':id=="network_id"?'<option value="">(elige una red)</option>':'')+j[k].map(([v,n,c,m])=>`<option value="${v}"${c?` data-cores="${c}" data-mem="${m}"`:""}>${n}</option>`).join("");if(saved[id])s.value=saved[id];else if(id=="network_id"&&j[k].length===1)s.value=j[k][0][0]}
+ if(lastSpec&&!planTouched)pickPlan()
   for(const [k,id] of [["layouts","layout_id"],["pools","resource_pool"]]){const s=document.getElementById(id);s.innerHTML='<option value="">(automático)</option>'+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id]}
  show("Datos cargados.")}catch(e){show("ERROR: "+e.message)}}
 const SEP=String.fromCharCode(92);

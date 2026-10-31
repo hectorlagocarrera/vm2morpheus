@@ -67,6 +67,9 @@ class FakeMorpheus(BaseHTTPRequestHandler):
             return self._send({"success": True, "instanceTypes": [{"id": 10, "code": "mvm"}]})
         if self.path.startswith("/api/zones/1/resource-pools"):
             return self._send({"success": True, "resourcePools": [{"id": 1, "name": "ClusterLab01", "active": True}]})
+        if self.path.startswith("/api/service-plans/6"):
+            return self._send({"success": True, "servicePlan": {"id": 6, "name": "1 CPU, 512MB Memory", "maxCores": 1,
+                                                                "maxMemory": 536870912}})
         if self.path.startswith("/api/virtual-images?"):
             hit = [{"id": 5, "name": self.existing_image_name}] if self.existing_image_name else []
             return self._send({"success": True, "virtualImages": hit})
@@ -1741,4 +1744,37 @@ def test_page_follows_the_source_name_until_the_user_types_their_own():
     page = render_page()
     for needle in ('id="new_vm_name"', "function syncNewName", "newNameTouched=true", "(elige una red)",
                    "Red <small>(obligatoria)</small>"):
+        assert needle in page
+
+
+def test_plan_shortfall_message():
+    from vm2morpheus.pipeline import plan_shortfall
+    small = {"name": "Discovered Instance", "maxCores": 1, "maxMemory": 512 * 2**20}
+    text = plan_shortfall(small, cpu=2, memory_mb=8192)
+    assert "Aviso: el plan 'Discovered Instance' da 1 CPU y 512.0 MiB" in text and "2 vCPU y 8192 MiB" in text
+    assert plan_shortfall({"name": "ok", "maxCores": 2, "maxMemory": 8192 * 2**20}, 2, 8192) is None
+    assert plan_shortfall({"name": "bigger", "maxCores": 4, "maxMemory": 16384 * 2**20}, 2, 8192) is None
+    assert plan_shortfall({"name": "unknown size"}, 2, 8192) is None   # nothing to compare: stay quiet
+    assert plan_shortfall(None, 2, 8192) is None
+
+
+def test_the_run_warns_when_the_chosen_plan_is_smaller_than_the_vm(tmp_path):
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    FakeMorpheus.log.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    msgs = []
+    migrate(FakeSource(disk), _client(srv), "vm1", {"workdir": str(tmp_path / "w33"), "shutdown_source": True},
+            {"image_type": "qcow2", "reference_instance": {"instance_id": 5, "image_id": 3}}, log=msgs.append)
+    srv.shutdown()
+    # FakeSource is a 2 vCPU / 2048 MiB VM; fake plan 6 gives 1 CPU / 512 MiB
+    assert any(m.startswith("Aviso: el plan '1 CPU, 512MB Memory' da 1 CPU y 512.0 MiB") for m in msgs)
+    assert "instance" in dict(FakeMorpheus.log)   # a warning, never a block
+
+
+def test_page_picks_the_plan_that_matches_the_vm():
+    from vm2morpheus.gui import render_page
+    page = render_page()
+    for needle in ("function pickPlan", 'id="planhint"', "data-cores", "planTouched=true", "coincide con la VM original"):
         assert needle in page

@@ -11,6 +11,17 @@ from .morpheus import MorpheusClient, MorpheusError, payload_from_reference, ren
 from .sources.base import Source
 from .util import CancelledError, Progress, human, redact
 
+def plan_shortfall(plan: dict | None, cpu: int, memory_mb: int) -> str | None:
+    """Warning text if the service plan gives fewer cores or less memory than the source VM has, else None."""
+    if not plan:
+        return None
+    cores, mem = plan.get("maxCores"), plan.get("maxMemory")
+    if not cores or not mem or (cores >= cpu and mem >= memory_mb * 2**20):
+        return None
+    return (f"Aviso: el plan {plan.get('name', '?')!r} da {cores} CPU y {human(mem)} de memoria, y la VM original "
+            f"tiene {cpu} vCPU y {memory_mb} MiB. Elige otro plan en el bloque 3 si quieres los mismos recursos.")
+
+
 def instance_exists_message(name: str, found: dict | None = None) -> str:
     where = f" (id {found['id']}, estado {found.get('status', '?')})" if found and found.get("id") else ""
     return (f"Ya existe en Morpheus una instancia llamada {name!r}{where}. Si es una prueba anterior, bórrala en "
@@ -337,6 +348,9 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                 log("Nota: no se instalaron drivers en la VM. " + (
                     "El disco de arranque se pide en un controlador SATA para que Windows arranque sin drivers VirtIO"
                     if want_sata else "un Windows necesita drivers VirtIO para arrancar desde VirtIO"))
+            warning = plan_shortfall(morpheus.service_plan(ref["plan"]["id"]), vm.cpu, vm.memory_mb)
+            if warning:
+                log(warning)
             log("Creando la instancia en Morpheus ...")
             try:
                 inst = create_instance_clearly(morpheus, build(want_sata), target)
