@@ -38,7 +38,8 @@ def convert_disk(src: Path, dst: Path, fmt: str = "qcow2", progress=None, cancel
     qemu_img = require_tool("qemu-img")
     if cancel is not None and cancel.is_set():
         raise CancelledError("cancelled")
-    proc = subprocess.Popen([qemu_img, "convert", "-p", "-O", fmt, str(src), str(dst)],
+    in_fmt = ["-f", "raw"] if src.suffix.lower() == ".img" else []  # flat ESXi disks are raw: do not let qemu guess
+    proc = subprocess.Popen([qemu_img, "convert", "-p", *in_fmt, "-O", fmt, str(src), str(dst)],
                             stdout=subprocess.PIPE, stderr=subprocess.PIPE, **no_window())
     finished = threading.Event()
 

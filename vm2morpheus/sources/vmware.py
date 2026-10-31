@@ -1,6 +1,7 @@
 import re
 import ssl
 import sys
+import threading
 import time
 import urllib.parse
 from pathlib import Path
@@ -13,19 +14,41 @@ from .base import Source
 CHUNK = 8 * 1024 * 1024
 
 
-class LeaseKeepAlive:
-    """The export lease only needs a progress ping every few seconds to stay alive (it expires after minutes of
-    silence). Pinging after every chunk meant one extra SOAP round trip per 4 MiB, which throttled the download."""
+def best_effort(fn, timeout: float = 15.0) -> bool:
+    """Run a SOAP call that may hang in a daemon thread and wait at most `timeout` seconds. True if it finished."""
+    def run():
+        try:
+            fn()
+        except Exception:
+            pass
 
-    def __init__(self, lease, interval: float = 20.0, clock=time.monotonic):
-        self.lease, self.interval, self.clock = lease, interval, clock
-        self.last = clock()
+    t = threading.Thread(target=run, daemon=True)
+    t.start()
+    t.join(timeout)
+    return not t.is_alive()
 
-    def tick(self, percent: int) -> None:
-        now = self.clock()
-        if now - self.last >= self.interval:
-            self.lease.HttpNfcLeaseProgress(percent)
-            self.last = now
+
+class LeaseHeartbeat:
+    """Keeps the export lease alive from a background thread. The ping is a SOAP call with no timeout: if the ESXi
+    stops answering it, only this thread waits, never the download."""
+
+    def __init__(self, lease, interval: float = 20.0):
+        self.lease, self.interval, self.percent = lease, interval, 0
+        self._stop = threading.Event()
+
+    def start(self):
+        threading.Thread(target=self._run, daemon=True).start()
+        return self
+
+    def _run(self):
+        while not self._stop.wait(self.interval):
+            try:
+                self.lease.HttpNfcLeaseProgress(self.percent)
+            except Exception:
+                pass
+
+    def stop(self) -> None:
+        self._stop.set()
 
 
 READ_TIMEOUT = 120  # seconds without a single byte from the ESXi before giving up
@@ -50,27 +73,32 @@ def file_is_complete_vmdk(path: Path) -> bool:
         return False
 
 
-def download_to(url: str, local: Path, cookie: str, verify: bool, cb, tick=lambda: None, getter=requests.get) -> int:
-    """Stream one exported disk to a file. It stops as soon as the end-of-stream marker has arrived, and a stalled
-    connection raises after READ_TIMEOUT instead of waiting forever."""
+def download_to(url: str, local: Path, cookie: str | None, verify: bool, cb, tick=lambda: None, getter=requests.get,
+                *, total: int | None = None, auth=None, end_marker: bool = True) -> int:
+    """Stream one disk to a file. For an export (end_marker=True) it stops as soon as the VMDK end-of-stream marker
+    has arrived; a stalled connection raises after READ_TIMEOUT instead of waiting forever."""
     done, tail = 0, b""
+    kw = {"auth": auth} if auth is not None else {}
     try:
-        with getter(url, stream=True, verify=verify, headers={"Cookie": cookie}, timeout=(15, READ_TIMEOUT)) as r:
+        with getter(url, stream=True, verify=verify, headers={"Cookie": cookie} if cookie else {},
+                    timeout=(15, READ_TIMEOUT), **kw) as r:
             r.raise_for_status()
             with open(local, "wb") as f:
                 for chunk in r.iter_content(CHUNK):
                     f.write(chunk)
                     done += len(chunk)
                     tail = (tail + chunk)[-1024:]
-                    cb(done, None)
+                    cb(done, total)
                     tick()
-                    if vmdk_stream_complete(tail):
+                    if end_marker and vmdk_stream_complete(tail):
                         break  # the server may keep the connection open: do not wait for more
     except requests.exceptions.ReadTimeout as e:
-        if vmdk_stream_complete(tail):
+        if end_marker and vmdk_stream_complete(tail):
             return done
+        last = tail[-16:].hex(" ") if tail else "ninguno"
         raise RuntimeError(f"El ESXi dejó de enviar datos durante {READ_TIMEOUT} s (se habían descargado "
-                           f"{done / 2**30:.1f} GiB). Revisa la red o el estado del host y vuelve a intentarlo.") from e
+                           f"{done / 2**30:.2f} GiB, {done} bytes). Últimos bytes recibidos: {last}. "
+                           "Revisa la red o el estado del host y vuelve a intentarlo.") from e
     return done
 
 
@@ -147,6 +175,7 @@ class VMwareSource(Source):
         self.password = cfg["password"]
         self.port = int(cfg.get("port", 443))
         self.verify = bool(cfg.get("verify_ssl", False))
+        self.method = cfg.get("download_method") or "auto"  # auto: export, flat disk if the export stalls
         self.si = None
         self.api_type = ""
         self._vms = {}
@@ -296,11 +325,41 @@ class VMwareSource(Source):
 
     def fetch_disks(self, vm: VMInfo, dest: Path, progress) -> list[Path]:
         try:
-            return self._fetch_disks(vm, dest, progress)
+            if self.method == "flat":
+                return self._fetch_flat(vm, dest, progress)
+            try:
+                return self._fetch_disks(vm, dest, progress)
+            except RuntimeError as e:
+                if self.method == "export" or "dejó de enviar datos" not in str(e):
+                    raise
+                print("La exportación del ESXi se detuvo. Se cambia al disco plano (sin comprimir: más datos, "
+                      "pero fiable).", file=sys.stderr)
+                return self._fetch_flat(vm, dest, progress)
         except RuntimeError:
             raise
         except Exception as e:
             raise explain_error(e)
+
+    def _fetch_flat(self, vm: VMInfo, dest: Path, progress) -> list[Path]:
+        """Download each disk's raw extent through the datastore browser. Bigger than the export (zeros included),
+        but it announces its length and does not depend on the export service."""
+        mo = self._find(vm.name)
+        dc_path = self._datacenter_path(mo)
+        out = []
+        for d in vm.disks:
+            local = dest / f"{vm.name}-disk{d.index}.img"
+            if local.exists() and local.stat().st_size == d.size_bytes:
+                print(f"{local.name} ya estaba descargado por completo: se reutiliza.", file=sys.stderr)
+                out.append(local)
+                continue
+            cb = progress(f"descargar {local.name}")
+            got = download_to(flat_url(self.host, d.path, dc_path), local, None, self.verify, cb,
+                              total=d.size_bytes, auth=(self.user, self.password), end_marker=False)
+            if got != d.size_bytes:
+                raise RuntimeError(f"El disco plano llegó incompleto: {got} de {d.size_bytes} bytes")
+            cb.finish()
+            out.append(local)
+        return out
 
     def _fetch_disks(self, vm: VMInfo, dest: Path, progress) -> list[Path]:
         from pyVmomi import vim
@@ -317,12 +376,13 @@ class VMwareSource(Source):
         if lease.state == vim.HttpNfcLease.State.error:
             raise RuntimeError(f"Falló la exportación de la VM: {lease.error}")
         out = []
+        heartbeat = None
         try:
             cookie = self.si._stub.cookie
             esxi_host = str(getattr(mo.runtime.host, "name", "") or "")
             disk_urls = [d for d in lease.info.deviceUrl if d.disk]
             wanted = {d.index for d in vm.disks}
-            keep_alive = LeaseKeepAlive(lease)
+            heartbeat = LeaseHeartbeat(lease).start()
             for i, du in enumerate(disk_urls):
                 if i not in wanted:  # the user left this disk out
                     continue
@@ -330,12 +390,15 @@ class VMwareSource(Source):
                 local = dest / f"{vm.name}-disk{i}.vmdk"
                 disk = next(d for d in vm.disks if d.index == i)
                 cb = progress(f"descargar {local.name}", estimate=disk.used_bytes)
-                pct = min(99, int(100 * (i + 0.5) / len(disk_urls)))
-                download_to(url, local, cookie, self.verify, cb, lambda pct=pct: keep_alive.tick(pct))
+                heartbeat.percent = min(99, int(100 * (i + 0.5) / len(disk_urls)))
+                download_to(url, local, cookie, self.verify, cb)
                 cb.finish()
                 out.append(local)
             lease.HttpNfcLeaseComplete()
         except Exception:
-            lease.HttpNfcLeaseAbort()
+            best_effort(lease.HttpNfcLeaseAbort)  # the ESXi may be the thing that hung: never wait for it
             raise
+        finally:
+            if heartbeat is not None:
+                heartbeat.stop()
         return out

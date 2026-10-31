@@ -1040,8 +1040,9 @@ def test_unverified_tls_notice_is_in_spanish_and_silences_urllib3():
     assert source_cfg({**base, "verify_source": True})["verify_ssl"] is True
 
 
-def test_lease_keepalive_pings_rarely_not_per_chunk():
-    from vm2morpheus.sources.vmware import LeaseKeepAlive
+def test_lease_heartbeat_pings_from_a_thread_and_a_hung_ping_never_blocks_the_caller():
+    import time as _t
+    from vm2morpheus.sources.vmware import LeaseHeartbeat
 
     class Lease:
         def __init__(self):
@@ -1050,17 +1051,22 @@ def test_lease_keepalive_pings_rarely_not_per_chunk():
         def HttpNfcLeaseProgress(self, pct):
             self.pings.append(pct)
 
-    t = {"now": 100.0}
     lease = Lease()
-    ka = LeaseKeepAlive(lease, interval=20, clock=lambda: t["now"])
-    for _ in range(500):  # 500 chunks within the same few seconds
-        t["now"] += 0.01
-        ka.tick(10)
-    assert lease.pings == []  # the old code made 500 SOAP calls here
-    t["now"] += 25
-    ka.tick(40)
-    ka.tick(41)
-    assert lease.pings == [40]
+    hb = LeaseHeartbeat(lease, interval=0.05).start()
+    hb.percent = 42
+    _t.sleep(0.3)
+    hb.stop()
+    assert len(lease.pings) >= 2 and set(lease.pings) <= {0, 42}
+
+    class Hung:
+        def HttpNfcLeaseProgress(self, pct):
+            threading.Event().wait()  # the ESXi never answers this SOAP call
+
+    t0 = _t.monotonic()
+    hb2 = LeaseHeartbeat(Hung(), interval=0.01).start()
+    _t.sleep(0.1)
+    hb2.stop()
+    assert _t.monotonic() - t0 < 2  # the caller was never held up by the hung ping
 
 
 def test_progress_shows_the_transfer_speed(monkeypatch):
@@ -1326,3 +1332,96 @@ def test_page_has_the_chart_and_the_log_toolbar():
     for needle in ('id="speedchart"', 'id="chartinfo"', "function feedChart", "function drawChart",
                    'onclick="copyLog()"', 'onclick="saveLog()"', 'onclick="clearLog()"', 'class="logbox"'):
         assert needle in page
+
+
+def test_best_effort_does_not_wait_for_a_hung_call():
+    import time as _t
+    from vm2morpheus.sources.vmware import best_effort
+    t0 = _t.monotonic()
+    finished = best_effort(lambda: threading.Event().wait(), timeout=0.2)
+    assert finished is False and _t.monotonic() - t0 < 2
+    assert best_effort(lambda: None) is True and best_effort(lambda: 1 / 0) is True
+
+
+def test_flat_download_uses_basic_auth_known_total_and_no_end_marker(tmp_path):
+    from vm2morpheus.sources.vmware import download_to
+    seen = {}
+
+    def getter(url, **kw):
+        seen.update(kw)
+        return _FakeResponse([FOOTER_AND_EOS, b"more"])  # raw data may contain anything: never cut it short
+
+    calls = []
+    got = download_to("https://esxi/folder/x-flat.vmdk", tmp_path / "d.img", None, False,
+                      lambda d, t: calls.append((d, t)), getter=getter, total=999, auth=("root", "pw"), end_marker=False)
+    assert seen["auth"] == ("root", "pw") and seen["headers"] == {} and got == len(FOOTER_AND_EOS) + 4
+    assert calls[-1] == (got, 999)
+
+
+def _vmware_with_stubs(method, export, flat):
+    from vm2morpheus.sources.vmware import VMwareSource
+    src = VMwareSource({"host": "h", "username": "u", "password": "p", "download_method": method})
+    calls = []
+    src._fetch_disks = lambda vm, dest, progress: (calls.append("export"), export())[1]
+    src._fetch_flat = lambda vm, dest, progress: (calls.append("flat"), flat())[1]
+    return src, calls
+
+
+def test_auto_method_falls_back_to_the_flat_disk_when_the_export_stalls(tmp_path):
+    def stalled():
+        raise RuntimeError("El ESXi dejó de enviar datos durante 120 s (se habían descargado 5.30 GiB)")
+
+    src, calls = _vmware_with_stubs("auto", stalled, lambda: ["flat-file"])
+    assert src.fetch_disks(None, tmp_path, None) == ["flat-file"] and calls == ["export", "flat"]
+
+
+def test_other_export_errors_and_export_only_do_not_fall_back(tmp_path):
+    def broken():
+        raise RuntimeError("Falló la exportación de la VM: licencia")
+
+    src, calls = _vmware_with_stubs("auto", broken, lambda: ["x"])
+    with pytest.raises(RuntimeError, match="licencia"):
+        src.fetch_disks(None, tmp_path, None)
+    assert calls == ["export"]  # a license problem would fail the flat route too: do not hide it
+
+    def stalled():
+        raise RuntimeError("El ESXi dejó de enviar datos durante 120 s")
+
+    src2, calls2 = _vmware_with_stubs("export", stalled, lambda: ["x"])
+    with pytest.raises(RuntimeError, match="dejó de enviar"):
+        src2.fetch_disks(None, tmp_path, None)
+    assert calls2 == ["export"]
+    src3, calls3 = _vmware_with_stubs("flat", stalled, lambda: ["flat-only"])
+    assert src3.fetch_disks(None, tmp_path, None) == ["flat-only"] and calls3 == ["flat"]
+
+
+def test_stall_error_reports_the_bytes_and_the_last_data(tmp_path):
+    import requests
+    from vm2morpheus.sources.vmware import download_to
+
+    class Stall(_FakeResponse):
+        def iter_content(self, size):
+            yield b"\x01\x02\x03\x04"
+            raise requests.exceptions.ReadTimeout("idle")
+
+    with pytest.raises(RuntimeError, match=r"4 bytes\)\. Últimos bytes recibidos: 01 02 03 04"):
+        download_to("https://esxi/x", tmp_path / "d.vmdk", "c", False, lambda d, t: None, getter=lambda *a, **k: Stall([]))
+
+
+def test_gui_passes_the_vmware_download_method():
+    from vm2morpheus.gui import render_page, source_cfg
+    base = {"source_type": "esxi", "source_host": "h", "source_user": "u", "source_password": "p"}
+    assert source_cfg(dict(base))["download_method"] == "auto"
+    assert source_cfg({**base, "vmware_method": "flat"})["download_method"] == "flat"
+    assert 'id="vmware_method"' in render_page()
+
+
+def test_raw_img_from_the_flat_download_converts_to_qcow2(tmp_path):
+    from vm2morpheus.convert import convert_disk
+    raw = tmp_path / "vm-disk0.img"
+    subprocess.run(["qemu-img", "create", "-f", "raw", str(raw), "4M"], check=True, capture_output=True)
+    raw.write_bytes(b"KDMV" + raw.read_bytes()[4:])  # even bytes that look like a VMDK header stay raw data
+    out = convert_disk(raw, tmp_path / "vm-disk0.qcow2", "qcow2")
+    assert out.read_bytes()[:4] == b"QFI\xfb"
+    info = subprocess.run(["qemu-img", "info", "--output=json", str(out)], capture_output=True, text=True).stdout
+    assert json.loads(info)["virtual-size"] == 4 * 1024 * 1024

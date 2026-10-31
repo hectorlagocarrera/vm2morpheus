@@ -1,3 +1,4 @@
+import itertools
 import json
 import os
 import shutil
@@ -143,13 +144,13 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         log("Descargando discos ...")
         tracker.begin("fetch")
         n_disks = len(vm.disks)
-        counter = iter(range(n_disks + 1))
+        counter = itertools.count()  # a fallback to another download method asks for the bars again
 
         def fetch_bar(label, estimate=None):
             i = next(counter)
-            tracker.update("fetch", i / n_disks)
+            tracker.update("fetch", min(1.0, i / n_disks))
             return Progress(label, cancel=cancel, estimate=estimate,
-                            on_progress=lambda f, i=i: tracker.update("fetch", (i + f) / n_disks))
+                            on_progress=lambda f, i=i: tracker.update("fetch", min(1.0, (i + f) / n_disks)))
 
         files = source.fetch_disks(vm, workdir, fetch_bar)
         st.mark("fetch", fetched=[str(f) for f in files])

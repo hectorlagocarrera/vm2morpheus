@@ -81,7 +81,8 @@ def source_cfg(f: dict) -> dict:
     _need(f, "source_user", "el usuario del origen")
     return {"type": f["source_type"], "host": f["source_host"], "username": f["source_user"],
             "password": f["source_password"], "os_family": f.get("os_family", "other"),
-            "verify_ssl": bool(f.get("verify_source")), "direct_read": bool(f.get("direct_read"))}
+            "verify_ssl": bool(f.get("verify_source")), "direct_read": bool(f.get("direct_read")),
+            "download_method": f.get("vmware_method") or "auto"}
 
 
 def make_cfgs(f: dict):
@@ -400,6 +401,7 @@ small{color:#5d6b7b}
 <label><input type="checkbox" id="inject_drivers"> Inyectar drivers VirtIO en el disco de Windows (solo Windows; ejecuta el programa como administrador)</label>
 <label><input type="checkbox" id="boot_sata" checked> Disco de arranque en SATA (Windows sin drivers VirtIO)</label></div>
 <label>ISO de virtio-win <small>(vacío = se descarga sola, ~700 MB, y se guarda en caché)</small></label><input id="virtio_iso" placeholder="C:\ISOs\virtio-win.iso">
+<label>Descarga desde VMware <small>(Automático: exportación comprimida y, si se para, disco plano)</small></label><select id="vmware_method"><option value="auto">Automático</option><option value="export">Solo exportación (comprimida, más rápida)</option><option value="flat">Disco plano (sin comprimir, más lenta pero fiable)</option></select>
 <label>Carpeta de trabajo <small>(necesita ~2× el tamaño real de los discos; vacío = automática)</small></label><div style="display:flex;gap:8px"><input id="workdir" placeholder="vacío = automático (disco local con más espacio libre)"><button class="sec" style="margin:0;white-space:nowrap" onclick="openPicker(document.getElementById('workdir').value.trim())">Examinar…</button></div>
 <div id="picker"><div id="pickerhead"></div><div id="pickerlist"></div>
 <button class="sec" onclick="pickerUp()">Subir</button><button onclick="pickerUse()">Usar esta carpeta</button><button class="sec" onclick="closePicker()">Cerrar</button></div></fieldset>
@@ -411,7 +413,7 @@ small{color:#5d6b7b}
 <div class="logbar"><b>Registro</b><span><button class="sec mini" onclick="copyLog()">Copiar</button><button class="sec mini" onclick="saveLog()">Guardar .txt</button><button class="sec mini" onclick="clearLog()">Limpiar</button></span></div>
 <div id="log" class="logbox" tabindex="0">Listo.</div></main>
 <script>
-const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","virtio_iso","ref_instance_id","ref_image_id","workdir"];
+const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","virtio_iso","vmware_method","ref_instance_id","ref_image_id","workdir"];
 const chks=["verify_ssl","verify_source","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
 const EMBEDDED=__EMBEDDED__;
 let analyzedVm=null;
@@ -535,7 +537,7 @@ async function run(p){try{await persist();const {job}=await post(p,form());curre
  const t=setInterval(async()=>{const r=await (await fetch("/job/"+job)).json();show(r.log||"...");drawBar(r);feedChart(r);if(r.status!=="running"){clearInterval(t);btn.style.display="none";currentJob=null}},1000)}catch(e){show("ERROR: "+e.message)}}
 srcHint();
 (async()=>{try{saved=await (await fetch("/settings")).json();
- ids.forEach(i=>{if(saved[i]!==undefined&&document.getElementById(i).tagName==="INPUT"||saved[i]!==undefined&&["source_type","os_family"].includes(i))document.getElementById(i).value=saved[i]});
+ ids.forEach(i=>{if(saved[i]!==undefined&&document.getElementById(i).tagName==="INPUT"||saved[i]!==undefined&&["source_type","os_family","vmware_method"].includes(i))document.getElementById(i).value=saved[i]});
  chks.forEach(i=>{if(saved[i]!==undefined)document.getElementById(i).checked=!!saved[i]});
  srcHint();
  if(saved.morpheus_url&&saved.morpheus_token)lookups()}catch(e){}})();
