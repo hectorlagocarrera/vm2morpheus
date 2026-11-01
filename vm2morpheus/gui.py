@@ -444,7 +444,8 @@ main{max-width:920px;margin:0 auto;padding:16px}
 h1{font-size:22px} fieldset{background:#fff;border:1px solid #d5dbe2;border-radius:8px;margin:0 0 14px;padding:12px 16px}
 legend{font-weight:600;padding:0 6px} label{display:block;margin:8px 0 2px;font-size:13px;color:#4a5665}
 input,select{width:100%;padding:7px;border:1px solid #b9c2cc;border-radius:5px;box-sizing:border-box}
-.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0 14px}
+input:not([type=checkbox]),select{height:34px}
+.row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0 14px;align-items:end}
 .chk label{display:inline-block;margin-right:16px;color:#1b2430;font-size:14px} .chk input{width:auto}
 button{padding:9px 16px;margin:4px 8px 4px 0;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer;font-size:14px}
 input.diskchk{width:auto;margin:0 8px 0 0;vertical-align:middle}
@@ -523,7 +524,7 @@ small{color:#5d6b7b}
 <div id="diskpanel" style="display:none;margin-top:8px"><div id="diskinfo"></div><div id="disklist" style="margin:6px 0"></div><small id="diskhint"></small></div></fieldset>
 <fieldset><legend>2. Destino Morpheus</legend><div class="row">
 <div><label>URL (https://ip)</label><input id="morpheus_url"></div>
-<div><label>Nombre de la VM en Morpheus <small>(igual que la original si lo dejas)</small></label><input id="new_vm_name" oninput="newNameTouched=true" placeholder="igual que la original"></div>
+<div><label>Nombre de la VM en Morpheus</label><input id="new_vm_name" oninput="newNameTouched=true" placeholder="igual que la original"></div>
 <div><label>Token API</label><input id="morpheus_token" type="password"></div>
 <div><label>imageType <small>(qcow2 por defecto, verifícalo)</small></label><input id="image_type" value="qcow2"></div>
 </div><div class="chk"><label><input type="checkbox" id="verify_ssl"> Verificar certificado TLS</label></div>

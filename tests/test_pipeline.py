@@ -2389,3 +2389,11 @@ def test_gui_passes_the_hot_copy_option_and_warns_about_the_running_source():
     job = {"status": "done", "cleanup": {"morpheus": {"url": "https://m"}, "vm": "w", "workdir": "x",
            "result": {"instance": {"id": 1}, "images": [{"id": 2, "name": "n"}], "hot": True}}}
     assert gui.done_info(job)["hot"] is True
+
+
+def test_form_fields_line_up_whatever_the_label_length():
+    from vm2morpheus.gui import render_page
+    page = render_page()
+    assert "align-items:end" in page.split(".row{", 1)[1].split("}", 1)[0]          # inputs share a baseline per row
+    assert "input:not([type=checkbox]),select{height:34px}" in page                 # a select is as tall as an input
+    assert "<label>Nombre de la VM en Morpheus</label>" in page                    # no wrapping hint under the label
