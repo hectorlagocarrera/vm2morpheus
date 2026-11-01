@@ -101,6 +101,8 @@ def ssh_check(f: dict, connect=None) -> list[str]:
                 ok = sh.run(f"test -d {shlex.quote(ds['path'])} && test -w {shlex.quote(ds['path'])} && echo ok",
                             check=False).strip() == "ok"
                 lines.append(f"{'✔' if ok else '✖'} Almacén {ds['name']} montado y escribible en {ds['path']}")
+        else:
+            lines.append("· Elige un almacén de datos (y pulsa «Cargar nubes…») para comprobar también que está montado")
     finally:
         sh.close()
     return lines
@@ -584,6 +586,9 @@ table#histtable{width:100%;border-collapse:collapse;background:#fff;border:1px s
 #modal{position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:20;display:none;align-items:center;justify-content:center;padding:16px}
 .dialog{position:relative;background:#fff;border-radius:14px;max-width:560px;width:100%;padding:22px 24px;box-shadow:0 20px 50px rgba(0,0,0,.35);max-height:90vh;overflow:auto}
 .dialog h2{margin:0 0 8px;font-size:19px} .dialog ul{margin:8px 0 12px 18px;padding:0;line-height:1.55;font-size:14px}
+#sshres{margin:6px 0 10px;padding:8px 12px;border-radius:8px;font-size:13px;display:none;white-space:pre-line}
+#sshres.ok{display:block;background:#dcfce7;border:1px solid #86efac;color:#166534}
+#sshres.bad{display:block;background:#fee2e2;border:1px solid #fca5a5;color:#991b1b}
 .dialog .res{font-size:13px;margin:8px 0} .dialog .res.err{color:#b91c1c} .dialog .res.ok{color:#166534}
 .dialog .actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px} .dialog .actions button,.dialog .actions a{margin:0}
 .dialog label.inl{display:flex;gap:8px;align-items:center;font-size:13px;color:#1b2430;margin:6px 0} .dialog label.inl input{width:auto}
@@ -651,7 +656,7 @@ small{color:#5d6b7b}
 <div class="chk"><label><input type="checkbox" id="ssh_direct"> Copiar los discos por SSH directamente a la VM (crea la VM con una imagen vacía de 1 MB y sustituye sus discos)</label></div>
 <div class="row"><div><label>Host HVM <small>(cualquiera del clúster)</small></label><input id="ssh_host" placeholder="vme01.laboratorio3.local"></div><div><label>Usuario SSH</label><input id="ssh_user" placeholder="root"></div>
 <div><label>Contraseña SSH</label><input id="ssh_password" type="password" autocomplete="off"></div><div><label>Clave privada <small>(opcional)</small></label><input id="ssh_key" placeholder="C:\Users\yo\.ssh\id_rsa"></div></div>
-<button class="sec" data-busy onclick="sshtest()">Probar SSH</button>
+<button class="sec" data-busy onclick="sshtest()">Probar SSH</button><div id="sshres"></div>
 <small>No es un método oficial de HPE: Morpheus no se entera de que el disco cambió (funciona porque la VM usa el fichero). Solo almacenes de ficheros (NFS, GFS2, directorio local). Si falla antes de tocar los discos, reintenta o desmarca la opción para usar la biblioteca.</small></details></fieldset>
 <fieldset><legend>4. Opciones</legend><div class="chk">
 <label><input type="checkbox" id="shutdown"> Apagar la VM de origen</label>
@@ -793,7 +798,11 @@ fetch("/info").then(r=>r.json()).then(i=>{const b=document.getElementById("admin
  b.title=i.admin?"Este programa tiene permisos de administrador (necesarios para inyectar drivers).":"Para inyectar drivers hay que abrir el programa con clic derecho > Ejecutar como administrador. Si ya lo hiciste, cierra todas las ventanas y procesos vm2morpheus antiguos."}).catch(()=>{});
 setInterval(()=>fetch("/ping").catch(()=>{}),5000);fetch("/ping").catch(()=>{});
 async function refinfo(){try{show(JSON.stringify(await busy("Leyendo la instancia de referencia …",()=>post("/refinfo",form())),null,2))}catch(e){show("ERROR: "+e.message)}}
-async function sshtest(){try{await persist();const j=await busy("Probando la conexión SSH …",()=>post("/sshtest",form()));show(j.lines.join("\n"))}catch(e){show("ERROR: "+e.message)}}
+async function sshtest(){const box=document.getElementById("sshres");box.className="";
+ try{await persist();const j=await busy("Probando la conexión SSH …",()=>post("/sshtest",form()));
+  const bad=j.lines.some(l=>l.startsWith("✖"));
+  box.textContent=(bad?"Conectado, pero hay problemas:\n":"Todo correcto:\n")+j.lines.join("\n");box.className=bad?"bad":"ok";show(j.lines.join("\n"))}
+ catch(e){box.textContent="✖ "+e.message;box.className="bad";show("ERROR: "+e.message)}}
 async function lookups(){try{await persist();const j=await busy("Cargando datos de Morpheus …",()=>post("/lookups",form()));
  for(const [k,id] of [["clouds","cloud_id"],["groups","group_id"],["plans","plan_id"],["networks","network_id"],["instances","ref_instance_id"]]){
   const s=document.getElementById(id);s.innerHTML=(id=="ref_instance_id"?'<option value="">(ninguna)</option>':id=="network_id"?'<option value="">(elige una red)</option>':'')+j[k].map(([v,n,c,m])=>`<option value="${v}"${c?` data-cores="${c}" data-mem="${m}"`:""}>${n}</option>`).join("");if(saved[id])s.value=saved[id];else if(id=="network_id"&&j[k].length===1)s.value=j[k][0][0]}

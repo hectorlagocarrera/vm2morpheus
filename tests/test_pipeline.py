@@ -2937,3 +2937,22 @@ def test_ssh_upload_resumes_after_what_was_already_written(tmp_path):
     seen = []
     sh.upload(local, str(remote), lambda done, total: seen.append(done))
     assert remote.read_bytes() == data and seen[0] > 5 * 1024 * 1024 and seen[-1] == len(data)
+
+
+def test_ssh_check_reports_tools_and_datastore_mount():
+    from vm2morpheus import gui
+
+    class Sh:
+        def __init__(self, *a):
+            pass
+
+        def run(self, cmd, check=True):
+            return {"qemu-img --version | head -1": "qemu-img version 8.2.2", "virsh --version": "10.0.0"}.get(cmd, "")
+
+        def close(self):
+            pass
+
+    lines = gui.ssh_check({"ssh_host": "vme02", "ssh_password": "x"}, connect=Sh)
+    assert lines[0] == "✔ Conectado por SSH a vme02 como root"
+    assert "✔ qemu-img: qemu-img version 8.2.2" in lines and "✔ virsh: 10.0.0" in lines
+    assert lines[-1].startswith("· Elige un almacén de datos")
