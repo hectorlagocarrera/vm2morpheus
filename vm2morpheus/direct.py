@@ -288,7 +288,8 @@ def replace_disk(shell, local, target: str, log=print, progress=None, cancel=Non
     else:
         part, label = posixpath.join(posixpath.dirname(target), "." + posixpath.basename(target) + ".vm2m-part"), local.name
         shell.upload(local, part, progress, cancel, owner)
-    got = int(json.loads(shell.run(f"{pre}qemu-img info --output=json {q(part)}"))["virtual-size"])
+    part_info = json.loads(shell.run(f"{pre}qemu-img info --output=json {q(part)}"))
+    got = int(part_info["virtual-size"])
     if got > want:
         raise DirectError(f"El disco migrado ({got} bytes) es mayor que el volumen que creó Morpheus ({want} bytes)")
     if got < want:
@@ -301,6 +302,17 @@ def replace_disk(shell, local, target: str, log=print, progress=None, cancel=Non
     if isinstance(local, str):  # the staging folder is empty once its last disk has moved
         shell.run(f"{pre}rmdir {q(posixpath.dirname(local))}", check=False)
     log(f"Disco {posixpath.basename(target)} sustituido por {label}")
+    return int(part_info.get("actual-size") or 0)
+
+
+def disk_usage(shell, target: str) -> int:
+    """Bytes the disk file really uses on the datastore (works while the VM has it open)."""
+    owner = shell.run(f"stat -c %U {shlex.quote(posixpath.dirname(target))}", check=False).strip() or None
+    out = shell.run(f"{shell.as_user(owner)}qemu-img info -U --output=json {shlex.quote(target)}", check=False)
+    try:
+        return int(json.loads(out).get("actual-size") or 0)
+    except ValueError:
+        return 0
 
 
 VIRSH = "virsh -c qemu:///system"  # explicit: a non-root SSH user would otherwise see only its own (empty) session
@@ -418,7 +430,15 @@ def push_disks(morpheus, instance_id: int, vm_name: str, disks: list, ssh: dict,
     when it accepts them and through virsh otherwise. Each disk file is swapped in one step (mv), so even if the
     VM is switched on meanwhile (auto recover) it keeps the old file open and the new one is intact; that is why
     it is always fully stopped and started again at the end, so the new process opens the new disks."""
-    log("Esperando a que la VM aparezca en el host (Morpheus la está creando) ...")
+    log("Esperando a que Morpheus termine de crear la VM ...")
+    try:  # never touch the disks while Morpheus may still be writing them (copy of the image, resize)
+        status = wait_instance(morpheus, instance_id, {"running", "stopped", "suspended", "warning"}, timeout=1200,
+                               sleep=sleep)
+        log(f"Morpheus ha terminado de crear la VM (estado: {status})")
+    except DirectError as e:
+        if "fallida" in str(e):
+            raise
+        log("Aviso: Morpheus sigue creando la VM después de 20 min; se continúa y se comprobará el disco al final")
     log("Hosts donde se buscará: " + ", ".join(candidate_hosts(morpheus, instance_id, ssh.get("host", ""))))
     shell, host, vm_name, xml = find_domain(morpheus, instance_id, vm_name, ssh, log, connect, sleep=sleep)
     log(f"VM encontrada en {host} (en libvirt se llama {vm_name!r})")
@@ -431,9 +451,10 @@ def push_disks(morpheus, instance_id: int, vm_name: str, disks: list, ssh: dict,
         if len(targets) < len(disks):
             raise DirectError(f"La VM tiene {len(targets)} disco(s) en {host} y hay {len(disks)} para subir")
         log(f"Subida directa por SSH a {host}: {len(disks)} disco(s)")
+        written = []
         for i, (local, target) in enumerate(zip(disks, targets)):
             pf = progress_for(i) if progress_for and not isinstance(local, str) else None
-            replace_disk(shell, local, target, log, pf, cancel)
+            written.append(replace_disk(shell, local, target, log, pf, cancel))
         if not _is_off(shell, vm_name):  # switched on meanwhile: it still runs on the old (blank) files
             log("La VM se encendió durante la copia (Morpheus recupera el estado de encendido); se apaga otra vez "
                 "para que arranque con los discos nuevos ...")
@@ -456,6 +477,13 @@ def push_disks(morpheus, instance_id: int, vm_name: str, disks: list, ssh: dict,
             if stale_disks(shell, vm_name, targets[:len(disks)]):
                 raise DirectError("Los discos se copiaron, pero la VM sigue arrancada con el disco vacío anterior. "
                                   "Apágala y enciéndela desde Morpheus (Stop y Start, no Restart).")
+        for target, size in zip(targets, written):  # Morpheus must not have written its blank disk over ours
+            now = disk_usage(shell, target)
+            if size and now < size // 2:
+                raise DirectError(f"El disco {posixpath.basename(target)} ya no es el migrado (ocupa {now} bytes y el "
+                                  f"subido ocupaba {size}): Morpheus lo ha vuelto a escribir. Repite la migración: "
+                                  "se reanudará desde la copia de los discos")
+        log("Comprobado: la VM arranca con los discos migrados")
     finally:
         shell.close()
     log("VM arrancada. Si Morpheus la sigue mostrando como 'provisioning', la dará por creada cuando Windows arranque "

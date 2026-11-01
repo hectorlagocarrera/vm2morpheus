@@ -3210,3 +3210,23 @@ def test_stale_disks_reads_the_deleted_files_held_by_qemu():
 
     assert stale_disks(Sh("h", "root"), "w2k16", ["/mnt/ds/w2k16/hvm_47-disk-0-bed12f3",
                                                    "/mnt/ds/w2k16/hvm_47-disk-1-aa"]) == ["/mnt/ds/w2k16/hvm_47-disk-0-bed12f3"]
+
+
+def test_push_disks_waits_for_morpheus_and_detects_a_disk_overwritten_afterwards(tmp_path, monkeypatch):
+    from vm2morpheus import direct
+    (d0, d1), (l0, l1), xml = _push_setup(tmp_path)
+    m, msgs = _PowerMorpheus(), []
+    seen = []
+    real_get = m.get_instance
+    m.get_instance = lambda i: (seen.append(m.status), real_get(i))[1]
+    monkeypatch.setattr(direct, "disk_usage", lambda shell, target: 200 * 1024)   # Morpheus wrote its blank disk again
+
+    def connect(*a):
+        m.shell = LocalShell(*a, xml=xml, state="running")
+        return m.shell
+
+    monkeypatch.setattr(direct, "replace_disk", lambda *a, **k: 10 << 30)
+    with pytest.raises(direct.DirectError, match="Morpheus lo ha vuelto a escribir"):
+        direct.push_disks(m, 42, "w2k16", [l0, l1], {"host": "vme02"}, msgs.append, connect=connect,
+                          sleep=lambda s: None)
+    assert seen and any("Morpheus ha terminado de crear la VM" in x for x in msgs)
