@@ -198,6 +198,39 @@ def domain_disks(xml_text: str) -> list[str]:
     return [p for _, _, p in sorted(disks)]
 
 
+def host_entries(ssh: dict) -> list[dict]:
+    """[{host, user, password}] from the SSH settings (one entry per host typed, each with its own login)."""
+    if ssh.get("hosts"):
+        return [h for h in ssh["hosts"] if h.get("host")]
+    return [{"host": h.strip(), "user": ssh.get("user") or "root", "password": ssh.get("password")}
+            for h in (ssh.get("host") or "").replace(";", ",").split(",") if h.strip()]
+
+
+def connect_host(ssh: dict, host: str, connect=None):
+    """SSH session to `host` with its own credentials; for an address that was not typed (one Morpheus reported for
+    a host), every distinct login typed is tried until one is accepted."""
+    connect = connect or HostShell
+    entries = host_entries(ssh)
+    exact = [e for e in entries if e["host"] == host]
+    logins, seen = [], set()
+    for e in exact + entries:
+        key = (e.get("user") or "root", e.get("password") or "")
+        if key not in seen:
+            seen.add(key)
+            logins.append(key)
+    if not logins:
+        logins = [("root", "")]
+    last = None
+    for user, password in logins:
+        try:
+            return connect(host, user, password or None, ssh.get("key_file"))
+        except DirectError as e:
+            if "incorrectos" not in str(e):  # not an authentication problem: the host is not reachable
+                raise
+            last = e
+    raise last
+
+
 def candidate_hosts(morpheus, instance_id: int, given: str) -> list[str]:
     """Where the VM may be defined: the host Morpheus says runs it, then the host typed by the user, then every
     HVM host it knows. Lookups that fail are skipped."""
@@ -336,13 +369,13 @@ def find_domain(morpheus, instance_id: int, vm_name: str, ssh: dict, log=print, 
     deadline, next_report = start + timeout, start + report_every
     try:
         while True:
-            hosts = candidate_hosts(morpheus, instance_id, ssh.get("host", ""))
+            hosts = candidate_hosts(morpheus, instance_id, ", ".join(e["host"] for e in host_entries(ssh)))
             for host in hosts:
                 if host not in shells:
                     if clock() - failed.get(host, -1e9) < 120:  # unreachable a moment ago: do not wait 20 s again
                         continue
                     try:
-                        shells[host] = connect(host, ssh.get("user") or "root", ssh.get("password"), ssh.get("key_file"))
+                        shells[host] = connect_host(ssh, host, connect)
                     except DirectError as e:
                         status[host], failed[host] = str(e), clock()
                         continue
@@ -439,7 +472,8 @@ def push_disks(morpheus, instance_id: int, vm_name: str, disks: list, ssh: dict,
         if "fallida" in str(e):
             raise
         log("Aviso: Morpheus sigue creando la VM después de 20 min; se continúa y se comprobará el disco al final")
-    log("Hosts donde se buscará: " + ", ".join(candidate_hosts(morpheus, instance_id, ssh.get("host", ""))))
+    log("Hosts donde se buscará: " + ", ".join(candidate_hosts(morpheus, instance_id,
+                                                                ", ".join(e["host"] for e in host_entries(ssh)))))
     shell, host, vm_name, xml = find_domain(morpheus, instance_id, vm_name, ssh, log, connect, sleep=sleep)
     log(f"VM encontrada en {host} (en libvirt se llama {vm_name!r})")
     try:

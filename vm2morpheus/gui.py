@@ -35,10 +35,16 @@ def idle_too_long(last_ping, now: float, busy: bool, limit: float = IDLE_LIMIT) 
 
 
 class JobLog:
-    """Collects log lines and the live (carriage-return) progress line of a job."""
+    """Collects log lines and the live (carriage-return) progress line of a job. Every line starts with the date
+    and time it was written (for a progress line: the time of its latest update)."""
 
-    def __init__(self):
+    def __init__(self, clock=None):
         self.lines, self.cur = [], ""
+        self.clock = clock or (lambda: time.strftime("%d/%m/%Y %H:%M:%S"))
+
+    def _stamp(self, line: str) -> str:
+        indent = len(line) - len(line.lstrip(" "))  # progress lines are indented: keep it after the time
+        return f"{self.clock()}  {line}" if not indent else f"{self.clock()}  {line[indent:]}"
 
     def write(self, s):
         for ch in s:
@@ -46,7 +52,7 @@ class JobLog:
                 self.cur = ""
             elif ch == "\n":
                 if self.cur.strip():
-                    self.lines.append(self.cur)
+                    self.lines.append(self._stamp(self.cur))
                 self.cur = ""
             else:
                 self.cur += ch
@@ -56,7 +62,7 @@ class JobLog:
         pass
 
     def text(self):
-        return "\n".join(self.lines + ([self.cur] if self.cur.strip() else []))
+        return "\n".join(self.lines + ([self._stamp(self.cur)] if self.cur.strip() else []))
 
 
 def synthetic_reference(f: dict) -> dict:
@@ -79,9 +85,25 @@ def synthetic_reference(f: dict) -> dict:
 
 
 def ssh_cfg(f: dict) -> dict:
-    _need(f, "ssh_host", "el host HVM para la subida por SSH")
-    return {"host": f["ssh_host"], "user": (f.get("ssh_user") or "").strip() or "root",
-            "password": f.get("ssh_password") or None, "key_file": (f.get("ssh_key") or "").strip() or None}
+    """The SSH settings: one entry per HVM host, each with its own user and password."""
+    hosts = []
+    try:
+        rows = json.loads(f.get("ssh_hosts") or "[]")
+        pws = json.loads(f.get("ssh_passwords") or "[]")
+    except ValueError:
+        rows, pws = [], []
+    for i, r in enumerate(rows):
+        host = (r.get("host") or "").strip()
+        if host:
+            hosts.append({"host": host, "user": (r.get("user") or "").strip() or "root",
+                          "password": (pws[i] if i < len(pws) else "") or None})
+    if not hosts:  # settings saved by an older version: one user and password for every host
+        hosts = [{"host": h, "user": (f.get("ssh_user") or "").strip() or "root", "password": f.get("ssh_password") or None}
+                 for h in ssh_hosts(f.get("ssh_host") or "")]
+    if not hosts:
+        raise ValueError("Falta al menos un host HVM para la subida directa por SSH (paso 4)")
+    return {"hosts": hosts, "host": ", ".join(h["host"] for h in hosts),
+            "key_file": (f.get("ssh_key") or "").strip() or None}
 
 
 def ssh_hosts(value: str) -> list[str]:
@@ -98,13 +120,14 @@ def ssh_check(f: dict, connect=None) -> list[str]:
         ds = MorpheusClient(f["morpheus_url"], f["morpheus_token"], verify=bool(f.get("verify_ssl"))).datastore(
             int(f["datastore_id"]))
     lines = []
-    for host in ssh_hosts(cfg["host"]):
+    for entry in cfg["hosts"]:
+        host = entry["host"]
         try:
-            sh = (connect or HostShell)(host, cfg["user"], cfg["password"], cfg["key_file"])
+            sh = (connect or HostShell)(host, entry["user"], entry["password"], cfg["key_file"])
         except DirectError as e:
             lines.append(f"✖ {e}")
             continue
-        lines.append(f"✔ Conectado por SSH a {host} como {cfg['user']}")
+        lines.append(f"✔ Conectado por SSH a {host} como {entry['user']}")
         try:
             for cmd, label in (("qemu-img --version | head -1", "qemu-img"), ("virsh --version", "virsh")):
                 out = sh.run(cmd, check=False).strip()
@@ -112,7 +135,7 @@ def ssh_check(f: dict, connect=None) -> list[str]:
             if ds and ds.get("path"):
                 path = shlex.quote(ds["path"])
                 owner = sh.run(f"stat -c %U {path}", check=False).strip()
-                pre = as_user_prefix(cfg["user"], owner or None)
+                pre = as_user_prefix(entry["user"], owner or None, bool(entry["password"]))
                 ok = sh.run(f"test -d {path} && {pre}test -w {path} && echo ok", check=False).strip() == "ok"
                 lines.append(f"   {'✔' if ok else '✖'} Almacén {ds['name']} montado y escribible en {ds['path']}"
                              + (f" (como {owner})" if pre else ""))
@@ -579,6 +602,8 @@ details.adv{margin-top:10px} details.adv summary{cursor:pointer;font-size:13px;c
 .mode input{position:absolute;left:12px;top:12px;width:auto} .mode b{display:block;font-size:14px}
 .mode span{display:block;font-size:12.5px;color:#5b6675;margin-top:3px;line-height:1.4}
 .mode.on{border-color:#2563eb;background:#eff6ff}
+.hosthead,.hostrow{display:grid;grid-template-columns:2fr 1fr 1fr 34px;gap:8px;align-items:center}
+.hosthead label{margin:4px 0 0} .hostrow{margin:4px 0} .hostrow button{margin:0;padding:6px 0;height:34px}
 #sshopts{display:none;border-left:3px solid #2563eb;padding-left:12px;margin:6px 0 4px}
 button{padding:9px 16px;margin:4px 8px 4px 0;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer;font-size:14px}
 input.diskchk{width:auto;margin:0 8px 0 0;vertical-align:middle}
@@ -637,7 +662,7 @@ button.sec{background:#e5e9ee;color:#1b2430} .logbar{display:flex;justify-conten
 .logbox{background:#0b1220;color:#d6e2f0;border-radius:10px;padding:10px 0;min-height:140px;max-height:440px;overflow:auto;
  font:13px/1.5 Consolas,"Cascadia Mono",Menlo,monospace;user-select:text;-webkit-user-select:text;cursor:text;box-shadow:inset 0 0 0 1px #1e293b}
 .logbox .ln{padding:0 14px;white-space:pre-wrap;word-break:break-word;border-left:3px solid transparent}
-.logbox .ln:hover{background:#111b30}
+.logbox .ln:hover{background:#111b30} .logbox .ts{color:#64748b;font-weight:400}
 .logbox .step{color:#93c5fd;font-weight:600;border-left-color:#3b82f6;margin-top:4px}
 .logbox .prog{color:#9fb3c8} .logbox .ok{color:#86efac;border-left-color:#22c55e}
 .logbox .warn{color:#fcd34d;border-left-color:#f59e0b} .logbox .err{color:#fca5a5;font-weight:600;border-left-color:#ef4444;background:#2a1215}
@@ -702,20 +727,21 @@ small{color:#5d6b7b}
 </div>
 <input type="checkbox" id="ssh_direct" hidden>
 <div id="libopts" class="chk"><label><input type="checkbox" id="multi_disk_bundle" checked> Varios discos en una sola imagen</label></div>
-<div id="sshopts"><div class="row">
-<div><label>Hosts HVM</label><input id="ssh_host" placeholder="vme01.empresa.local, vme02.empresa.local"></div>
-<div><label>Usuario</label><input id="ssh_user" placeholder="root"></div>
-<div><label>Contraseña</label><input id="ssh_password" type="password" autocomplete="off"></div>
-<div><label>Clave privada <small>(opcional)</small></label><input id="ssh_key" placeholder="C:\Users\usuario\.ssh\id_rsa"></div></div>
+<div id="sshopts">
+<div class="hosthead"><label>Host HVM</label><label>Usuario</label><label>Contraseña</label><span></span></div>
+<div id="hostlist"></div>
+<button class="sec mini" onclick="addHost()">+ Añadir host</button>
+<input type="hidden" id="ssh_hosts"><input type="hidden" id="ssh_passwords">
+<div class="row"><div><label>Clave privada <small>(opcional, para todos los hosts)</small></label><input id="ssh_key" placeholder="C:\Users\usuario\.ssh\id_rsa"></div></div>
 <div class="btns"><button class="sec" data-busy onclick="sshtest()">Probar conexión</button></div><div id="sshres"></div>
-<p class="help">Indica todos los hosts del clúster, separados por comas: la VM se crea en el que elija Morpheus. Si el usuario no es root, se usa sudo con la misma contraseña. Con un almacén compartido (NFS o GFS2), los discos de datos se copian directamente desde el origen sin pasar por este equipo.</p></div>
+<p class="help">Añade todos los hosts del clúster: la VM se crea en el que elija Morpheus.</p></div>
 <div class="chk"><label><input type="checkbox" id="compress_image"> Comprimir los discos (menos datos que subir; la VM puede leer algo más lento)</label></div>
 </fieldset>
 
 <fieldset><legend>5. Windows</legend><div class="chk">
 <label><input type="checkbox" id="inject_drivers"> Instalar los drivers VirtIO en el disco (necesita ejecutar el programa como administrador)</label>
 <label><input type="checkbox" id="boot_sata" checked> Arrancar desde SATA (para Windows sin drivers VirtIO)</label></div>
-<label>ISO de virtio-win</label><input id="virtio_iso" placeholder="vacío = se descarga automáticamente (unos 700 MB, una sola vez)">
+<label>ISO de virtio-win</label><input id="virtio_iso" placeholder="vacío = se descarga la última versión estable (unos 700 MB) y se guarda para las siguientes migraciones">
 </fieldset>
 
 <fieldset><legend>6. Este equipo</legend>
@@ -743,26 +769,29 @@ small{color:#5d6b7b}
 <div id="modal" style="display:none"><div class="dialog" id="dialog"></div></div>
 </main>
 <script>
-const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","datastore_id","ssh_host","ssh_user","ssh_password","ssh_key","instance_type","layout_id","resource_pool","virtio_iso","vmware_method","new_vm_name","ref_instance_id","ref_image_id","workdir"];
+const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","datastore_id","ssh_hosts","ssh_passwords","ssh_key","instance_type","layout_id","resource_pool","virtio_iso","vmware_method","new_vm_name","ref_instance_id","ref_image_id","workdir"];
 const chks=["ssh_direct","verify_ssl","verify_source","compress_image","hot_copy","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
 const EMBEDDED=__EMBEDDED__;
 let analyzedVm=null;
-const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);if(analyzedVm&&analyzedVm===document.getElementById("vm").value.trim()&&document.querySelector(".diskchk"))o.disk_indexes=[...document.querySelectorAll(".diskchk")].filter(c=>c.checked).map(c=>Number(c.value));else o.disk_indexes=null;return o};
+const form=()=>{syncHosts();const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);if(analyzedVm&&analyzedVm===document.getElementById("vm").value.trim()&&document.querySelector(".diskchk"))o.disk_indexes=[...document.querySelectorAll(".diskchk")].filter(c=>c.checked).map(c=>Number(c.value));else o.disk_indexes=null;return o};
 let shown=[];
-function lineClass(l){
+const TS=/^(\d\d\/\d\d\/\d{4} \d\d:\d\d:\d\d)  (.*)$/;
+function lineClass(l){const m=l.match(TS);if(m)l=m[2];
  if(/^ERROR/.test(l))return"err";
  if(/^(Aviso|Nota|Advertencia)/i.test(l))return"warn";
- if(/terminado|^Terminado|Conectado a|encontradas|ya se migró|reutilizan/i.test(l))return"ok";
- if(/^\s+\S.*(MiB|GiB|KiB|%)/.test(l))return"prog";
- if(/^(Descargando|Convirtiendo|Subiendo|Creando|Inyectando|Empaquetando|Apagando|Añadiendo|Quitando|Simulación|Se contin)/.test(l))return"step";
+ if(/terminado|^Terminado|Conectado a|encontradas|ya se migró|reutilizan|^Comprobado|^✔/i.test(l))return"ok";
+ if(/^(descargar|convertir|subir|copiar)\b.*(MiB|GiB|KiB|%)/.test(l)||/^\s+\S.*(MiB|GiB|KiB|%)/.test(l))return"prog";
+ if(/^(Descargando|Convirtiendo|Subiendo|Creando|Inyectando|Empaquetando|Apagando|Arrancando|Esperando|Añadiendo|Quitando|Simulación|Se contin)/.test(l))return"step";
  return""}
-// Only the lines that changed are touched, so selecting text while a migration runs no longer gets wiped every second.
+const now=()=>{const d=new Date(),z=n=>String(n).padStart(2,"0");return `${z(d.getDate())}/${z(d.getMonth()+1)}/${d.getFullYear()} ${z(d.getHours())}:${z(d.getMinutes())}:${z(d.getSeconds())}`};
+function note(text){show(String(text).split("\n").map(l=>l&&!TS.test(l)?now()+"  "+l:l).join("\n"))}
 function show(text){const box=document.getElementById("log"),lines=String(text).split("\n");
  const atBottom=box.scrollHeight-box.scrollTop-box.clientHeight<40;
  let i=0;while(i<lines.length&&i<shown.length&&lines[i]===shown[i])i++;
  if(!shown.length)box.textContent="";
  while(box.children.length>i)box.removeChild(box.lastChild);
- for(let k=i;k<lines.length;k++){const d=document.createElement("div");d.className="ln "+lineClass(lines[k]);d.textContent=lines[k]||" ";box.appendChild(d)}
+ for(let k=i;k<lines.length;k++){const d=document.createElement("div");d.className="ln "+lineClass(lines[k]);const m=lines[k].match(TS);
+  if(m){const t=document.createElement("span");t.className="ts";t.textContent=m[1]+"  ";d.appendChild(t);d.appendChild(document.createTextNode(m[2]))}else d.textContent=lines[k]||" ";box.appendChild(d)}
  shown=lines;if(atBottom)box.scrollTop=box.scrollHeight}
 async function copyLog(){const text=shown.join("\n");
  try{await navigator.clipboard.writeText(text)}catch(e){const a=document.createElement("textarea");a.value=text;document.body.appendChild(a);a.select();document.execCommand("copy");a.remove()}
@@ -807,14 +836,14 @@ async function busy(text,fn){const w=document.getElementById("busywrap"),t=docum
  try{return await fn()}finally{clearInterval(tick);w.style.display="none";document.querySelectorAll("button[data-busy]").forEach(b=>b.disabled=false)}}
 async function persist(){try{await post("/settings",form())}catch(e){}}
 let saved={};
-async function listvms(){try{await persist();const j=await busy("Conectando con el origen y listando las VM …",()=>post("/listvms",form()));const s=document.getElementById("vm_select");s.innerHTML='<option value="">(elige una VM)</option>'+j.vms.map(v=>`<option value="${v.name}">${v.name} — ${v.state=="on"?"encendida":"apagada"}, ${v.cpu} vCPU, ${(v.memory_mb/1024).toFixed(1)} GiB${v.host?" · host "+v.host:""}</option>`).join("");show("Conectado a "+j.kind+": "+j.vms.length+" VM(s) encontradas. Elige una en el desplegable.")}catch(e){show("ERROR: "+e.message)}}
+async function listvms(){try{await persist();const j=await busy("Conectando con el origen y listando las VM …",()=>post("/listvms",form()));const s=document.getElementById("vm_select");s.innerHTML='<option value="">(elige una VM)</option>'+j.vms.map(v=>`<option value="${v.name}">${v.name} — ${v.state=="on"?"encendida":"apagada"}, ${v.cpu} vCPU, ${(v.memory_mb/1024).toFixed(1)} GiB${v.host?" · host "+v.host:""}</option>`).join("");note("Conectado a "+j.kind+": "+j.vms.length+" VM(s) encontradas. Elige una en el desplegable.")}catch(e){note("ERROR: "+e.message)}}
 let newNameTouched=false;
 function syncNewName(){if(!newNameTouched)document.getElementById("new_vm_name").value=document.getElementById("vm").value.trim()}
 async function analyze(force){const vm=document.getElementById("vm").value.trim();syncNewName();
  if(!vm||!document.getElementById("source_host").value.trim())return;
  if(!force&&analyzedVm===vm)return; // same VM: keep the disks the user ticked
  try{await persist();const j=await busy("Analizando la VM …",()=>post("/inspect",form()));analyzedVm=vm;renderDisks(j)}
- catch(e){document.getElementById("diskpanel").style.display="none";analyzedVm=null;show("ERROR: "+e.message)}}
+ catch(e){document.getElementById("diskpanel").style.display="none";analyzedVm=null;note("ERROR: "+e.message)}}
 let planTouched=false,lastSpec=null;
 // Choose the plan that matches the source VM (exact cores+memory, else the smallest one that is big enough).
 function pickPlan(){const sel=document.getElementById("plan_id"),hint=document.getElementById("planhint");if(!lastSpec)return;
@@ -835,11 +864,11 @@ function disksChanged(){const n=document.querySelectorAll(".diskchk:checked").le
 async function speedtest(){try{await persist();
  const j=await busy("Midiendo la velocidad (unos 20 s por cada vía) …",()=>post("/speedtest",form()));
  const line=(n,r)=>r.error?`${n}: no se pudo medir (${r.error})`:`${n}: ${r.mib_s.toFixed(1)} MiB/s (${r.mib.toFixed(0)} MiB leídos)`;
- show(line("Exportación (la que usa el programa)",j.export)+"\n"+line("Disco plano (como el navegador)",j.flat)
+ note(line("Exportación (la que usa el programa)",j.export)+"\n"+line("Disco plano (como el navegador)",j.flat)
  +(j.flat_parallel?"\n"+(j.flat_parallel.error?`Disco plano en paralelo: no se pudo medir (${j.flat_parallel.error})`:`Disco plano con ${j.flat_parallel.streams} conexiones a la vez: ${j.flat_parallel.mib_s.toFixed(1)} MiB/s`+(j.flat&&j.flat.mib_s?` (${(j.flat_parallel.mib_s/j.flat.mib_s).toFixed(1)}× la de una sola conexión)`:"")):"")
  +"\n\nSi la exportación va mucho más lenta que el disco plano, el límite es la compresión del ESXi, no el programa. Si varias conexiones suman mucho más que una, descargar el disco plano en paralelo compensaría.")}
- catch(e){show("ERROR: "+e.message)}}
-async function inspect_(){await analyze(true);if(analyzedVm)show("VM analizada: revisa el panel de discos.")}
+ catch(e){note("ERROR: "+e.message)}}
+async function inspect_(){await analyze(true);if(analyzedVm)note("VM analizada: revisa el panel de discos.")}
 async function quit(){if(currentJob&&!confirm("Hay una migración en curso. ¿Salir igualmente?"))return;
  try{await post("/shutdown",{})}catch(e){}
  document.body.innerHTML="<main><h1>Programa cerrado</h1><p>Ya puedes cerrar esta pestaña.</p></main>"}
@@ -848,20 +877,33 @@ fetch("/info").then(r=>r.json()).then(i=>{const b=document.getElementById("admin
  b.className="adminbadge "+(i.admin?"on":"off");b.textContent=i.admin?"Administrador":"Sin permisos de administrador";
  b.title=i.admin?"Este programa tiene permisos de administrador (necesarios para inyectar drivers).":"Para inyectar drivers hay que abrir el programa con clic derecho > Ejecutar como administrador. Si ya lo hiciste, cierra todas las ventanas y procesos vm2morpheus antiguos."}).catch(()=>{});
 setInterval(()=>fetch("/ping").catch(()=>{}),5000);fetch("/ping").catch(()=>{});
-async function refinfo(){try{show(JSON.stringify(await busy("Leyendo la instancia de referencia …",()=>post("/refinfo",form())),null,2))}catch(e){show("ERROR: "+e.message)}}
+async function refinfo(){try{note(JSON.stringify(await busy("Leyendo la instancia de referencia …",()=>post("/refinfo",form())),null,2))}catch(e){note("ERROR: "+e.message)}}
 async function sshtest(){const box=document.getElementById("sshres");box.className="";
  try{await persist();const j=await busy("Probando la conexión SSH …",()=>post("/sshtest",form()));
   const bad=j.lines.some(l=>l.startsWith("✖"));
-  box.textContent=(bad?"Conectado, pero hay problemas:\n":"Todo correcto:\n")+j.lines.join("\n");box.className=bad?"bad":"ok";show(j.lines.join("\n"))}
- catch(e){box.textContent="✖ "+e.message;box.className="bad";show("ERROR: "+e.message)}}
+  box.textContent=(bad?"Conectado, pero hay problemas:\n":"Todo correcto:\n")+j.lines.join("\n");box.className=bad?"bad":"ok";note(j.lines.join("\n"))}
+ catch(e){box.textContent="✖ "+e.message;box.className="bad";note("ERROR: "+e.message)}}
 async function lookups(){try{await persist();const j=await busy("Cargando datos de Morpheus …",()=>post("/lookups",form()));
  for(const [k,id] of [["clouds","cloud_id"],["groups","group_id"],["plans","plan_id"],["networks","network_id"],["instances","ref_instance_id"]]){
   const s=document.getElementById(id);s.innerHTML=(id=="ref_instance_id"?'<option value="">(ninguna)</option>':id=="network_id"?'<option value="">(elige una red)</option>':'')+j[k].map(([v,n,c,m])=>`<option value="${v}"${c?` data-cores="${c}" data-mem="${m}"`:""}>${n}</option>`).join("");if(saved[id])s.value=saved[id];else if(id=="network_id"&&j[k].length===1)s.value=j[k][0][0]}
  if(lastSpec&&!planTouched)pickPlan()
   {const s=document.getElementById("datastore_id");s.innerHTML='<option value="">(automático: lo elige Morpheus)</option>'+(j.datastores||[]).map(([v,n])=>`<option value="${v}">${esc(n)}</option>`).join("");if(saved.datastore_id)s.value=saved.datastore_id}
   for(const [k,id] of [["layouts","layout_id"],["pools","resource_pool"]]){const s=document.getElementById(id);s.innerHTML='<option value="">(automático)</option>'+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id]}
- show("Datos cargados.")}catch(e){show("ERROR: "+e.message)}}
+ note("Datos cargados.")}catch(e){note("ERROR: "+e.message)}}
 const SEP=String.fromCharCode(92);
+function hostRow(h){const d=document.createElement("div");d.className="hostrow";
+ d.innerHTML=`<input class="h-host" placeholder="vme01.empresa.local"><input class="h-user" placeholder="root"><input class="h-pw" type="password" autocomplete="off"><button class="sec" title="Quitar este host" onclick="this.parentNode.remove();syncHosts()">✕</button>`;
+ d.querySelector(".h-host").value=h.host||"";d.querySelector(".h-user").value=h.user||"";d.querySelector(".h-pw").value=h.pw||"";
+ d.querySelectorAll("input").forEach(i=>i.addEventListener("input",syncHosts));document.getElementById("hostlist").appendChild(d)}
+function addHost(){const rows=document.querySelectorAll(".hostrow"),last=rows[rows.length-1];
+ hostRow({user:last?last.querySelector(".h-user").value:""});syncHosts()}
+function syncHosts(){const rows=[...document.querySelectorAll(".hostrow")];
+ document.getElementById("ssh_hosts").value=JSON.stringify(rows.map(r=>({host:r.querySelector(".h-host").value.trim(),user:r.querySelector(".h-user").value.trim()})));
+ document.getElementById("ssh_passwords").value=JSON.stringify(rows.map(r=>r.querySelector(".h-pw").value))}
+function renderHosts(saved){let hosts=[],pws=[];try{hosts=JSON.parse(saved.ssh_hosts||"[]");pws=JSON.parse(saved.ssh_passwords||"[]")}catch(e){}
+ if(!hosts.length&&saved.ssh_host)hosts=saved.ssh_host.split(/[,;]/).map(h=>h.trim()).filter(Boolean).map(h=>({host:h,user:saved.ssh_user||""}));
+ if(!pws.length&&saved.ssh_password)pws=hosts.map(()=>saved.ssh_password);
+ document.getElementById("hostlist").innerHTML="";(hosts.length?hosts:[{}]).forEach((h,i)=>hostRow({host:h.host,user:h.user,pw:pws[i]||""}));syncHosts()}
 function uploadMode(){const r=document.querySelector('input[name=upload_mode]:checked');const ssh=!!r&&r.value==="ssh";
  document.getElementById("ssh_direct").checked=ssh;document.getElementById("sshopts").style.display=ssh?"block":"none";
  document.getElementById("libopts").style.display=ssh?"none":"";
@@ -883,9 +925,9 @@ async function openPicker(path){try{const r=await fetch("/browse?path="+encodeUR
  const add=(txt,go)=>{const d=document.createElement("div");d.className="item";d.textContent=txt;d.onclick=go;list.appendChild(d)};
  j.drives.forEach(d=>add(`${d.path} — ${gib(d.free)} libres de ${gib(d.total)} (${d.local?"local":"red/otro"})`,()=>openPicker(d.path)));
  j.dirs.forEach(n=>add("📁 "+n,()=>openPicker(j.path.endsWith(SEP)||j.path.endsWith("/")?j.path+n:j.path+(j.path.includes(SEP)?SEP:"/")+n)));
- if(!j.drives.length&&!j.dirs.length)add("(sin subcarpetas)",()=>{})}catch(e){show("ERROR: "+e.message)}}
+ if(!j.drives.length&&!j.dirs.length)add("(sin subcarpetas)",()=>{})}catch(e){note("ERROR: "+e.message)}}
 function pickerUp(){openPicker(pickerState.parent||"")}
-function pickerUse(){if(pickerState.path){document.getElementById("workdir").value=pickerState.path;closePicker()}else show("Entra primero en un disco o carpeta.")}
+function pickerUse(){if(pickerState.path){document.getElementById("workdir").value=pickerState.path;closePicker()}else note("Entra primero en un disco o carpeta.")}
 function closePicker(){document.getElementById("picker").style.display="none"}
 
 function showTab(name){for(const t of["migrar","historico"]){document.getElementById("tab-"+t).style.display=t===name?"block":"none";document.getElementById("tabbtn-"+t).classList.toggle("on",t===name)}
@@ -901,7 +943,7 @@ async function loadHistory(){try{const j=await (await fetch("/history")).json();
  const tbl=document.getElementById("histtable");tbl.style.display=rows.length?"table":"none";
  tbl.querySelector("tbody").innerHTML=rows.map(e=>{const st=STATUS[e.status]||[e.status,""],sp=e.speeds_mib_s||{};
   return `<tr onclick="showDetail('${esc(e.id)}')"><td>${esc((e.started||"").replace("T"," "))}</td><td>${esc(e.vm)}${e.target_name&&e.target_name!==e.vm?" → "+esc(e.target_name):""}</td><td>${esc(e.source_type)} ${esc(e.source_host)}</td><td>${e.gib?e.gib.toFixed(1)+" GiB":"–"}</td><td>${fmtDur(e.total_seconds)}</td><td>${fmtMibs(sp.fetch)}</td><td>${fmtMibs(sp.upload)}</td><td><span class="badge ${st[1]}">${st[0]}</span></td></tr>`}).join("");
- document.getElementById("histdetail").style.display="none"}catch(e){show("ERROR: "+e.message)}}
+ document.getElementById("histdetail").style.display="none"}catch(e){note("ERROR: "+e.message)}}
 function renderCards(s){const c=(v,l)=>`<div class="card"><b>${v}</b><span>${l}</span></div>`;
  document.getElementById("histcards").innerHTML=c(s.runs,"migraciones registradas")+c(s.ok+" ("+(s.runs?Math.round(100*s.ok/s.runs):0)+"%)","correctas")+c(s.gib_moved.toFixed(1)+" GiB","datos subidos a Morpheus")+c(fmtMibs(s.avg_download),"descarga media")+c(fmtMibs(s.avg_upload),"subida media")+c(s.avg_seconds?fmtDur(s.avg_seconds):"–","duración media")}
 async function showDetail(id){const e=await (await fetch("/history/"+id)).json(),box=document.getElementById("histdetail");
@@ -953,16 +995,17 @@ function drawBar(r){const w=document.getElementById("barwrap"),b=document.getEle
  if(r.status==="running"&&p&&p.step)txt=`Paso ${p.index} de ${p.total_steps}: ${p.label} (${p.fraction==null?"en curso":Math.round(p.fraction*100)+"%"}) · Total estimado ${pct}%`;
  else if(r.status==="done")txt="Terminado · 100%";else if(r.status==="error")txt=`Error · ${pct}% completado`;else if(r.status==="cancelled")txt=`Cancelado · ${pct}% completado`;
  l.textContent=txt}
-async function cancelJob(){if(!currentJob)return;document.getElementById("cancelbtn").disabled=true;try{await post("/cancel",{job:currentJob})}catch(e){show("ERROR: "+e.message)}}
-async function run(p){try{await persist();const {job}=await post(p,form());currentJob=job;show("Trabajo "+job+" en marcha...");
+async function cancelJob(){if(!currentJob)return;document.getElementById("cancelbtn").disabled=true;try{await post("/cancel",{job:currentJob})}catch(e){note("ERROR: "+e.message)}}
+async function run(p){try{await persist();const {job}=await post(p,form());currentJob=job;note("Trabajo "+job+" en marcha...");
  const btn=document.getElementById("cancelbtn");btn.style.display="inline-block";btn.disabled=false;resetChart();document.getElementById("barwrap").style.display="none";
- const t=setInterval(async()=>{const r=await (await fetch("/job/"+job)).json();show(r.log||"...");drawBar(r);feedChart(r);if(r.status==="done"&&r.done&&!doneShown.has(job)){doneShown.add(job);showDoneDialog(job,r.done)}if(r.status!=="running"){clearInterval(t);btn.style.display="none";currentJob=null}},1000)}catch(e){show("ERROR: "+e.message)}}
+ const t=setInterval(async()=>{const r=await (await fetch("/job/"+job)).json();show(r.log||"...");drawBar(r);feedChart(r);if(r.status==="done"&&r.done&&!doneShown.has(job)){doneShown.add(job);showDoneDialog(job,r.done)}if(r.status!=="running"){clearInterval(t);btn.style.display="none";currentJob=null}},1000)}catch(e){note("ERROR: "+e.message)}}
 srcHint();
+renderHosts({});
 (async()=>{try{saved=await (await fetch("/settings")).json();
  ids.forEach(i=>{if(saved[i]!==undefined&&document.getElementById(i).tagName==="INPUT"||saved[i]!==undefined&&["source_type","os_family","vmware_method"].includes(i))document.getElementById(i).value=saved[i]});
  newNameTouched=!!(saved.new_vm_name&&saved.new_vm_name!==saved.vm); // a name typed earlier is kept
  chks.forEach(i=>{if(saved[i]!==undefined)document.getElementById(i).checked=!!saved[i]});
- setUploadMode();
+ renderHosts(saved);setUploadMode();
  srcHint();
  if(saved.morpheus_url&&saved.morpheus_token)lookups()}catch(e){}})();
 </script></html>"""

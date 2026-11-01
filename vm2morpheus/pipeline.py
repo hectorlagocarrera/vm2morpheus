@@ -9,7 +9,7 @@ from pathlib import Path
 
 from .bundle import build_bundle, disk_file_name
 from .convert import convert_disk, find_tool, inject_drivers
-from .direct import PLACEHOLDER_NAME, HostShell, push_disks, stage_disk
+from .direct import PLACEHOLDER_NAME, HostShell, connect_host, host_entries, push_disks, stage_disk
 from .drivers_windows import ensure_virtio_iso, inject_virtio_windows, is_admin
 from .morpheus import MorpheusClient, MorpheusError, payload_from_reference, render_template
 from .sources.base import Source
@@ -198,7 +198,8 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     direct = bool(ssh) and bool(mcfg.get("reference_instance"))
     if ssh and not direct:
         log("Aviso: la subida directa por SSH necesita crear la VM (bloque 3); se sube la imagen a la biblioteca")
-    log("Subida de los discos: " + (f"directa al almacén de datos por SSH (hosts: {ssh['host']})" if direct
+    log("Subida de los discos: " + (f"directa al almacén de datos por SSH (hosts: "
+                                    f"{', '.join(e['host'] for e in host_entries(ssh))})" if direct
                                     else "biblioteca de imágenes de Morpheus"))
     if st.d.get("placeholder") and not st.d.get("pushed") and not direct:
         # started with the direct upload, now without it: never create (or leave) a VM with the blank placeholder disk
@@ -531,8 +532,7 @@ def staging_folder(morpheus, mcfg: dict, source, target: str, log=print) -> str 
 
 
 def stage_data_disks(source, vm, ssh: dict, staging: str, fetch_bar, log=print, cancel=None) -> list[str]:
-    first = [h.strip() for h in ssh["host"].replace(";", ",").split(",") if h.strip()][0]  # any host: shared datastore
-    shell = HostShell(first, ssh.get("user") or "root", ssh.get("password"), ssh.get("key_file"))
+    shell = connect_host(ssh, host_entries(ssh)[0]["host"], HostShell)  # any host: the datastore is shared
     try:
         out = []
         for d in vm.disks[1:]:

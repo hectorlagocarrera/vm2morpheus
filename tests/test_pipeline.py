@@ -164,9 +164,9 @@ def test_gui_synthetic_reference_builds_hvm_payload():
     assert p["config"]["imageId"] == 77 and p["config"]["resourcePoolId"] == "pool-9"
     assert p["networkInterfaces"] == [{"network": {"id": "network-5"}}]
     assert [v["size"] for v in p["volumes"]] == [110, 100] and p["volumes"][0]["datastoreId"] == "auto"
-    jl = JobLog()
-    jl.write("a\n\rp 10%\rp 50%")
-    assert jl.text() == "a\np 50%"
+    jl = JobLog(clock=lambda: "01/11/2026 10:00:00")
+    jl.write("a\n\r  p 10%\r  p 50%")
+    assert jl.text() == "01/11/2026 10:00:00  a\n01/11/2026 10:00:00  p 50%"
 
 
 def test_gui_http_serves_page_and_rejects_unknown_job():
@@ -3277,3 +3277,38 @@ def test_a_direct_migration_switched_to_the_library_before_the_vm_exists_uploads
         srv.shutdown()
     assert any("se suben a la biblioteca" in m for m in msgs)
     assert FakeMorpheus.uploads[7][:4] == b"QFI\xfb" and res["images"] and res["images"][0]["id"] == 7
+
+
+def test_each_hvm_host_has_its_own_login():
+    from vm2morpheus.gui import ssh_cfg
+    cfg = ssh_cfg({"ssh_hosts": json.dumps([{"host": "vme01", "user": "hvmadmin"}, {"host": "vme02", "user": ""}]),
+                   "ssh_passwords": json.dumps(["uno", "dos"])})
+    assert cfg["hosts"] == [{"host": "vme01", "user": "hvmadmin", "password": "uno"},
+                            {"host": "vme02", "user": "root", "password": "dos"}]
+    old = ssh_cfg({"ssh_host": "a, b", "ssh_user": "u", "ssh_password": "p"})   # settings of older versions
+    assert [h["host"] for h in old["hosts"]] == ["a", "b"] and old["hosts"][1]["password"] == "p"
+    with pytest.raises(ValueError, match="al menos un host"):
+        ssh_cfg({"ssh_hosts": "[]"})
+
+
+def test_connect_host_uses_the_hosts_login_and_tries_the_others_for_an_untyped_address():
+    from vm2morpheus.direct import DirectError, connect_host
+    ssh = {"hosts": [{"host": "vme01", "user": "a", "password": "1"}, {"host": "vme02", "user": "b", "password": "2"}]}
+    tried = []
+
+    def connect(host, user, password, key):
+        tried.append((host, user, password))
+        if (host, password) in (("vme02", "2"), ("192.168.40.32", "2")):
+            return "ok"
+        raise DirectError(f"SSH a {host}: usuario o contraseña/clave incorrectos")
+
+    assert connect_host(ssh, "vme02", connect) == "ok" and tried == [("vme02", "b", "2")]
+    tried.clear()
+    assert connect_host(ssh, "192.168.40.32", connect) == "ok"            # address reported by Morpheus
+    assert tried == [("192.168.40.32", "a", "1"), ("192.168.40.32", "b", "2")]
+
+    def down(host, user, password, key):
+        raise DirectError(f"No se pudo conectar por SSH a {host}: timed out")
+
+    with pytest.raises(DirectError, match="No se pudo conectar"):
+        connect_host(ssh, "vme01", down)
