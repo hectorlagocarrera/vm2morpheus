@@ -3182,3 +3182,31 @@ def test_an_old_placeholder_gets_vm_tools_unchecked_so_morpheus_does_not_wait_fo
 
     assert ensure_placeholder(M(), tmp_path, False, lambda *_: None) == {"id": 9, "name": "vm2morpheus-vacia"}
     assert updates == [(9, {"vmToolsInstalled": False, "installAgent": False, "isCloudInit": False})]
+
+
+def test_push_disks_power_cycles_again_if_the_vm_still_holds_the_old_blank_disk(tmp_path, monkeypatch):
+    from vm2morpheus import direct
+    (d0, d1), (l0, l1), xml = _push_setup(tmp_path)
+    m, msgs = _PowerMorpheus(), []
+    answers = iter([[str(d0)], []])   # first check: the old file is still open; after the power cycle: clean
+    monkeypatch.setattr(direct, "stale_disks", lambda shell, name, targets: next(answers))
+
+    def connect(*a):
+        m.shell = LocalShell(*a, xml=xml, state="running")
+        return m.shell
+
+    direct.push_disks(m, 42, "w2k16", [l0, l1], {"host": "vme02"}, msgs.append, connect=connect, sleep=lambda s: None)
+    assert any("sigue usando el disco vacío anterior" in x for x in msgs)
+    assert m.actions == ["stop", "start", "start"] and any("virsh destroy" in c for c in m.shell.cmds)
+
+
+def test_stale_disks_reads_the_deleted_files_held_by_qemu():
+    from vm2morpheus.direct import stale_disks
+
+    class Sh(LocalShell):
+        def run(self, cmd, check=True, timeout=3600):
+            return ("lrwx------ 1 libvirt-qemu kvm 64 nov 1 12:00 17 -> /mnt/ds/w2k16/hvm_47-disk-0-bed12f3 (deleted)\n"
+                    "lrwx------ 1 libvirt-qemu kvm 64 nov 1 12:00 18 -> /mnt/ds/w2k16/hvm_47-disk-1-aa\n")
+
+    assert stale_disks(Sh("h", "root"), "w2k16", ["/mnt/ds/w2k16/hvm_47-disk-0-bed12f3",
+                                                   "/mnt/ds/w2k16/hvm_47-disk-1-aa"]) == ["/mnt/ds/w2k16/hvm_47-disk-0-bed12f3"]

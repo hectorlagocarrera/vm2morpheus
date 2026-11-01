@@ -387,6 +387,16 @@ def power_off(morpheus, instance_id: int, shell, vm_name: str, log=print, sleep=
     raise DirectError(f"La VM {vm_name!r} no se apagó: no se tocan sus discos")
 
 
+def stale_disks(shell, vm_name: str, targets: list[str]) -> list[str]:
+    """Disk paths the VM's running qemu process still holds as deleted files, i.e. it was started before they were
+    replaced. Empty when it is not running on this host or the check is not possible."""
+    script = (f"pid=$(cat /run/libvirt/qemu/{shlex.quote(vm_name)}.pid 2>/dev/null) && "
+              "[ -n \"$pid\" ] && ls -l /proc/$pid/fd 2>/dev/null")
+    out = shell.run(f"{shell.as_user('root')}sh -c {shlex.quote(script)}", check=False)
+    held = [line for line in out.splitlines() if "(deleted)" in line]
+    return [t for t in targets if any(f"-> {t} (deleted)" in line for line in held)]
+
+
 def power_on(morpheus, instance_id: int, shell, vm_name: str, log=print, sleep=time.sleep) -> None:
     try:
         morpheus.instance_action(instance_id, "start")
@@ -430,6 +440,22 @@ def push_disks(morpheus, instance_id: int, vm_name: str, disks: list, ssh: dict,
             power_off(morpheus, instance_id, shell, vm_name, log, sleep)
         log("Arrancando la VM con los discos migrados ...")
         power_on(morpheus, instance_id, shell, vm_name, log, sleep)
+        for attempt in range(2):  # make sure the running process opened the NEW files, not the replaced ones
+            stale = stale_disks(shell, vm_name, targets[:len(disks)])
+            if not stale:
+                break
+            log("La VM sigue usando el disco vacío anterior (" + ", ".join(posixpath.basename(t) for t in stale)
+                + "); se apaga y se enciende de nuevo ...")
+            shell.run(f"{VIRSH} destroy {shlex.quote(vm_name)}", check=False)
+            for _ in range(30):
+                if _is_off(shell, vm_name):
+                    break
+                sleep(2)
+            power_on(morpheus, instance_id, shell, vm_name, log, sleep)
+        else:
+            if stale_disks(shell, vm_name, targets[:len(disks)]):
+                raise DirectError("Los discos se copiaron, pero la VM sigue arrancada con el disco vacío anterior. "
+                                  "Apágala y enciéndela desde Morpheus (Stop y Start, no Restart).")
     finally:
         shell.close()
     log("VM arrancada. Si Morpheus la sigue mostrando como 'provisioning', la dará por creada cuando Windows arranque "
