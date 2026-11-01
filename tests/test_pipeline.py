@@ -3230,3 +3230,50 @@ def test_push_disks_waits_for_morpheus_and_detects_a_disk_overwritten_afterwards
         direct.push_disks(m, 42, "w2k16", [l0, l1], {"host": "vme02"}, msgs.append, connect=connect,
                           sleep=lambda s: None)
     assert seen and any("Morpheus ha terminado de crear la VM" in x for x in msgs)
+
+
+def _direct_state(tmp_path, **extra):
+    wd = tmp_path / "wd" / "vm1"
+    wd.mkdir(parents=True)
+    conv = wd / "d.qcow2"
+    subprocess.run(["qemu-img", "create", "-f", "qcow2", str(conv), "8M"], check=True, capture_output=True)
+    st = {"done": ["fetch", "convert", "drivers", "upload"], "fetched": [], "converted": [str(conv)],
+          "images": [], "placeholder": {"id": 7, "name": "vm2morpheus-vacia-uefi"}, **extra}
+    (wd / "state.json").write_text(json.dumps(st))
+    return wd
+
+
+def test_a_direct_migration_resumed_without_ssh_never_ends_with_the_blank_vm(tmp_path):
+    from vm2morpheus.gui import synthetic_reference
+    _direct_state(tmp_path, instance={"id": 42, "name": "vm1"}, done=["fetch", "convert", "drivers", "upload", "instance"])
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    ref = synthetic_reference({"cloud_id": "1", "group_id": "1", "plan_id": "23", "network_id": "3"})
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        with pytest.raises(RuntimeError, match="Elige «Directa al almacén de datos \\(SSH\\)»"):
+            migrate(FakeSource(disk), _client(srv), "vm1", {"workdir": str(tmp_path / "wd"), "shutdown_source": True},
+                    {"image_type": "qcow2", "reference_instance": {"synthetic": ref}}, log=lambda *_: None)
+    finally:
+        srv.shutdown()
+
+
+def test_a_direct_migration_switched_to_the_library_before_the_vm_exists_uploads_the_disk(tmp_path):
+    from vm2morpheus.gui import synthetic_reference
+    _direct_state(tmp_path)
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    ref = synthetic_reference({"cloud_id": "1", "group_id": "1", "plan_id": "23", "network_id": "3"})
+    FakeMorpheus.log.clear()
+    FakeMorpheus.uploads.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    msgs = []
+    try:
+        res = migrate(FakeSource(disk), _client(srv), "vm1", {"workdir": str(tmp_path / "wd"), "shutdown_source": True},
+                      {"image_type": "qcow2", "reference_instance": {"synthetic": ref}}, log=msgs.append)
+    finally:
+        srv.shutdown()
+    assert any("se suben a la biblioteca" in m for m in msgs)
+    assert FakeMorpheus.uploads[7][:4] == b"QFI\xfb" and res["images"] and res["images"][0]["id"] == 7

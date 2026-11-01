@@ -194,6 +194,26 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         st.d["done"].remove("instance")  # redo only the last step; delete the old instance in Morpheus first
         st.d.pop("instance", None)
         st.path.write_text(json.dumps(st.d, indent=2))
+    ssh = opts.get("ssh") or None  # direct upload to the HVM host: the disks replace those of a VM made from a blank image
+    direct = bool(ssh) and bool(mcfg.get("reference_instance"))
+    if ssh and not direct:
+        log("Aviso: la subida directa por SSH necesita crear la VM (bloque 3); se sube la imagen a la biblioteca")
+    log("Subida de los discos: " + (f"directa al almacén de datos por SSH (hosts: {ssh['host']})" if direct
+                                    else "biblioteca de imágenes de Morpheus"))
+    if st.d.get("placeholder") and not st.d.get("pushed") and not direct:
+        # started with the direct upload, now without it: never create (or leave) a VM with the blank placeholder disk
+        if st.d.get("instance") or st.d.get("staged"):
+            raise RuntimeError(
+                "Esta migración se empezó con la subida directa al almacén de datos (SSH)"
+                + (" y la VM ya está creada en Morpheus, todavía con el disco vacío" if st.d.get("instance") else
+                   " y los discos de datos ya están en el almacén")
+                + ". Elige «Directa al almacén de datos (SSH)» en el paso 4 y vuelve a lanzarla para terminarla.")
+        log("Esta migración se empezó con la subida directa por SSH, que ahora no está elegida: los discos se suben a "
+            "la biblioteca de Morpheus")
+        st.d["done"] = [x for x in st.d.get("done", []) if x != "upload"]
+        st.d.pop("placeholder", None)
+        st.d.pop("images", None)
+        st.path.write_text(json.dumps(st.d, indent=2))
     steps = relevant_steps(opts, mcfg, bool(st.d.get("injected")))
     done = [x for x in steps if st.done(x)]
     pending = [x for x in steps if not st.done(x)]
@@ -209,10 +229,6 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         log(f"Para migrarla otra vez desde cero, borra {st.path}; para recrear solo la VM, marca "
             "'Recrear solo la instancia'.")
 
-    ssh = opts.get("ssh") or None  # direct upload to the HVM host: the disks replace those of a VM made from a blank image
-    direct = bool(ssh) and bool(mcfg.get("reference_instance"))
-    if ssh and not direct:
-        log("Aviso: la subida directa por SSH necesita crear la VM (bloque 3); se sube la imagen a la biblioteca")
     bundle = bool(opts.get("multi_disk_bundle", True)) and len(vm.disks) > 1 and not direct
     staging = None  # folder on the datastore where data disks go straight from the source (direct mode)
     if direct and len(vm.disks) > 1 and not st.done("fetch"):
