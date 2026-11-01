@@ -206,9 +206,11 @@ BOOT_DRIVERS = {
 
 
 def _boot_script(win: str, names: list[str]) -> str:
-    """PowerShell that makes the given storage drivers load at boot in the offline Windows at `win`, then unloads the
-    hive (retrying: a handle left open makes the unload fail and the changes may never reach the disk), loads it
-    again and reads the values back to prove they were persisted."""
+    """PowerShell that makes the given storage drivers load at boot in the offline Windows at `win`.
+
+    Everything is written with reg.exe, not with the PowerShell registry provider: the provider keeps handles open
+    in the PowerShell process and the hive can then not be unloaded, so the changes would never reach the disk.
+    The hive is unloaded (with retries), loaded again and read back to prove the values were persisted."""
     ids = "@{" + "; ".join(
         f"{ps_quote(n)}=@({', '.join(ps_quote(i) for i in BOOT_DRIVERS[n])})" for n in names) + "}"
     return f"""
@@ -216,6 +218,8 @@ $ErrorActionPreference='Stop'
 $win = {ps_quote(win)}
 $map = {ids}
 $hive = $win + 'Windows\\System32\\config\\SYSTEM'
+$cls = '{{4D36E97B-E325-11CE-BFC1-08002BE10318}}'
+function Reg {{ & reg.exe @args | Out-Null; if ($LASTEXITCODE -ne 0) {{ throw ('reg.exe ' + ($args -join ' ') + ' fallo (' + $LASTEXITCODE + ')') }} }}
 function Unload-Hive {{
   for ($i = 0; $i -lt 20; $i++) {{
     [gc]::Collect(); [gc]::WaitForPendingFinalizers()
@@ -225,11 +229,12 @@ function Unload-Hive {{
   }}
   throw 'no se pudo cerrar el registro del disco (SYSTEM): los cambios podrian perderse'
 }}
-reg load HKLM\\VM2M_SYS $hive | Out-Null
+cmd /c 'reg unload HKLM\\VM2M_SYS >nul 2>&1'   # a hive left loaded by an earlier failed run
+Reg load 'HKLM\\VM2M_SYS' $hive
 try {{
+  $cur = ((& reg.exe query 'HKLM\\VM2M_SYS\\Select' /v Current) -join ' ') -replace '.*0x([0-9a-fA-F]+).*', '$1'
   $roots = @('ControlSet001')
-  $cur = (Get-ItemProperty 'HKLM:\\VM2M_SYS\\Select').Current
-  if ($cur -and $cur -ne 1) {{ $roots += ('ControlSet{{0:d3}}' -f [int]$cur) }}
+  if ($cur -match '^[0-9a-fA-F]+$' -and [Convert]::ToInt32($cur, 16) -gt 1) {{ $roots += ('ControlSet{{0:d3}}' -f [Convert]::ToInt32($cur, 16)) }}
   foreach ($name in $map.Keys) {{
     $sys = $win + 'Windows\\System32\\drivers\\' + $name + '.sys'
     if (-not (Test-Path $sys)) {{
@@ -238,32 +243,30 @@ try {{
       Copy-Item $src.FullName $sys
     }}
     foreach ($r in $roots) {{
-      $svc = 'HKLM:\\VM2M_SYS\\' + $r + '\\Services\\' + $name
-      New-Item -Path $svc -Force | Out-Null
-      Set-ItemProperty $svc -Name Type -Value 1 -Type DWord
-      Set-ItemProperty $svc -Name Start -Value 0 -Type DWord
-      Set-ItemProperty $svc -Name ErrorControl -Value 1 -Type DWord
-      Set-ItemProperty $svc -Name Group -Value 'SCSI miniport' -Type String
-      Set-ItemProperty $svc -Name ImagePath -Value ('system32\\drivers\\' + $name + '.sys') -Type ExpandString
+      $svc = 'HKLM\\VM2M_SYS\\' + $r + '\\Services\\' + $name
+      Reg add $svc /v Type /t REG_DWORD /d 1 /f
+      Reg add $svc /v Start /t REG_DWORD /d 0 /f
+      Reg add $svc /v ErrorControl /t REG_DWORD /d 1 /f
+      Reg add $svc /v Group /t REG_SZ /d 'SCSI miniport' /f
+      Reg add $svc /v ImagePath /t REG_EXPAND_SZ /d ('system32\\drivers\\' + $name + '.sys') /f
       foreach ($id in $map[$name]) {{
-        $k = 'HKLM:\\VM2M_SYS\\' + $r + '\\Control\\CriticalDeviceDatabase\\' + $id
-        New-Item -Path $k -Force | Out-Null
-        Set-ItemProperty $k -Name Service -Value $name -Type String
-        Set-ItemProperty $k -Name ClassGUID -Value '{{4D36E97B-E325-11CE-BFC1-08002BE10318}}' -Type String
-        Set-ItemProperty $k -Name Class -Value 'SCSIAdapter' -Type String
+        $k = 'HKLM\\VM2M_SYS\\' + $r + '\\Control\\CriticalDeviceDatabase\\' + $id
+        Reg add $k /v Service /t REG_SZ /d $name /f
+        Reg add $k /v ClassGUID /t REG_SZ /d $cls /f
+        Reg add $k /v Class /t REG_SZ /d 'SCSIAdapter' /f
       }}
     }}
   }}
 }} finally {{
   Unload-Hive
 }}
-reg load HKLM\\VM2M_SYS $hive | Out-Null
+Reg load 'HKLM\\VM2M_SYS' $hive
 try {{
   $out = foreach ($name in $map.Keys) {{
-    $start = (Get-ItemProperty ('HKLM:\\VM2M_SYS\\ControlSet001\\Services\\' + $name)).Start
-    $n = @(Get-ChildItem 'HKLM:\\VM2M_SYS\\ControlSet001\\Control\\CriticalDeviceDatabase' | Where-Object {{ (Get-ItemProperty $_.PSPath).Service -eq $name }}).Count
-    if ($start -ne 0 -or $n -lt 1) {{ throw ($name + ': el registro no se guardo en el disco') }}
-    $name + ' Start=' + $start + ' (' + $n + ' ids PCI)'
+    $start = (& reg.exe query ('HKLM\\VM2M_SYS\\ControlSet001\\Services\\' + $name) /v Start) -join ' '
+    $found = @((& reg.exe query 'HKLM\\VM2M_SYS\\ControlSet001\\Control\\CriticalDeviceDatabase' /s /v Service) | Where-Object {{ $_ -match ('REG_SZ\\s+' + $name + '\\s*$') }}).Count
+    if ($start -notmatch 'REG_DWORD\\s+0x0\\s*$' -or $found -lt 1) {{ throw ($name + ': el registro no se guardo en el disco') }}
+    $name + ' Start=0 (' + $found + ' ids PCI)'
   }}
   $out -join ', '
 }} finally {{
