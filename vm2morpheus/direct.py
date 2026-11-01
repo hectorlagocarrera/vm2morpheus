@@ -363,29 +363,59 @@ def domstate(shell, vm_name: str) -> str:
     return shell.run(f"{VIRSH} domstate {shlex.quote(vm_name)}", check=False).strip().lower()
 
 
+def _is_off(shell, vm_name: str) -> bool:
+    return domstate(shell, vm_name) in ("shut off", "apagado")
+
+
+def power_off(morpheus, instance_id: int, shell, vm_name: str, log=print, sleep=time.sleep) -> None:
+    """Stop the VM through Morpheus first (so it knows the VM is meant to be off: clusters with "auto recover power
+    state" switch on any VM that is powered off behind their back), and with virsh if that does not work."""
+    try:
+        morpheus.instance_action(instance_id, "stop")
+        for _ in range(45):
+            if _is_off(shell, vm_name):
+                return
+            sleep(2)
+    except Exception as e:  # e.g. Morpheus refuses actions while the instance is still provisioning
+        log(f"Morpheus no pudo apagarla ({e}); se apaga en el host")
+    shell.run(f"{VIRSH} destroy {shlex.quote(vm_name)}", check=False)
+    for _ in range(30):
+        if _is_off(shell, vm_name):
+            return
+        sleep(2)
+    raise DirectError(f"La VM {vm_name!r} no se apagó: no se tocan sus discos")
+
+
+def power_on(morpheus, instance_id: int, shell, vm_name: str, log=print, sleep=time.sleep) -> None:
+    try:
+        morpheus.instance_action(instance_id, "start")
+        for _ in range(30):
+            if not _is_off(shell, vm_name):
+                return
+            sleep(2)
+    except Exception as e:
+        log(f"Morpheus no pudo arrancarla ({e}); se arranca en el host")
+    if _is_off(shell, vm_name):
+        shell.run(f"{VIRSH} start {shlex.quote(vm_name)}")
+
+
 def push_disks(morpheus, instance_id: int, vm_name: str, disks: list, ssh: dict, log=print,
                progress_for=None, cancel=None, connect=HostShell, sleep=time.sleep) -> str:
-    """Power off the new VM on its host, replace its disk files with `disks` (boot disk first) and start it.
+    """Power off the new VM, replace its disk files with `disks` (boot disk first) and start it again.
 
-    Everything happens with virsh on the host: Morpheus keeps the instance in "provisioning" until an operating
-    system boots and gets a network address, which never happens with the blank placeholder disk, so its API
-    cannot be used to stop/start it at this point. Returns the host used."""
+    The VM is found with virsh on whichever cluster host Morpheus placed it. Power actions go through Morpheus
+    when it accepts them and through virsh otherwise. Each disk file is swapped in one step (mv), so even if the
+    VM is switched on meanwhile (auto recover) it keeps the old file open and the new one is intact; that is why
+    it is always fully stopped and started again at the end, so the new process opens the new disks."""
     log("Esperando a que la VM aparezca en el host (Morpheus la está creando) ...")
     log("Hosts donde se buscará: " + ", ".join(candidate_hosts(morpheus, instance_id, ssh.get("host", ""))))
     shell, host, vm_name, xml = find_domain(morpheus, instance_id, vm_name, ssh, log, connect, sleep=sleep)
     log(f"VM encontrada en {host} (en libvirt se llama {vm_name!r})")
-    q = shlex.quote(vm_name)
     try:
-        if domstate(shell, vm_name) not in ("shut off", "apagado"):
-            log(f"Apagando en {host} la VM recién creada (solo tiene el disco vacío de la plantilla) ...")
-            shell.run(f"{VIRSH} destroy {q}", check=False)
-            for _ in range(30):
-                if domstate(shell, vm_name) in ("shut off", "apagado"):
-                    break
-                sleep(2)
-            else:
-                raise DirectError(f"La VM {vm_name!r} no se apagó en {host}: no se tocan sus discos")
-        xml = shell.run(f"{VIRSH} dumpxml {q}")  # again: the definition may have changed while it was booting
+        if not _is_off(shell, vm_name):
+            log(f"Apagando la VM recién creada (solo tiene el disco vacío de la plantilla) ...")
+            power_off(morpheus, instance_id, shell, vm_name, log, sleep)
+        xml = shell.run(f"{VIRSH} dumpxml {shlex.quote(vm_name)}")  # again: it may have changed while booting
         targets = domain_disks(xml)
         if len(targets) < len(disks):
             raise DirectError(f"La VM tiene {len(targets)} disco(s) en {host} y hay {len(disks)} para subir")
@@ -393,13 +423,14 @@ def push_disks(morpheus, instance_id: int, vm_name: str, disks: list, ssh: dict,
         for i, (local, target) in enumerate(zip(disks, targets)):
             pf = progress_for(i) if progress_for and not isinstance(local, str) else None
             replace_disk(shell, local, target, log, pf, cancel)
-        if domstate(shell, vm_name) not in ("shut off", "apagado"):
-            raise DirectError(f"Alguien encendió la VM {vm_name!r} mientras se sustituían los discos; apágala, "
-                              "reintenta la migración y no la arranques a mano hasta que termine")
-        log("Arrancando la VM ...")
-        shell.run(f"{VIRSH} start {q}")
+        if not _is_off(shell, vm_name):  # switched on meanwhile: it still runs on the old (blank) files
+            log("La VM se encendió durante la copia (Morpheus recupera el estado de encendido); se apaga otra vez "
+                "para que arranque con los discos nuevos ...")
+            power_off(morpheus, instance_id, shell, vm_name, log, sleep)
+        log("Arrancando la VM con los discos migrados ...")
+        power_on(morpheus, instance_id, shell, vm_name, log, sleep)
     finally:
         shell.close()
-    log("VM arrancada. Morpheus la dará por creada cuando Windows arranque y obtenga una dirección de red "
-        "(puede tardar unos minutos; el estado 'provisioning' hasta entonces es normal).")
+    log("VM arrancada. Si Morpheus la sigue mostrando como 'provisioning', la dará por creada cuando Windows arranque "
+        "y obtenga una dirección de red.")
     return host

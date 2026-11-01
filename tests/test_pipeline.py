@@ -2865,32 +2865,70 @@ class _InstMorpheus:
         raise RuntimeError("no API in this fake")
 
 
-def test_push_disks_powers_off_on_the_host_replaces_every_disk_then_starts(tmp_path):
-    from vm2morpheus.direct import push_disks
+def _push_setup(tmp_path):
     d0, d1 = tmp_path / "hvm_47-disk-0-bed12f3", tmp_path / "hvm_47-disk-1-aa"
     _qcow(d0, "2M")
     _qcow(d1, "1M")
     l0, l1 = tmp_path / "w-sda.qcow2", tmp_path / "w-sdb.qcow2"
     _qcow(l0, "2M", data="0x11")
     _qcow(l1, "1M", data="0x22")
-    xml = DOMAIN_XML.replace("/mnt/ds/w2k16", str(tmp_path))
-    m, msgs, shells = _InstMorpheus(), [], []
+    return (d0, d1), (l0, l1), DOMAIN_XML.replace("/mnt/ds/w2k16", str(tmp_path))
+
+
+class _PowerMorpheus(_InstMorpheus):
+    """Morpheus whose stop/start act on the libvirt domain; refuse=True answers like a provisioning instance."""
+
+    def __init__(self, refuse=False):
+        super().__init__()
+        self.refuse, self.shell = refuse, None
+
+    def instance_action(self, iid, action):
+        self.actions.append(action)
+        if self.refuse:
+            raise RuntimeError("Instance is provisioning")
+        self.shell.state = "shut off" if action == "stop" else "running"
+
+
+@pytest.mark.parametrize("refuse", [False, True])
+def test_push_disks_powers_off_replaces_every_disk_then_starts(tmp_path, refuse):
+    from vm2morpheus.direct import push_disks
+    (d0, d1), (l0, l1), xml = _push_setup(tmp_path)
+    m, msgs = _PowerMorpheus(refuse), []
 
     def connect(*a):
-        shells.append(LocalShell(*a, xml=xml, state="running"))   # Morpheus booted the blank placeholder
-        return shells[-1]
+        m.shell = LocalShell(*a, xml=xml, state="running")   # Morpheus booted the blank placeholder
+        return m.shell
 
-    m.status = "provisioning"   # stays so: Morpheus waits for an OS that the blank disk does not have
-    host = push_disks(m, 42, "w2k16", [l0, l1], {"host": "vme02"}, msgs.append, connect=connect,
-                      sleep=lambda s: None)
-    sh = shells[0]
-    assert host == "vme02" and m.actions == []                  # no Morpheus API calls: all through virsh
-    order = [c.split()[1] for c in sh.cmds if c.startswith("virsh ") and c.split()[1] in ("destroy", "start")]
-    assert order == ["destroy", "start"] and sh.state == "running"
+    host = push_disks(m, 42, "w2k16", [l0, l1], {"host": "vme02"}, msgs.append, connect=connect, sleep=lambda s: None)
+    sh = m.shell
+    virsh = [c.split()[1] for c in sh.cmds if c.startswith("virsh ") and c.split()[1] in ("destroy", "start")]
+    assert host == "vme02" and sh.state == "running" and m.actions == ["stop", "start"]
+    assert virsh == (["destroy", "start"] if refuse else [])   # virsh only when Morpheus refuses
     for disk, pat in ((d0, "0x11"), (d1, "0x22")):
         r = subprocess.run(["qemu-io", "-c", f"read -P {pat} 0 64k", str(disk)], capture_output=True, text=True)
         assert "Pattern verification failed" not in r.stdout
     assert any("Subida directa por SSH a vme02: 2 disco(s)" in x for x in msgs)
+
+
+def test_push_disks_restarts_a_vm_that_auto_recover_switched_on_during_the_copy(tmp_path, monkeypatch):
+    from vm2morpheus import direct
+    (d0, d1), (l0, l1), xml = _push_setup(tmp_path)
+    m, msgs = _PowerMorpheus(), []
+    real = direct.replace_disk
+
+    def replace_then_auto_recover(shell, *a, **k):
+        real(shell, *a, **k)
+        shell.state = "running"   # the cluster's "auto recover power state" switched it back on
+
+    monkeypatch.setattr(direct, "replace_disk", replace_then_auto_recover)
+
+    def connect(*a):
+        m.shell = LocalShell(*a, xml=xml, state="running")
+        return m.shell
+
+    direct.push_disks(m, 42, "w2k16", [l0, l1], {"host": "vme02"}, msgs.append, connect=connect, sleep=lambda s: None)
+    assert m.actions == ["stop", "stop", "start"] and m.shell.state == "running"
+    assert any("se encendió durante la copia" in x for x in msgs)
 
 
 def test_push_disks_never_touches_a_domain_that_does_not_power_off(tmp_path):
