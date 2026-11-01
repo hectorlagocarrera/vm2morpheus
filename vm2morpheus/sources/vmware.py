@@ -1,3 +1,4 @@
+import queue
 import re
 import ssl
 import sys
@@ -169,6 +170,97 @@ def measure_parallel(getter, url: str, size: int, streams: int = 4, seconds: flo
     return state["bytes"], max(clock() - start, 1e-6), state["ranged"]
 
 
+class RangeNotSupported(RuntimeError):
+    """The server answered a ranged request with the whole file: parallel download is not possible."""
+
+
+PARALLEL_BLOCK = 64 * 1024 * 1024  # each connection fetches the file in blocks of this size
+PARALLEL_RETRIES = 3
+
+
+def download_parallel(url: str, local: Path, total: int, streams: int, verify: bool, auth, cb, cancel=None,
+                      getter=requests.get, block: int = PARALLEL_BLOCK, retries: int = PARALLEL_RETRIES,
+                      sleep=time.sleep, watchdog=None) -> int:
+    """Download a file of known size over several simultaneous ranged connections, each writing at its own offset.
+
+    Worth it when the server limits every single connection (an ESXi datastore browser tends to): N connections
+    then add up. Each block is retried on its own, so a hiccup costs one block, not the file. Raises
+    RangeNotSupported if the server ignores the Range header."""
+    with open(local, "wb") as f:
+        f.truncate(total)  # preallocate: every worker writes at its own offset
+    blocks: queue.Queue = queue.Queue()
+    for start in range(0, total, block):
+        blocks.put((start, min(start + block, total) - 1))
+    lock, state, stop = threading.Lock(), {"done": 0, "error": None}, threading.Event()
+
+    def fail(exc: BaseException) -> None:
+        state["error"] = state["error"] or exc
+        stop.set()
+
+    def worker() -> None:
+        try:
+            with open(local, "r+b") as f:
+                while not stop.is_set():
+                    try:
+                        start, end = blocks.get_nowait()
+                    except queue.Empty:
+                        return
+                    for attempt in range(retries):
+                        written = 0
+                        try:
+                            with getter(url, stream=True, verify=verify, auth=auth, timeout=(15, READ_TIMEOUT),
+                                        headers={"Range": f"bytes={start}-{end}"}) as r:
+                                if r.status_code != 206:
+                                    raise RangeNotSupported("el ESXi no admite descargas por tramos (Range)")
+                                f.seek(start)
+                                for chunk in r.iter_content(CHUNK):
+                                    if stop.is_set():
+                                        return
+                                    f.write(chunk)
+                                    written += len(chunk)
+                                    with lock:
+                                        state["done"] += len(chunk)
+                            if written != end - start + 1:
+                                raise IOError(f"bloque incompleto: {written} de {end - start + 1} bytes")
+                            break
+                        except RangeNotSupported as e:
+                            return fail(e)
+                        except Exception as e:  # network hiccup: redo this block only
+                            with lock:
+                                state["done"] -= written
+                            if attempt == retries - 1:
+                                return fail(RuntimeError(f"Falló un bloque de la descarga en paralelo tras {retries} "
+                                                         f"intentos: {e}"))
+                            sleep(2 * (attempt + 1))
+        except Exception as e:
+            fail(e)
+
+    threads = [threading.Thread(target=worker, daemon=True) for _ in range(max(1, streams))]
+    for t in threads:
+        t.start()
+    try:
+        while any(t.is_alive() for t in threads):
+            with lock:
+                done = state["done"]
+            if watchdog is not None:
+                watchdog.beat(done)
+            cb(done, total)  # raises CancelledError when the user cancels
+            stop.wait(0.5)
+    except BaseException:
+        stop.set()
+        for t in threads:
+            t.join(timeout=READ_TIMEOUT)
+        raise
+    for t in threads:
+        t.join()
+    if state["error"] is not None:
+        raise state["error"]
+    if state["done"] != total:
+        raise RuntimeError(f"La descarga en paralelo quedó incompleta: {state['done']} de {total} bytes")
+    cb(total, total)
+    return total
+
+
 def note_unverified_tls(verify: bool, host: str, stream=None) -> bool:
     """ESXi/vCenter normally use a self-signed certificate, so verification is off unless the user asks for it.
     Say so once, in Spanish, instead of letting urllib3 print its English warning for every request."""
@@ -213,6 +305,7 @@ class VMwareSource(Source):
         self.port = int(cfg.get("port", 443))
         self.verify = bool(cfg.get("verify_ssl", False))
         self.method = cfg.get("download_method") or "auto"  # auto: export, flat disk if the export stalls
+        self.streams = int(cfg.get("parallel_streams") or 4)  # connections used by method "flat_parallel"
         self.si = None
         self.api_type = ""
         self._vms = {}
@@ -367,8 +460,8 @@ class VMwareSource(Source):
 
     def fetch_disks(self, vm: VMInfo, dest: Path, progress) -> list[Path]:
         try:
-            if self.method == "flat":
-                return self._fetch_flat(vm, dest, progress)
+            if self.method in ("flat", "flat_parallel"):
+                return self._fetch_flat(vm, dest, progress, parallel=self.method == "flat_parallel")
             try:
                 return self._fetch_disks(vm, dest, progress)
             except RuntimeError as e:
@@ -382,7 +475,7 @@ class VMwareSource(Source):
         except Exception as e:
             raise explain_error(e)
 
-    def _fetch_flat(self, vm: VMInfo, dest: Path, progress) -> list[Path]:
+    def _fetch_flat(self, vm: VMInfo, dest: Path, progress, parallel: bool = False) -> list[Path]:
         """Download each disk's raw extent through the datastore browser. Bigger than the export (zeros included),
         but it announces its length and does not depend on the export service."""
         mo = self._find(vm.name)
@@ -395,8 +488,19 @@ class VMwareSource(Source):
                 out.append(local)
                 continue
             cb = progress(f"descargar {local.name}")
-            got = download_to(flat_url(self.host, d.path, dc_path), local, None, self.verify, cb,
-                              total=d.size_bytes, auth=(self.user, self.password), end_marker=False)
+            url, auth = flat_url(self.host, d.path, dc_path), (self.user, self.password)
+            got = None
+            if parallel:
+                watchdog = StallWatchdog(f"la descarga de {local.name}", min_rate=128 * 1024).start()
+                try:
+                    got = download_parallel(url, local, d.size_bytes, self.streams, self.verify, auth, cb,
+                                            watchdog=watchdog)
+                except RangeNotSupported:
+                    print("El ESXi no admite descargas por tramos: se usa una sola conexión.", file=sys.stderr)
+                finally:
+                    watchdog.stop()
+            if got is None:
+                got = download_to(url, local, None, self.verify, cb, total=d.size_bytes, auth=auth, end_marker=False)
             if got != d.size_bytes:
                 raise RuntimeError(f"El disco plano llegó incompleto: {got} de {d.size_bytes} bytes")
             cb.finish()

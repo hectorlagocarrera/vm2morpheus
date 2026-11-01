@@ -1391,7 +1391,7 @@ def _vmware_with_stubs(method, export, flat):
     src = VMwareSource({"host": "h", "username": "u", "password": "p", "download_method": method})
     calls = []
     src._fetch_disks = lambda vm, dest, progress: (calls.append("export"), export())[1]
-    src._fetch_flat = lambda vm, dest, progress: (calls.append("flat"), flat())[1]
+    src._fetch_flat = lambda vm, dest, progress, parallel=False: (calls.append("flat-parallel" if parallel else "flat"), flat())[1]
     return src, calls
 
 
@@ -2397,3 +2397,142 @@ def test_form_fields_line_up_whatever_the_label_length():
     assert "align-items:end" in page.split(".row{", 1)[1].split("}", 1)[0]          # inputs share a baseline per row
     assert "input:not([type=checkbox]),select{height:34px}" in page                 # a select is as tall as an input
     assert "<label>Nombre de la VM en Morpheus</label>" in page                    # no wrapping hint under the label
+
+
+# ------------------------------------------------------------------ parallel flat-disk download
+class RangeServer:
+    """Stands in for the datastore browser: serves byte ranges of a payload, optionally flaky or range-less."""
+
+    def __init__(self, payload, per_chunk_delay=0.0, ignore_range=False, flaky_starts=(), always_fail_start=None):
+        self.payload, self.delay, self.ignore_range = payload, per_chunk_delay, ignore_range
+        self.flaky, self.always_fail = set(flaky_starts), always_fail_start
+        self.requests, self.closed = [], 0
+
+    def __call__(self, url, **kw):
+        import time as _t
+        start, end = (int(x) for x in kw["headers"]["Range"].removeprefix("bytes=").split("-"))
+        self.requests.append((start, end))
+        if start == self.always_fail:
+            raise ConnectionError("connection reset")
+        if start in self.flaky:
+            self.flaky.discard(start)
+            raise ConnectionError("connection reset")
+        if self.ignore_range:
+            return _ranged_response(200, [self.payload])
+        data = self.payload[start:end + 1]
+        server = self
+
+        class R(_FakeResponse):
+            status_code = 206
+
+            def iter_content(self_inner, size):
+                try:
+                    for i in range(0, len(data), 1000):
+                        if server.delay:
+                            _t.sleep(server.delay)
+                        yield data[i:i + 1000]
+                finally:
+                    server.closed += 1
+        return R([])
+
+
+def _parallel(tmp_path, srv, total, streams=4, block=100_000, cb=None, **kw):
+    from vm2morpheus.sources.vmware import download_parallel
+    seen = []
+    out = tmp_path / "disk.img"
+    got = download_parallel("https://esxi/x", out, total, streams, False, ("root", "pw"), cb or (lambda d, t: seen.append(d)),
+                            getter=srv, block=block, sleep=lambda s: None, **kw)
+    return got, out, seen
+
+
+def test_parallel_download_reassembles_the_file_exactly(tmp_path):
+    import os
+    payload = os.urandom(1_000_003)                         # not a multiple of the block size
+    srv = RangeServer(payload)
+    got, out, seen = _parallel(tmp_path, srv, len(payload))
+    assert got == len(payload) and out.read_bytes() == payload
+    assert len(srv.requests) == -(-len(payload) // 100_000)  # one request per block
+    covered = sorted(srv.requests)
+    assert covered[0][0] == 0 and covered[-1][1] == len(payload) - 1
+    assert all(a[1] + 1 == b[0] for a, b in zip(covered, covered[1:]))  # no gaps, no overlaps
+    assert seen[-1] == len(payload)
+
+
+def test_parallel_download_retries_a_failed_block_and_still_ends_exact(tmp_path):
+    import os
+    payload = os.urandom(450_000)
+    srv = RangeServer(payload, flaky_starts=(200_000,))
+    got, out, seen = _parallel(tmp_path, srv, len(payload))
+    assert out.read_bytes() == payload and got == len(payload)
+    assert srv.requests.count((200_000, 299_999)) == 2       # first attempt failed, second worked
+    assert max(seen) <= len(payload)                          # the failed attempt's bytes were not double counted
+
+
+def test_parallel_download_gives_up_on_a_block_that_keeps_failing(tmp_path):
+    srv = RangeServer(b"x" * 300_000, always_fail_start=100_000)
+    with pytest.raises(RuntimeError, match="Falló un bloque de la descarga en paralelo tras 3 intentos"):
+        _parallel(tmp_path, srv, 300_000)
+
+
+def test_parallel_download_detects_a_server_without_ranges(tmp_path):
+    from vm2morpheus.sources.vmware import RangeNotSupported
+    with pytest.raises(RangeNotSupported):
+        _parallel(tmp_path, RangeServer(b"x" * 300_000, ignore_range=True), 300_000)
+
+
+def test_parallel_download_stops_its_workers_on_cancel(tmp_path):
+    import time as _t
+    from vm2morpheus.util import CancelledError
+    srv = RangeServer(b"x" * 4_000_000, per_chunk_delay=0.005)
+
+    def cancel_after_some_progress(done, total):
+        if done > 20_000:
+            raise CancelledError("cancelled")
+
+    with pytest.raises(CancelledError):
+        _parallel(tmp_path, srv, 4_000_000, cb=cancel_after_some_progress)
+    _t.sleep(0.3)
+    assert srv.closed == len(srv.requests)                    # every open response was closed: nobody keeps reading
+
+
+def test_several_connections_beat_one_when_each_connection_is_slow(tmp_path):
+    import time as _t
+    payload = b"z" * 800_000
+    times = {}
+    for streams in (1, 4):
+        srv = RangeServer(payload, per_chunk_delay=0.004)     # a per-connection speed limit, like a throttled host
+        t0 = _t.monotonic()
+        _parallel(tmp_path, srv, len(payload), streams=streams, block=100_000)
+        times[streams] = _t.monotonic() - t0
+    assert times[4] < times[1] * 0.6, times
+
+
+def test_flat_parallel_method_falls_back_to_one_connection_when_ranges_are_refused(tmp_path, monkeypatch):
+    from vm2morpheus.sources import vmware
+    src = vmware.VMwareSource({"host": "esxi1", "username": "u", "password": "p", "download_method": "flat_parallel"})
+    src._find = lambda name: object()
+    src._datacenter_path = lambda mo: "ha-datacenter"
+    used = []
+
+    def refuse(*a, **k):
+        raise vmware.RangeNotSupported("sin Range")
+
+    def single(url, local, cookie, verify, cb, **kw):
+        used.append(("single", kw["total"]))
+        local.write_bytes(b"\0" * kw["total"])
+        return kw["total"]
+
+    monkeypatch.setattr(vmware, "download_parallel", refuse)
+    monkeypatch.setattr(vmware, "download_to", single)
+    vm = VMInfo("vm1", 1, 1024, "bios", "windows", "off", [DiskInfo("d", 4096, "[ds1] vm1/vm1.vmdk", index=0)])
+    files = src.fetch_disks(vm, tmp_path, lambda label: __import__("vm2morpheus.util", fromlist=["Progress"]).Progress(label))
+    assert used == [("single", 4096)] and files[0].stat().st_size == 4096
+
+
+def test_flat_parallel_is_routed_and_offered(tmp_path):
+    from vm2morpheus.gui import render_page, source_cfg
+    src, calls = _vmware_with_stubs("flat_parallel", lambda: ["export"], lambda: ["flat"])
+    assert src.fetch_disks(None, tmp_path, None) == ["flat"] and calls == ["flat-parallel"]
+    assert 'value="flat_parallel"' in render_page()
+    base = {"source_type": "esxi", "source_host": "h", "source_user": "u", "source_password": "p"}
+    assert source_cfg({**base, "vmware_method": "flat_parallel"})["download_method"] == "flat_parallel"
