@@ -478,6 +478,29 @@ class VMwareSource(Source):
         except Exception as e:
             raise explain_error(e)
 
+    supports_stream = True
+
+    def open_disk(self, vm: VMInfo, disk):
+        """The disk's raw extent through the datastore browser (VM powered off)."""
+        mo = self._find(vm.name)
+        url = flat_url(self.host, disk.path, self._datacenter_path(mo))
+        r = requests.get(url, stream=True, auth=(self.user, self.password), verify=self.verify,
+                         timeout=(15, READ_TIMEOUT))
+        try:
+            r.raise_for_status()
+        except Exception as e:
+            r.close()
+            raise explain_error(e)
+
+        class Reader:
+            def read(self, n):
+                return r.raw.read(n, decode_content=True)
+
+            def close(self):
+                r.close()
+
+        return Reader(), "raw", int(r.headers.get("Content-Length") or disk.size_bytes)
+
     def _fetch_flat(self, vm: VMInfo, dest: Path, progress, parallel: bool = False) -> list[Path]:
         """Download each disk's raw extent through the datastore browser. Bigger than the export (zeros included),
         but it announces its length and does not depend on the export service."""

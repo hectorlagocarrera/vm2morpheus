@@ -1,13 +1,15 @@
+import copy
 import itertools
 import json
 import os
+import posixpath
 import shutil
 import subprocess
 from pathlib import Path
 
 from .bundle import build_bundle, disk_file_name
 from .convert import convert_disk, find_tool, inject_drivers
-from .direct import PLACEHOLDER_NAME, push_disks
+from .direct import PLACEHOLDER_NAME, HostShell, push_disks, stage_disk
 from .drivers_windows import ensure_virtio_iso, inject_virtio_windows, is_admin
 from .morpheus import MorpheusClient, MorpheusError, payload_from_reference, render_template
 from .sources.base import Source
@@ -148,7 +150,10 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         probe = probe.parent
     free = shutil.disk_usage(probe).free
     # the downloaded disk files plus a converted copy; qcow2 only stores used blocks, so used size is a safe bound
-    needed = (1 if source.direct else 2) * sum(d.used_bytes or d.size_bytes for d in vm.disks)
+    local_disks = vm.disks
+    if opts.get("ssh") and mcfg.get("reference_instance") and len(vm.disks) > 1 and stageable(morpheus, mcfg, source)[0]:
+        local_disks = vm.disks[:1]  # data disks go straight to the datastore
+    needed = (1 if source.direct else 2) * sum(d.used_bytes or d.size_bytes for d in local_disks)
     if free < needed:
         problems.append(f"No hay espacio suficiente en {probe}: {human(free)} libres, hacen falta unos {human(needed)}; "
                         "elige otra carpeta de trabajo (p. ej. D:\\migracion) en un disco más grande")
@@ -206,6 +211,9 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     if ssh and not direct:
         log("Aviso: la subida directa por SSH necesita crear la VM (bloque 3); se sube la imagen a la biblioteca")
     bundle = bool(opts.get("multi_disk_bundle", True)) and len(vm.disks) > 1 and not direct
+    staging = None  # folder on the datastore where data disks go straight from the source (direct mode)
+    if direct and len(vm.disks) > 1 and not st.done("fetch"):
+        staging = staging_folder(morpheus, mcfg, source, target_name(opts, vm), log)
     target = (opts.get("new_name") or "").strip() or vm.name  # name shown in Morpheus (image and VM)
     if target != vm.name:
         log(f"Nombre en Morpheus: {target!r} (en el origen es {vm.name!r})")
@@ -237,7 +245,13 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                 vm.disks = [frozen[d.index] for d in vm.disks]
                 log(f"Checkpoint {source.hot_type}. La VM de origen sigue encendida: lo que cambie a partir de ahora "
                     "no estará en la copia.")
-            files = source.fetch_disks(vm, workdir, fetch_bar)
+            if staging:
+                boot_only = copy.copy(vm)
+                boot_only.disks = vm.disks[:1]
+                files = source.fetch_disks(boot_only, workdir, fetch_bar)
+                staged = stage_data_disks(source, vm, ssh, staging, fetch_bar, log, cancel)
+            else:
+                files, staged = source.fetch_disks(vm, workdir, fetch_bar), []
         finally:
             if use_hot:  # also after an error or a cancel: never leave the source VM running on a checkpoint chain
                 try:
@@ -246,7 +260,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                     log(f"AVISO: no se pudo eliminar el checkpoint temporal de la VM de origen ({e}). Elimínalo a "
                         "mano en el Administrador de Hyper-V: mientras exista, la VM sigue escribiendo en un disco "
                         "diferencial que crece.")
-        st.mark("fetch", fetched=[str(f) for f in files], hot=use_hot)
+        st.mark("fetch", fetched=[str(f) for f in files], staged=staged, hot=use_hot)
         tracker.finish("fetch")
 
     check()
@@ -440,6 +454,9 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         converted = [Path(p) for p in st.d["converted"]]
         sizes = [f.stat().st_size for f in converted]
         bars = {}
+        if st.d.get("staged"):
+            log(f"{len(st.d['staged'])} disco(s) de datos ya están en el almacén de datos (copiados directamente desde "
+                "el origen y convertidos en el host)")
 
         def progress_for(i):
             bar = bars[i] = Progress(f"subir por SSH {converted[i].name}", cancel=cancel)
@@ -450,8 +467,8 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                 tracker.update("instance", (before + done) / total, f"subiendo {converted[i].name} por SSH")
             return cb
 
-        push_disks(morpheus, st.d["instance"]["id"], st.d["instance"].get("name") or target, converted, ssh, log,
-                   progress_for, cancel)
+        push_disks(morpheus, st.d["instance"]["id"], st.d["instance"].get("name") or target,
+                   converted + list(st.d.get("staged") or []), ssh, log, progress_for, cancel)
         for b in bars.values():
             b.finish()
         st.set(pushed=True)
@@ -464,6 +481,48 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     timings.record(tracker.durations, gib, source.timing_kind)  # only steps run now: resumed ones have no duration
     log("Terminado.")
     return result
+
+
+def target_name(opts: dict, vm) -> str:
+    return (opts.get("new_name") or "").strip() or vm.name
+
+
+def stageable(morpheus, mcfg: dict, source):
+    """(datastore, None) if data disks can be streamed to it, else (None, reason)."""
+    ds = morpheus.datastore(mcfg["datastore_id"]) if mcfg.get("datastore_id") and hasattr(morpheus, "datastore") else None
+    if not getattr(source, "supports_stream", False):
+        return None, "este origen no permite leer los discos como flujo"
+    if not ds or not ds.get("path"):
+        return None, "elige un almacén de datos concreto (no «automático»)"
+    if "local" in (ds.get("type") or "").lower():
+        return None, f"el almacén {ds['name']} es local de un host; hace falta uno compartido (NFS o GFS2)"
+    return ds, None
+
+
+def staging_folder(morpheus, mcfg: dict, source, target: str, log=print) -> str | None:
+    """Where on the datastore the data disks can go straight from the source, or None (then every disk is copied
+    to the work folder as usual). Needs a chosen, shared (NFS/GFS2) datastore and a source that can stream."""
+    ds, why = stageable(morpheus, mcfg, source)
+    if why:
+        log(f"Los discos de datos se copian a la carpeta de trabajo como el de arranque: {why}")
+        return None
+    log(f"Los discos de datos irán directamente del origen al almacén {ds['name']} (sin pasar por la carpeta de "
+        "trabajo) y se convertirán en el host; el de arranque pasa por este equipo para inyectar los drivers")
+    return posixpath.join(ds["path"], ".vm2morpheus", target)
+
+
+def stage_data_disks(source, vm, ssh: dict, staging: str, fetch_bar, log=print, cancel=None) -> list[str]:
+    shell = HostShell(ssh["host"], ssh.get("user") or "root", ssh.get("password"), ssh.get("key_file"))
+    try:
+        out = []
+        for d in vm.disks[1:]:
+            reader, fmt, size = source.open_disk(vm, d)
+            bar = fetch_bar(f"copiar al host {d.name}")
+            out.append(stage_disk(shell, reader, fmt, size, staging, f"disk{len(out) + 1}", log, bar, cancel))
+            bar.finish()
+        return out
+    finally:
+        shell.close()
 
 
 def ensure_placeholder(morpheus, workdir: Path, uefi: bool, log=print) -> dict:

@@ -86,6 +86,31 @@ class HostShell:
                 if progress:
                     progress(done, total)
 
+    def write_stream(self, reader, remote: str, size: int, progress=None, cancel=None) -> None:
+        """Write a stream to a remote file. Runs of zeros are skipped (left as holes), so an empty or thin disk
+        costs network but not datastore writes; the file is then truncated to its full size."""
+        zero = bytes(CHUNK)
+        done = 0
+        with self.sftp.open(remote, "wb") as dst:
+            dst.set_pipelined(True)
+            while True:
+                if cancel is not None and cancel.is_set():
+                    raise CancelledError("cancelado")
+                buf = reader.read(CHUNK)
+                if not buf:
+                    break
+                if buf == zero[:len(buf)]:
+                    dst.seek(done + len(buf))
+                else:
+                    dst.seek(done)
+                    dst.write(buf)
+                done += len(buf)
+                if progress:
+                    progress(done, size)
+            dst.truncate(max(done, 0))
+        if size and done < size:
+            raise DirectError(f"El origen dejó de enviar el disco a los {done} de {size} bytes")
+
     def close(self):
         try:
             if self._sftp is not None:
@@ -157,13 +182,38 @@ def wait_instance(morpheus, instance_id: int, wanted: set[str], timeout: float =
         sleep(poll)
 
 
-def replace_disk(shell, local: Path, target: str, log=print, progress=None, cancel=None) -> None:
-    """Upload `local` (qcow2) and swap it in for the disk file `target` on the host."""
+def stage_disk(shell, reader, fmt: str, size: int, staging: str, name: str, log=print, progress=None,
+               cancel=None) -> str:
+    """Send one data disk straight from the source to `staging` (a folder on the datastore) and convert it to
+    qcow2 there with the host's qemu-img. Returns the remote qcow2 path. A disk already converted is reused."""
     q = shlex.quote
-    part = posixpath.join(posixpath.dirname(target), "." + posixpath.basename(target) + ".vm2m-part")
+    out = posixpath.join(staging, name + ".qcow2")
+    src = posixpath.join(staging, name + "." + fmt + ".src")
+    shell.run(f"mkdir -p {q(staging)}")
+    if shell.run(f"test -f {q(out)} && echo yes", check=False).strip() == "yes":
+        log(f"{name}: ya estaba copiado y convertido en el host, se reutiliza")
+        return out
+    try:
+        shell.write_stream(reader, src, size, progress, cancel)
+    finally:
+        reader.close()
+    log(f"Convirtiendo {name} a qcow2 en el host ...")
+    shell.run(f"qemu-img convert -f {q(fmt)} -O qcow2 {q(src)} {q(out + '.part')} && mv -f {q(out + '.part')} {q(out)} "
+              f"&& rm -f {q(src)}")
+    return out
+
+
+def replace_disk(shell, local, target: str, log=print, progress=None, cancel=None) -> None:
+    """Swap the disk file `target` on the host for `local`: a local qcow2 that is uploaded first, or (str) the
+    path of a qcow2 already prepared on the same datastore by stage_disk."""
+    q = shlex.quote
     info = json.loads(shell.run(f"qemu-img info --output=json {q(target)}"))
     want = int(info["virtual-size"])
-    shell.upload(local, part, progress, cancel)
+    if isinstance(local, str):  # already on the host
+        part, label = local, posixpath.basename(local)
+    else:
+        part, label = posixpath.join(posixpath.dirname(target), "." + posixpath.basename(target) + ".vm2m-part"), local.name
+        shell.upload(local, part, progress, cancel)
     got = int(json.loads(shell.run(f"qemu-img info --output=json {q(part)}"))["virtual-size"])
     if got > want:
         raise DirectError(f"El disco migrado ({got} bytes) es mayor que el volumen que creó Morpheus ({want} bytes)")
@@ -172,10 +222,12 @@ def replace_disk(shell, local: Path, target: str, log=print, progress=None, canc
     shell.run(f"qemu-img check -q {q(part)}")
     shell.run(f"chown --reference={q(target)} {q(part)} && chmod --reference={q(target)} {q(part)}")
     shell.run(f"mv -f {q(part)} {q(target)}")
-    log(f"Disco {posixpath.basename(target)} sustituido por {local.name}")
+    if isinstance(local, str):  # the staging folder is empty once its last disk has moved
+        shell.run(f"rmdir {q(posixpath.dirname(local))} 2>/dev/null", check=False)
+    log(f"Disco {posixpath.basename(target)} sustituido por {label}")
 
 
-def push_disks(morpheus, instance_id: int, vm_name: str, disks: list[Path], ssh: dict, log=print,
+def push_disks(morpheus, instance_id: int, vm_name: str, disks: list, ssh: dict, log=print,
                progress_for=None, cancel=None, connect=HostShell) -> str:
     """Stop the new VM, replace its disk files with `disks` (boot disk first) and start it again.
     Returns the host used."""
@@ -205,7 +257,8 @@ def push_disks(morpheus, instance_id: int, vm_name: str, disks: list[Path], ssh:
                 raise DirectError(f"La VM tiene {len(targets)} disco(s) en {host} y hay {len(disks)} para subir")
             log(f"Subida directa por SSH a {host}: {len(disks)} disco(s)")
             for i, (local, target) in enumerate(zip(disks, targets)):
-                replace_disk(shell, local, target, log, progress_for(i) if progress_for else None, cancel)
+                pf = progress_for(i) if progress_for and not isinstance(local, str) else None
+                replace_disk(shell, local, target, log, pf, cancel)
             break
         finally:
             shell.close()

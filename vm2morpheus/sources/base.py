@@ -38,6 +38,13 @@ class Source(ABC):
     def hot_release(self, log=print) -> None:
         """Remove whatever hot_prepare created. Must be safe to call when nothing was created."""
 
+    supports_stream = False  # open_disk is implemented: a disk can be read as a stream, without a local copy
+
+    def open_disk(self, vm: VMInfo, disk):
+        """(reader, qemu format, size in bytes) for one disk of a powered-off or checkpointed VM. The reader has
+        read(n) and close(). Used to send data disks straight to the HVM host."""
+        raise NotImplementedError
+
     timing_kind = "default"  # which history the progress bar learns from (see timings.py)
     direct = False  # True when fetch_disks returns paths on the source instead of local copies
 

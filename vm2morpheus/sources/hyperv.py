@@ -151,6 +151,20 @@ if ($s.Count -gt 0) {{ $s | Remove-VMSnapshot }}
             time.sleep(5)
         raise RuntimeError(f"La VM {name} no se apagó en 5 minutos")
 
+    supports_stream = True
+
+    def open_disk(self, vm: VMInfo, disk):
+        if disk.path.lower().endswith(".avhdx"):
+            raise RuntimeError(f"{disk.path} es un disco de checkpoint (diferencial); "
+                               "elimina o fusiona antes los checkpoints de la VM")
+        fmt = "vhd" if disk.path.lower().endswith(".vhd") else "vhdx"
+        if self.local:
+            return open(disk.path, "rb"), fmt, os.path.getsize(disk.path)
+        import smbclient
+        smbclient.register_session(self.host, username=self.user, password=self.password)
+        unc = self._unc(disk.path)
+        return smbclient.open_file(unc, mode="rb", share_access="rwd"), fmt, smbclient.stat(unc).st_size
+
     def _unc(self, win_path: str) -> str:
         p = PureWindowsPath(win_path)
         return "\\\\" + self.host + "\\" + p.drive.rstrip(":") + "$\\" + "\\".join(p.parts[1:])

@@ -657,7 +657,7 @@ small{color:#5d6b7b}
 <div class="row"><div><label>Host HVM <small>(cualquiera del clúster)</small></label><input id="ssh_host" placeholder="vme01.laboratorio3.local"></div><div><label>Usuario SSH</label><input id="ssh_user" placeholder="root"></div>
 <div><label>Contraseña SSH</label><input id="ssh_password" type="password" autocomplete="off"></div><div><label>Clave privada <small>(opcional)</small></label><input id="ssh_key" placeholder="C:\Users\yo\.ssh\id_rsa"></div></div>
 <button class="sec" data-busy onclick="sshtest()">Probar SSH</button><div id="sshres"></div>
-<small>No es un método oficial de HPE: Morpheus no se entera de que el disco cambió (funciona porque la VM usa el fichero). Solo almacenes de ficheros (NFS, GFS2, directorio local). Si falla antes de tocar los discos, reintenta o desmarca la opción para usar la biblioteca.</small></details></fieldset>
+<small>Con un almacén de datos compartido (NFS o GFS2) elegido arriba, los discos de datos van directamente del origen al almacén y se convierten en el host; solo el disco de arranque pasa por este equipo (para inyectar los drivers).<br>No es un método oficial de HPE: Morpheus no se entera de que el disco cambió (funciona porque la VM usa el fichero). Solo almacenes de ficheros (NFS, GFS2, directorio local). Si falla antes de tocar los discos, reintenta o desmarca la opción para usar la biblioteca.</small></details></fieldset>
 <fieldset><legend>4. Opciones</legend><div class="chk">
 <label><input type="checkbox" id="shutdown"> Apagar la VM de origen</label>
 <label><input type="checkbox" id="multi_disk_bundle" checked> Varios discos en una sola imagen (zip + metadata.json)</label>

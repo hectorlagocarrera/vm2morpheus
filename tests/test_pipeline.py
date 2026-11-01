@@ -2783,6 +2783,13 @@ class LocalShell:
     def remote_size(self, path):
         return os.path.getsize(path) if os.path.exists(path) else None
 
+    def write_stream(self, reader, remote, size, progress=None, cancel=None):
+        with open(remote, "wb") as d:
+            while buf := reader.read(1 << 20):
+                d.write(buf)
+        if progress:
+            progress(size, size)
+
     def upload(self, local, remote, progress=None, cancel=None):
         start = self.remote_size(remote) or 0
         with open(local, "rb") as s, open(remote, "r+b" if start else "wb") as d:
@@ -2956,3 +2963,113 @@ def test_ssh_check_reports_tools_and_datastore_mount():
     assert lines[0] == "✔ Conectado por SSH a vme02 como root"
     assert "✔ qemu-img: qemu-img version 8.2.2" in lines and "✔ virsh: 10.0.0" in lines
     assert lines[-1].startswith("· Elige un almacén de datos")
+
+
+def test_data_disk_is_staged_on_the_host_converted_there_and_swapped_in(tmp_path):
+    from vm2morpheus.direct import replace_disk, stage_disk
+    data = tmp_path / "datos.vhdx"
+    subprocess.run(["qemu-img", "create", "-f", "vhdx", str(data), "1M"], check=True, capture_output=True)
+    subprocess.run(["qemu-io", "-f", "vhdx", "-c", "write -P 0x33 0 64k", str(data)], check=True, capture_output=True)
+    target = tmp_path / "vm" / "hvm_1-disk-1"
+    target.parent.mkdir()
+    _qcow(target, "2M")
+    sh, msgs = LocalShell("h", "root"), []
+    staged = stage_disk(sh, open(data, "rb"), "vhdx", data.stat().st_size, str(tmp_path / ".vm2morpheus" / "w"),
+                        "disk1", msgs.append)
+    assert staged.endswith("/disk1.qcow2") and not list((tmp_path / ".vm2morpheus" / "w").glob("*.src"))
+    assert stage_disk(sh, open(data, "rb"), "vhdx", 0, str(tmp_path / ".vm2morpheus" / "w"), "disk1",
+                      msgs.append) == staged   # resumed run reuses the converted disk
+    replace_disk(sh, staged, str(target), msgs.append)
+    r = subprocess.run(["qemu-io", "-c", "read -P 0x33 0 64k", str(target)], capture_output=True, text=True)
+    assert "Pattern verification failed" not in r.stdout and r.returncode == 0
+    assert not (tmp_path / ".vm2morpheus" / "w").exists()   # empty staging folder removed
+
+
+def test_write_stream_skips_zero_runs_and_keeps_the_full_size(tmp_path):
+    import io
+    from vm2morpheus.direct import CHUNK, HostShell
+
+    class F:
+        def __init__(self, path):
+            self.f, self.writes = open(path, "wb"), 0
+
+        def set_pipelined(self, on): pass
+
+        def seek(self, n): self.f.seek(n)
+
+        def write(self, b):
+            self.writes += 1
+            self.f.write(b)
+
+        def truncate(self, n): self.f.truncate(n)
+
+        def __enter__(self): return self
+
+        def __exit__(self, *a): self.f.close()
+
+    files = []
+
+    class Sftp:
+        def open(self, p, mode):
+            files.append(F(p))
+            return files[-1]
+
+    sh = HostShell.__new__(HostShell)
+    sh._sftp = Sftp()
+    data = b"\x01" * CHUNK + bytes(3 * CHUNK) + b"\x02" * 10
+    out = tmp_path / "r.raw"
+    sh.write_stream(io.BytesIO(data), str(out), len(data))
+    assert out.read_bytes() == data and files[0].writes == 2   # the three zero chunks were never sent to disk
+
+
+class StreamSource(FakeSource):
+    supports_stream = True
+
+    def __init__(self, disk, data):
+        super().__init__(disk)
+        self.data = data
+
+    def get_vm(self, name):
+        vm = super().get_vm(name)
+        vm.disks.append(DiskInfo("datos.vhdx", 1 << 20, "y"))
+        return vm
+
+    def fetch_disks(self, vm, dest, progress):
+        assert [d.name for d in vm.disks] == ["d.vmdk"]   # only the boot disk comes to the work folder
+        return super().fetch_disks(vm, dest, progress)
+
+    def open_disk(self, vm, disk):
+        return open(self.data, "rb"), "vhdx", self.data.stat().st_size
+
+
+def test_pipeline_streams_data_disks_to_the_datastore_and_only_the_boot_disk_locally(tmp_path, monkeypatch):
+    from vm2morpheus import pipeline
+    from vm2morpheus.gui import synthetic_reference
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    data = tmp_path / "datos.vhdx"
+    subprocess.run(["qemu-img", "create", "-f", "vhdx", str(data), "1M"], check=True, capture_output=True)
+    ds_path = tmp_path / "nfs"
+    ds_path.mkdir()
+    monkeypatch.setattr(pipeline, "HostShell", lambda *a: LocalShell(*a))
+    pushed = {}
+    monkeypatch.setattr(pipeline, "push_disks", lambda m, iid, name, disks, ssh, log, pf, cancel: pushed.update(
+        disks=[str(d) for d in disks]))
+    monkeypatch.setattr(MorpheusClient, "datastore", lambda self, i: {
+        "id": 5, "name": "FS_NFS50", "type": "NFS Datastore", "free": 1 << 40, "path": str(ds_path)})
+    FakeMorpheus.log.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    ref = synthetic_reference({"cloud_id": "1", "group_id": "1", "plan_id": "23", "network_id": "3", "datastore_id": "5"})
+    msgs = []
+    try:
+        migrate(StreamSource(disk, data), _client(srv), "vm1",
+                {"workdir": str(tmp_path / "wd"), "shutdown_source": True, "ssh": {"host": "vme02"}},
+                {"image_type": "qcow2", "datastore_id": 5, "reference_instance": {"synthetic": ref}}, log=msgs.append)
+    finally:
+        srv.shutdown()
+    staged = str(ds_path / ".vm2morpheus" / "vm1" / "disk1.qcow2")
+    assert pushed["disks"][1] == staged and pushed["disks"][0].endswith(".qcow2") and os.path.exists(staged)
+    sent = dict(FakeMorpheus.log)["instance"]
+    assert len(sent["volumes"]) == 2 and sent["volumes"][1]["datastoreId"] == 5
+    assert any("irán directamente del origen al almacén FS_NFS50" in m for m in msgs)

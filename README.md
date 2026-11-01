@@ -80,3 +80,19 @@ the original VHDX files, which are copied as plain files while the VM keeps runn
 as the copy ends (also after an error or a cancel). The copy is a point in time: what the VM writes after the
 checkpoint is not in it, and the source keeps running, so power it off before starting the migrated VM. Requires that
 the VM has no checkpoints of its own and that checkpoints are enabled on it (`Set-VM -CheckpointType Production`).
+
+## Direct upload over SSH (no image library)
+
+Block 3 → "Subida directa por SSH al host HVM". With an HVM host, user and password (or key), the VM is created from a
+1 MB blank placeholder image (`vm2morpheus-vacia`, uploaded once and reused), stopped, and its disk files on the host
+(found with `virsh dumpxml`) are replaced: each disk is uploaded next to the original as a hidden, resumable part file,
+grown to the volume size, checked with `qemu-img check`, given the original's owner/permissions and moved over it.
+Morpheus never copies a library image, so every disk travels once. Not an official HPE method; file datastores only
+(NFS, GFS2, local directory). "Probar SSH" checks the connection, `qemu-img`/`virsh` and that the chosen datastore is
+mounted and writable.
+
+With a shared datastore (NFS/GFS2) chosen in "Almacén de datos", the **data disks** do not go through the work folder:
+they are read from the source (Hyper-V SMB / ESXi datastore browser) and written straight to
+`<datastore>/.vm2morpheus/<vm>/` on the host (zero runs are skipped), converted to qcow2 there with the host's
+qemu-img, then moved into place. Only the boot disk comes to this PC, because the VirtIO driver injection (DISM)
+needs Windows. With a hot copy, all disks come from the same checkpoint.
