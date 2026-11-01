@@ -31,6 +31,7 @@ class DirectError(RuntimeError):
 RECEIVER = (
     "import os,struct,sys\n"
     "r=sys.stdin.buffer\n"
+    "while r.readline()!=b'VM2M\\n': pass\n"  # skips a sudo password line that sudo did not need to read
     "fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT,0o644)\n"
     "def rd(n):\n"
     " b=b''\n"
@@ -48,12 +49,17 @@ RECEIVER = (
 )
 
 
-def as_user_prefix(ssh_user: str, owner: str | None) -> str:
+SUDO_PW = "sudo -k -S -p '' "  # -S: password on stdin (the SSH password); -k: always asks, so stdin stays in step
+
+
+def as_user_prefix(ssh_user: str, owner: str | None, password: bool = False) -> str:
     """Command prefix to act as `owner` (the owner of the datastore folder) instead of the SSH user."""
     if not owner or owner == ssh_user:
         return ""
     q = shlex.quote(owner)
-    return f"runuser -u {q} -- " if ssh_user == "root" else f"sudo -n -u {q} -- "
+    if ssh_user == "root":
+        return f"runuser -u {q} -- "
+    return f"{SUDO_PW}-u {q} -- " if password else f"sudo -n -u {q} -- "
 
 
 def _frames(src, start: int, total: int | None, progress=None, cancel=None, size_hint: int | None = None):
@@ -91,18 +97,26 @@ class HostShell:
             raise DirectError(f"SSH a {host}: usuario o contraseña/clave incorrectos ({e})") from e
         except (OSError, paramiko.SSHException) as e:
             raise DirectError(f"No se pudo conectar por SSH a {host}: {e}") from e
-        self.user = user
+        self.user, self._password = user, password
 
     def run(self, cmd: str, check: bool = True, timeout: float = 3600) -> str:
-        _, out, err = self.client.exec_command(cmd, timeout=timeout)
+        stdin, out, err = self.client.exec_command(cmd, timeout=timeout)
+        if SUDO_PW in cmd and self._password:  # one password line per sudo in the command
+            stdin.write((self._password + "\n") * cmd.count(SUDO_PW))
+            stdin.flush()
+        stdin.channel.shutdown_write()
         text, etext = out.read().decode("utf-8", "replace"), err.read().decode("utf-8", "replace")
         code = out.channel.recv_exit_status()
+        if check and code != 0 and ("a password is required" in etext or "incorrect password" in etext
+                                    or "Sorry, try again" in etext or "no tty present" in etext):
+            raise DirectError(f"En {self.host}, el usuario {self.user} necesita sudo y no se pudo usar con la "
+                              "contraseña indicada: usa root o un usuario con sudo y su contraseña")
         if check and code != 0:
             raise DirectError(f"En {self.host} falló «{cmd}» ({code}): {(etext or text).strip()[-500:]}")
         return text
 
     def as_user(self, owner: str | None) -> str:
-        return as_user_prefix(self.user, owner)
+        return as_user_prefix(self.user, owner, bool(getattr(self, "_password", None)))
 
     def remote_size(self, path: str, owner: str | None = None) -> int | None:
         out = self.run(f"{self.as_user(owner)}stat -c %s {shlex.quote(path)}", check=False).strip()
@@ -118,6 +132,9 @@ class HostShell:
         chan = self.client.get_transport().open_session()
         chan.exec_command(cmd)
         try:
+            if SUDO_PW in cmd:
+                chan.sendall((self._password + "\n").encode())
+            chan.sendall(b"VM2M\n")
             for off, data in frames:
                 chan.sendall(struct.pack(">QI", off, len(data)) + data)
                 if not data:
@@ -128,6 +145,9 @@ class HostShell:
         out = chan.makefile("rb").read().decode("utf-8", "replace")
         err = chan.makefile_stderr("rb").read().decode("utf-8", "replace")
         code = chan.recv_exit_status()
+        if "a password is required" in err or "incorrect password" in err.lower() or "contraseña" in err.lower():
+            raise DirectError(f"En {self.host}, sudo no acepta la contraseña del usuario {self.user}: usa root o un "
+                              "usuario con sudo y su contraseña")
         if code != 0 or "ok" not in out:
             raise DirectError(f"En {self.host} no se pudo escribir {remote}" + (f" como {owner}" if owner else "")
                               + f" ({code}): {(err or out).strip()[-400:]}")

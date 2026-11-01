@@ -2984,7 +2984,7 @@ def _receiver_shell():
             payload += _st.pack(">QI", off, len(data)) + data
             if not data:
                 break
-        r = subprocess.run(["python3", "-c", RECEIVER, remote], input=payload, capture_output=True)
+        r = subprocess.run(["python3", "-c", RECEIVER, remote], input=b"secreto\nVM2M\n" + payload, capture_output=True)
         if r.returncode or b"ok" not in r.stdout:
             raise DirectError(r.stderr.decode())
 
@@ -3007,6 +3007,7 @@ def test_receiver_writes_as_the_folder_owner_prefix():
     from vm2morpheus.direct import as_user_prefix
     assert as_user_prefix("root", "libvirt-qemu") == "runuser -u libvirt-qemu -- "
     assert as_user_prefix("admin", "libvirt-qemu") == "sudo -n -u libvirt-qemu -- "
+    assert as_user_prefix("admin", "root", password=True) == "sudo -k -S -p '' -u root -- "
     assert as_user_prefix("root", "root") == "" and as_user_prefix("root", None) == ""
 
 def test_ssh_check_reports_tools_and_datastore_mount():
