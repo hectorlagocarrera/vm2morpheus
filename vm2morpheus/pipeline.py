@@ -150,6 +150,20 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     if free < needed:
         problems.append(f"No hay espacio suficiente en {probe}: {human(free)} libres, hacen falta unos {human(needed)}; "
                         "elige otra carpeta de trabajo (p. ej. D:\\migracion) en un disco más grande")
+    ds_id = (mcfg or {}).get("datastore_id")
+    if ds_id and hasattr(morpheus, "datastore"):
+        ds = morpheus.datastore(ds_id)
+        if ds is None:
+            problems.append(f"El almacén de datos elegido (id {ds_id}) no existe o no admite discos de VM: "
+                            "vuelve a cargar los datos de Morpheus y elige otro")
+        elif ds.get("free") is not None:
+            used = sum(d.used_bytes or d.size_bytes for d in vm.disks)
+            if ds["free"] < used:
+                problems.append(f"No caben los discos en el almacén de datos {ds['name']}: {human(ds['free'])} libres, "
+                                f"los discos ocupan unos {human(used)}; elige otro almacén")
+            else:
+                log(f"Almacén de datos: {ds['name']} ({human(ds['free'])} libres)"
+                    + ("; ojo: si los discos se llenan hasta su tamaño provisionado no cabrían" if ds["free"] < total else ""))
     if dry_run:
         for p in problems:
             log(f"  fallaría: {p}")

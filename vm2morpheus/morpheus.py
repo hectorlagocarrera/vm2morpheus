@@ -148,6 +148,27 @@ class MorpheusClient:
             return []
         return [(f"pool-{p['id']}", p.get("name", "")) for p in data.get("resourcePools", []) if p.get("active", True)]
 
+    def datastores(self, cloud_id: int | None = None) -> list[dict]:
+        """Datastores where Morpheus can place VM disks (active, online, provisioning allowed), as
+        {id, name, type, free, total, default, path}; restricted to one cloud when cloud_id is given."""
+        try:
+            items = self._req("GET", "/api/data-stores", params={"max": 200}).get("datastores", [])
+        except MorpheusError:
+            return []
+        out = []
+        for d in items:
+            if not (d.get("allowProvision") and d.get("active", True) and d.get("online", True)):
+                continue
+            if cloud_id and (d.get("zone") or {}).get("id") not in (None, int(cloud_id)):
+                continue
+            out.append({"id": d["id"], "name": d.get("name", ""), "type": (d.get("datastoreType") or {}).get("name", ""),
+                        "free": d.get("freeSpace"), "total": d.get("storageSize"), "default": bool(d.get("defaultStore")),
+                        "path": d.get("externalPath")})
+        return sorted(out, key=lambda d: (not d["default"], d["name"].lower()))
+
+    def datastore(self, datastore_id: int) -> dict | None:
+        return next((d for d in self.datastores() if d["id"] == int(datastore_id)), None)
+
     def service_plan(self, plan_id: int) -> dict | None:
         try:
             return self._req("GET", f"/api/service-plans/{plan_id}").get("servicePlan")

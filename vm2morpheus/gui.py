@@ -71,9 +71,17 @@ def synthetic_reference(f: dict) -> dict:
         "plan": {"id": int(f["plan_id"])},
         "config": {"imageId": None, "resourcePoolId": f.get("resource_pool") or None,
                    "poolProviderType": "mvm", "layoutSize": 1, "createUser": False, "uefi": False},
-        "volumes": [{"name": "root", "rootVolume": True, "size": 1, "storageType": 1, "datastoreId": "auto"}],
+        "volumes": [{"name": "root", "rootVolume": True, "size": 1, "storageType": 1,
+                     "datastoreId": int(f["datastore_id"]) if f.get("datastore_id") else "auto"}],
         "interfaces": [{"id": f"network-{net}", "network": {"id": int(net)}}] if net else [],
     }
+
+
+def datastore_label(d: dict) -> str:
+    gib = lambda b: f"{b / 1024 ** 3:.0f} GiB" if b else "?"  # noqa: E731
+    kind = d["type"].replace(" Datastore", "").replace("Directory (Local)", "local")
+    return (f'{d["name"]} · {kind} · {gib(d["free"])} libres de {gib(d["total"])}'
+            + (" (predeterminado)" if d["default"] else ""))
 
 
 def _need(f: dict, key: str, label: str) -> None:
@@ -97,6 +105,8 @@ def make_cfgs(f: dict):
     src = source_cfg(f)
     m = {"url": f["morpheus_url"], "token": f["morpheus_token"], "verify_ssl": bool(f.get("verify_ssl")),
          "image_type": f.get("image_type") or "qcow2"}
+    if f.get("datastore_id"):
+        m["datastore_id"] = int(f["datastore_id"])
     if f.get("ref_instance_id"):
         m["reference_instance"] = {"instance_id": int(f["ref_instance_id"]),
                                    "image_id": int(f["ref_image_id"]) if f.get("ref_image_id") else None}
@@ -312,18 +322,20 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/lookups":
                 c = MorpheusClient(f["morpheus_url"], f["morpheus_token"], verify=bool(f.get("verify_ssl")))
-                zone = f.get("cloud_id")
+                clouds = c.clouds()
+                zone = f.get("cloud_id") or (clouds[0]["id"] if len(clouds) == 1 else None)  # the only cloud = the one
                 plans = c._req("GET", "/api/service-plans", params={"max": 200, **({"zoneId": zone} if zone else {})})
                 layouts = c.layouts("mvm")
                 pools = c.resource_pools(int(zone)) if zone else []
                 return self._json({
                     "layouts": layouts, "pools": pools,
-                    "clouds": [(z["id"], z["name"]) for z in c.clouds()],
+                    "clouds": [(z["id"], z["name"]) for z in clouds],
                     "groups": [(g["id"], g["name"]) for g in c._req("GET", "/api/groups", params={"max": 200}).get("groups", [])],
                     "plans": [(p["id"], p["name"], p.get("maxCores"), p.get("maxMemory")) for p in plans.get("servicePlans", [])
                               if "discover" not in f'{p.get("code", "")} {p.get("name", "")}'.lower()],
                     "instances": [(i["id"], i["name"]) for i in c._req("GET", "/api/instances", params={"max": 200}).get("instances", [])],
                     "networks": [(n["id"], n["name"]) for n in c._req("GET", "/api/networks", params={"max": 200}).get("networks", [])],
+                    "datastores": [(d["id"], datastore_label(d)) for d in c.datastores(int(zone) if zone else None)],
                 })
             if self.path == "/refinfo":
                 c = MorpheusClient(f["morpheus_url"], f["morpheus_token"], verify=bool(f.get("verify_ssl")))
@@ -601,7 +613,7 @@ small{color:#5d6b7b}
 <button class="sec" data-busy onclick="refinfo()">Ver instancia de referencia (JSON)</button>
 <details open><summary><small>Sin instancia de referencia: crear desde cero (rellena nube, grupo, plan, red y layout)</small></summary>
 <div class="row"><div><label>Nube</label><select id="cloud_id"></select></div><div><label>Grupo</label><select id="group_id"></select></div>
-<div><label>Plan <small id="planhint"></small></label><select id="plan_id" onchange="planTouched=true"></select></div><div><label>Red <small>(obligatoria)</small></label><select id="network_id"></select></div>
+<div><label>Plan <small id="planhint"></small></label><select id="plan_id" onchange="planTouched=true"></select></div><div><label>Red <small>(obligatoria)</small></label><select id="network_id"></select></div><div><label>Almacén de datos</label><select id="datastore_id"><option value="">(automático: lo elige Morpheus)</option></select></div>
 <div><label>Instance type (código)</label><input id="instance_type" value="mvm"></div><div><label>Layout <small>(automático: Single HVM)</small></label><select id="layout_id"><option value="">(automático)</option></select></div><div><label>Resource pool <small>(automático)</small></label><select id="resource_pool"><option value="">(automático)</option></select></div></div></details></fieldset>
 <fieldset><legend>4. Opciones</legend><div class="chk">
 <label><input type="checkbox" id="shutdown"> Apagar la VM de origen</label>
@@ -637,7 +649,7 @@ small{color:#5d6b7b}
 <div id="modal" style="display:none"><div class="dialog" id="dialog"></div></div>
 </main>
 <script>
-const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","instance_type","layout_id","resource_pool","virtio_iso","vmware_method","new_vm_name","ref_instance_id","ref_image_id","workdir"];
+const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","datastore_id","instance_type","layout_id","resource_pool","virtio_iso","vmware_method","new_vm_name","ref_instance_id","ref_image_id","workdir"];
 const chks=["verify_ssl","verify_source","compress_image","hot_copy","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
 const EMBEDDED=__EMBEDDED__;
 let analyzedVm=null;
@@ -747,6 +759,7 @@ async function lookups(){try{await persist();const j=await busy("Cargando datos 
  for(const [k,id] of [["clouds","cloud_id"],["groups","group_id"],["plans","plan_id"],["networks","network_id"],["instances","ref_instance_id"]]){
   const s=document.getElementById(id);s.innerHTML=(id=="ref_instance_id"?'<option value="">(ninguna)</option>':id=="network_id"?'<option value="">(elige una red)</option>':'')+j[k].map(([v,n,c,m])=>`<option value="${v}"${c?` data-cores="${c}" data-mem="${m}"`:""}>${n}</option>`).join("");if(saved[id])s.value=saved[id];else if(id=="network_id"&&j[k].length===1)s.value=j[k][0][0]}
  if(lastSpec&&!planTouched)pickPlan()
+  {const s=document.getElementById("datastore_id");s.innerHTML='<option value="">(automático: lo elige Morpheus)</option>'+(j.datastores||[]).map(([v,n])=>`<option value="${v}">${esc(n)}</option>`).join("");if(saved.datastore_id)s.value=saved.datastore_id}
   for(const [k,id] of [["layouts","layout_id"],["pools","resource_pool"]]){const s=document.getElementById(id);s.innerHTML='<option value="">(automático)</option>'+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id]}
  show("Datos cargados.")}catch(e){show("ERROR: "+e.message)}}
 const SEP=String.fromCharCode(92);

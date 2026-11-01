@@ -2694,3 +2694,53 @@ def test_watchdog_explains_a_network_wait_in_plain_words_with_the_hint():
     assert "esperando a que el origen envíe más datos" in text and text.rstrip().endswith("Es normal en ESXi.")
     assert "File \"" not in text and "\n" not in text.rstrip()
     release.set()
+
+
+DS_SAMPLE = {"datastores": [
+    {"id": 5, "name": "FS_NFS50", "datastoreType": {"name": "NFS Datastore"}, "storageSize": 1044536098816,
+     "freeSpace": 928394706944, "active": True, "online": True, "allowProvision": True, "defaultStore": True,
+     "externalPath": "/mnt/633692c9", "zone": {"id": 1}},
+    {"id": 3, "name": "morpheus-images", "datastoreType": {"name": "Directory Datastore (Local)"},
+     "storageSize": 85008351232, "freeSpace": 69534732288, "active": True, "online": True, "allowProvision": False,
+     "zone": {"id": 1}},
+    {"id": 1, "name": "local", "datastoreType": {"name": "Directory Datastore (Local)"}, "storageSize": 85008351232,
+     "freeSpace": 69534736384, "active": True, "online": True, "allowProvision": True, "zone": {"id": 1}},
+    {"id": 9, "name": "other-cloud", "datastoreType": {"name": "NFS Datastore"}, "active": True, "online": True,
+     "allowProvision": True, "zone": {"id": 2}},
+]}
+
+
+def test_datastores_lists_only_provisionable_ones_of_the_cloud_default_first(monkeypatch):
+    from vm2morpheus.morpheus import MorpheusClient
+    from vm2morpheus.gui import datastore_label
+    c = MorpheusClient("https://m", "t")
+    monkeypatch.setattr(c, "_req", lambda method, path, **kw: DS_SAMPLE)
+    ds = c.datastores(1)
+    assert [d["id"] for d in ds] == [5, 1]           # images store (no provisioning) and other cloud left out
+    assert ds[0]["path"] == "/mnt/633692c9" and c.datastore(1)["name"] == "local"
+    assert datastore_label(ds[0]) == "FS_NFS50 · NFS · 865 GiB libres de 973 GiB (predeterminado)"
+    assert datastore_label(ds[1]).startswith("local · local · 65 GiB libres")
+
+
+def test_chosen_datastore_goes_into_the_instance_volumes():
+    from vm2morpheus.gui import synthetic_reference, make_cfgs
+    f = {"cloud_id": "1", "group_id": "1", "plan_id": "2", "network_id": "3", "datastore_id": "5"}
+    assert synthetic_reference(f)["volumes"][0]["datastoreId"] == 5
+    assert synthetic_reference({**f, "datastore_id": ""})["volumes"][0]["datastoreId"] == "auto"
+    _, m, _ = make_cfgs({**f, "vm": "w", "morpheus_url": "https://m", "morpheus_token": "t", "source_type": "hyperv",
+                         "source_host": "h", "source_user": "u", "source_password": "p"})
+    assert m["datastore_id"] == 5
+
+
+def test_a_datastore_without_room_stops_the_migration_before_downloading(tmp_path):
+    src = HotSource(_disk(tmp_path))
+
+    class Tiny:
+        def datastore(self, ds_id):
+            return {"id": ds_id, "name": "local", "free": 1024}
+
+    msgs = []
+    res = migrate(src, Tiny(), "vm1", {"workdir": str(tmp_path / "ds"), "hot_copy": True},
+                  {"image_type": "qcow2", "datastore_id": 1}, log=msgs.append, dry_run=True)
+    assert any("No caben los discos en el almacén de datos local" in m for m in msgs)
+    assert not any(c.startswith("fetch") for c in src.calls)
