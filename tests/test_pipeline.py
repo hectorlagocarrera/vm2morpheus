@@ -3001,7 +3001,8 @@ def test_pipeline_direct_mode_creates_the_vm_from_the_placeholder_and_pushes_the
     assert sent["config"]["imageId"] == 7 and sent["volumes"][0]["datastoreId"] == 5 and sent["config"]["noAgent"] is True
     assert pushed == {"iid": 42, "name": "vm1", "disks": [True], "ssh": {"host": "vme02"}}
     assert res["images"] == [] and res["instance"]["id"] == 42
-    assert not list((tmp_path / "wd" / "vm1").glob("*.qcow2"))   # converted disk removed after the push
+    assert list((tmp_path / "wd" / "vm1").glob("*.qcow2"))   # kept until the user deletes the work folder
+    assert json.loads((tmp_path / "wd" / "vm1" / "state.json").read_text())["pushed"] == 42
 
 
 def _receiver_shell():
@@ -3312,3 +3313,32 @@ def test_connect_host_uses_the_hosts_login_and_tries_the_others_for_an_untyped_a
 
     with pytest.raises(DirectError, match="No se pudo conectar"):
         connect_host(ssh, "vme01", down)
+
+
+def test_a_recreated_vm_gets_its_disks_again_and_old_states_are_understood(tmp_path, monkeypatch):
+    from vm2morpheus import pipeline
+    from vm2morpheus.gui import synthetic_reference
+    _direct_state(tmp_path, instance={"id": 42, "name": "vm1"}, pushed=True,   # written by an older version
+                  done=["fetch", "convert", "drivers", "upload", "instance"])
+    pushed = []
+    monkeypatch.setattr(pipeline, "push_disks", lambda m, iid, *a, **k: pushed.append(iid))
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    ref = synthetic_reference({"cloud_id": "1", "group_id": "1", "plan_id": "23", "network_id": "3"})
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        migrate(FakeSource(disk), _client(srv), "vm1",
+                {"workdir": str(tmp_path / "wd"), "shutdown_source": True, "ssh": {"host": "vme02"}},
+                {"image_type": "qcow2", "reference_instance": {"synthetic": ref}}, log=lambda *_: None)
+    finally:
+        srv.shutdown()
+    assert pushed == [42]
+
+
+def test_job_log_stamps_every_line_of_every_message():
+    from vm2morpheus.gui import JobLog
+    jl = JobLog(clock=lambda: "T")
+    jl.add("uno")
+    jl.add("dos\ntres")
+    assert jl.text() == "T  uno\nT  dos\nT  tres"

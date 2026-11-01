@@ -58,6 +58,12 @@ class JobLog:
                 self.cur += ch
         return len(s)
 
+    def add(self, msg) -> None:
+        """A whole message from the migration (may span several lines): each line gets its time."""
+        for line in str(msg).split("\n"):
+            if line.strip():
+                self.lines.append(self._stamp(line))
+
     def flush(self):
         pass
 
@@ -282,7 +288,7 @@ def run_job(job_id: str, f: dict, dry: bool):
             source.connect()
             try:
                 client = MorpheusClient(m["url"], m["token"], verify=m["verify_ssl"])
-                result = migrate(source, client, f["vm"], opts, m, dry_run=dry, log=lambda s: jl.lines.append(str(s)),
+                result = migrate(source, client, f["vm"], opts, m, dry_run=dry, log=jl.add,
                                  cancel=job["cancel"], on_progress=lambda p: job.__setitem__("progress", p),
                                  run_info=info)
             finally:
@@ -291,12 +297,12 @@ def run_job(job_id: str, f: dict, dry: bool):
             job["status"] = "done"
             job["cleanup"] = {"morpheus": m, "workdir": opts["workdir"], "vm": f["vm"].strip(), "result": result}
         except CancelledError:
-            jl.lines.append("Migración cancelada. Lo ya descargado o convertido se conserva: al volver a pulsar "
+            jl.add("Migración cancelada. Lo ya descargado o convertido se conserva: al volver a pulsar "
                             "Migrar se reanuda desde ahí.")
             status = "cancelled"
             job["status"] = "cancelled"
         except Exception as e:  # shown to the user in the log panel
-            jl.lines.append(f"ERROR: {e}")
+            jl.add(f"ERROR: {e}")
             error = str(e)
             job["status"] = "error"
         finally:

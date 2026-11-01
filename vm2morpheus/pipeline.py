@@ -201,7 +201,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     log("Subida de los discos: " + (f"directa al almacén de datos por SSH (hosts: "
                                     f"{', '.join(e['host'] for e in host_entries(ssh))})" if direct
                                     else "biblioteca de imágenes de Morpheus"))
-    if st.d.get("placeholder") and not st.d.get("pushed") and not direct:
+    if st.d.get("placeholder") and needs_push(st) and not direct:
         # started with the direct upload, now without it: never create (or leave) a VM with the blank placeholder disk
         if st.d.get("instance") or st.d.get("staged"):
             raise RuntimeError(
@@ -215,10 +215,18 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         st.d.pop("placeholder", None)
         st.d.pop("images", None)
         st.path.write_text(json.dumps(st.d, indent=2))
+    if direct and st.done("convert") and needs_push(st) and not all(Path(p).exists() for p in st.d.get("converted", [])):
+        # the converted disk was deleted (older versions removed it after a push): redo the disk part, keep the VM
+        log("El disco convertido ya no está en la carpeta de trabajo: se vuelve a descargar y convertir"
+            + (" (la VM ya creada en Morpheus se reutiliza)" if st.d.get("instance") else ""))
+        st.d["done"] = [x for x in st.d.get("done", []) if x == "instance"]
+        for k in ("fetched", "converted", "injected", "staged", "hot"):
+            st.d.pop(k, None)
+        st.path.write_text(json.dumps(st.d, indent=2))
     steps = relevant_steps(opts, mcfg, bool(st.d.get("injected")))
     done = [x for x in steps if st.done(x)]
     pending = [x for x in steps if not st.done(x)]
-    if st.d.get("placeholder") and st.d.get("instance") and not st.d.get("pushed"):
+    if st.d.get("placeholder") and st.d.get("instance") and needs_push(st):
         log("Se continúa una migración anterior: la VM ya está creada en Morpheus; falta copiar sus discos por SSH.")
         log(f"(Progreso guardado en {st.path})")
     elif done and pending:
@@ -474,7 +482,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             log("No hay plantilla de instancia configurada: se termina tras subir la imagen")
             st.mark("instance")
         tracker.finish("instance")
-    if direct and st.d.get("instance") and not st.d.get("pushed"):
+    if direct and st.d.get("instance") and needs_push(st):
         check()
         tracker.begin("instance")
         converted = [Path(p) for p in st.d["converted"]]
@@ -497,10 +505,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                    converted + list(st.d.get("staged") or []), ssh, log, progress_for, cancel)
         for b in bars.values():
             b.finish()
-        st.set(pushed=True)
-        if not opts.get("keep_files"):
-            for f in converted:
-                f.unlink(missing_ok=True)
+        st.set(pushed=st.d["instance"]["id"])  # the converted disks stay until the user deletes the work folder
         tracker.finish("instance")
     result["instance"] = st.d.get("instance")
     tracker.complete()
@@ -511,6 +516,12 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
 
 def target_name(opts: dict, vm) -> str:
     return (opts.get("new_name") or "").strip() or vm.name
+
+
+def needs_push(st) -> bool:
+    """Direct mode: the disks have not been copied into THIS instance yet (a recreated VM needs them again)."""
+    inst = st.d.get("instance") or {}
+    return st.d.get("pushed") != inst.get("id") or inst.get("id") is None
 
 
 def stageable(morpheus, mcfg: dict, source):
