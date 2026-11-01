@@ -2769,7 +2769,10 @@ class LocalShell:
         self.host, self.xml, self.state, self.cmds, self.stuck = host, xml, state, [], stuck
 
     def run(self, cmd, check=True, timeout=3600):
+        cmd = cmd.replace("virsh -c qemu:///system ", "virsh ")
         self.cmds.append(cmd)
+        if cmd.startswith("virsh list"):
+            return "otra\nw2k16\n" if self.xml else "otra\n"
         if cmd.startswith("virsh dumpxml"):
             return self.xml or ""
         if cmd.startswith("virsh domstate"):
@@ -2905,14 +2908,24 @@ def test_find_domain_waits_until_morpheus_has_defined_the_vm():
 
     class Sh(LocalShell):
         def run(self, cmd, check=True, timeout=3600):
-            if cmd.startswith("virsh dumpxml"):
+            if "list --all --name" in cmd:
                 calls["n"] += 1
-                return DOMAIN_XML if calls["n"] >= 3 else "error: failed to get domain"
+                return "otra\nW2K16\n" if calls["n"] >= 3 else "otra\n"
+            if "dumpxml" in cmd:
+                return DOMAIN_XML
             return ""
 
-    sh, host, xml = find_domain(_InstMorpheus(), 42, "w2k16", {"host": "vme01"}, connect=lambda *a: Sh(*a),
-                                sleep=lambda s: None)
-    assert host == "vme01" and "<domain" in xml and calls["n"] == 3
+    t = {"now": 0.0}
+
+    def tick(s):
+        t["now"] += 40
+
+    msgs = []
+    sh, host, name, xml = find_domain(_InstMorpheus(), 42, "w2k16", {"host": "vme01"}, msgs.append,
+                                      connect=lambda *a: Sh(*a), sleep=tick, clock=lambda: t["now"],
+                                      report_every=30)
+    assert host == "vme01" and name == "W2K16" and "<domain" in xml and calls["n"] == 3
+    assert any("Todavía buscando la VM" in m and "no está entre sus VMs (otra)" in m for m in msgs)
 
 
 def test_pipeline_direct_mode_creates_the_vm_from_the_placeholder_and_pushes_the_disks(tmp_path, monkeypatch):
@@ -2996,9 +3009,9 @@ def test_ssh_check_reports_tools_and_datastore_mount():
         def close(self):
             pass
 
-    lines = gui.ssh_check({"ssh_host": "vme02", "ssh_password": "x"}, connect=Sh)
-    assert lines[0] == "✔ Conectado por SSH a vme02 como root"
-    assert "✔ qemu-img: qemu-img version 8.2.2" in lines and "✔ virsh: 10.0.0" in lines
+    lines = gui.ssh_check({"ssh_host": "vme01, vme02", "ssh_password": "x"}, connect=Sh)
+    assert lines[0] == "✔ Conectado por SSH a vme01 como root" and "✔ Conectado por SSH a vme02 como root" in lines
+    assert "   ✔ qemu-img: qemu-img version 8.2.2" in lines and "   ✔ virsh: 10.0.0" in lines
     assert lines[-1].startswith("· No has elegido almacén de datos")
 
 
@@ -3110,3 +3123,22 @@ def test_pipeline_streams_data_disks_to_the_datastore_and_only_the_boot_disk_loc
     sent = dict(FakeMorpheus.log)["instance"]
     assert len(sent["volumes"]) == 2 and sent["volumes"][1]["datastoreId"] == 5
     assert any("irán directamente del origen al almacén FS_NFS50" in m for m in msgs)
+
+
+def test_candidate_hosts_tries_every_address_and_every_host_typed():
+    from vm2morpheus.direct import candidate_hosts
+
+    class M:
+        def get_instance(self, i):
+            return {"servers": [9]}
+
+        def _req(self, method, path, params=None):
+            if path == "/api/servers/9":
+                return {"server": {"parentServer": {"id": 1}}}
+            if path == "/api/servers/1":
+                return {"server": {"name": "vme01", "internalIp": "192.168.40.21"}}
+            return {"servers": [{"name": "vme02", "internalIp": "192.168.40.22",
+                                 "computeServerType": {"code": "mvmHost"}}]}
+
+    assert candidate_hosts(M(), 42, "vme02.lab, 10.0.0.5") == [
+        "192.168.40.21", "vme01", "vme02.lab", "10.0.0.5", "192.168.40.22", "vme02"]

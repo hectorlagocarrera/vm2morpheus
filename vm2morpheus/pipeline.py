@@ -515,7 +515,8 @@ def staging_folder(morpheus, mcfg: dict, source, target: str, log=print) -> str 
 
 
 def stage_data_disks(source, vm, ssh: dict, staging: str, fetch_bar, log=print, cancel=None) -> list[str]:
-    shell = HostShell(ssh["host"], ssh.get("user") or "root", ssh.get("password"), ssh.get("key_file"))
+    first = [h.strip() for h in ssh["host"].replace(";", ",").split(",") if h.strip()][0]  # any host: shared datastore
+    shell = HostShell(first, ssh.get("user") or "root", ssh.get("password"), ssh.get("key_file"))
     try:
         out = []
         for d in vm.disks[1:]:

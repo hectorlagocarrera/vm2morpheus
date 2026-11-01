@@ -84,28 +84,40 @@ def ssh_cfg(f: dict) -> dict:
             "password": f.get("ssh_password") or None, "key_file": (f.get("ssh_key") or "").strip() or None}
 
 
+def ssh_hosts(value: str) -> list[str]:
+    return [h.strip() for h in (value or "").replace(";", ",").split(",") if h.strip()]
+
+
 def ssh_check(f: dict, connect=None) -> list[str]:
-    """'Probar SSH': connect, show the tools the direct upload needs and whether the chosen datastore is mounted."""
-    from .direct import HostShell
+    """'Probar SSH' on every host typed: connection, the tools the direct upload needs and whether the chosen
+    datastore is mounted there (the VM may land on any host of the cluster)."""
+    from .direct import DirectError, HostShell
     cfg = ssh_cfg(f)
-    sh = (connect or HostShell)(cfg["host"], cfg["user"], cfg["password"], cfg["key_file"])
-    lines = [f"✔ Conectado por SSH a {cfg['host']} como {cfg['user']}"]
-    try:
-        for cmd, label in (("qemu-img --version | head -1", "qemu-img"), ("virsh --version", "virsh")):
-            out = sh.run(cmd, check=False).strip()
-            lines.append(f"{'✔' if out else '✖'} {label}: {out or 'no encontrado'}")
-        if f.get("datastore_id") and f.get("morpheus_url"):
-            ds = MorpheusClient(f["morpheus_url"], f["morpheus_token"], verify=bool(f.get("verify_ssl"))).datastore(
-                int(f["datastore_id"]))
+    ds = None
+    if f.get("datastore_id") and f.get("morpheus_url"):
+        ds = MorpheusClient(f["morpheus_url"], f["morpheus_token"], verify=bool(f.get("verify_ssl"))).datastore(
+            int(f["datastore_id"]))
+    lines = []
+    for host in ssh_hosts(cfg["host"]):
+        try:
+            sh = (connect or HostShell)(host, cfg["user"], cfg["password"], cfg["key_file"])
+        except DirectError as e:
+            lines.append(f"✖ {e}")
+            continue
+        lines.append(f"✔ Conectado por SSH a {host} como {cfg['user']}")
+        try:
+            for cmd, label in (("qemu-img --version | head -1", "qemu-img"), ("virsh --version", "virsh")):
+                out = sh.run(cmd, check=False).strip()
+                lines.append(f"   {'✔' if out else '✖'} {label}: {out or 'no encontrado'}")
             if ds and ds.get("path"):
                 ok = sh.run(f"test -d {shlex.quote(ds['path'])} && test -w {shlex.quote(ds['path'])} && echo ok",
                             check=False).strip() == "ok"
-                lines.append(f"{'✔' if ok else '✖'} Almacén {ds['name']} montado y escribible en {ds['path']}")
-        else:
-            lines.append("· No has elegido almacén de datos: elígelo en el bloque 3 (desplegable «Almacén de datos», junto a "
-                         "«Red») y vuelve a probar para comprobar que está montado en el host")
-    finally:
-        sh.close()
+                lines.append(f"   {'✔' if ok else '✖'} Almacén {ds['name']} montado y escribible en {ds['path']}")
+        finally:
+            sh.close()
+    if not ds:
+        lines.append("· No has elegido almacén de datos: elígelo en el bloque 3 (desplegable «Almacén de datos», junto a "
+                     "«Red») y vuelve a probar para comprobar que está montado en los hosts")
     return lines
 
 
@@ -655,7 +667,7 @@ small{color:#5d6b7b}
 <div><label>Instance type (código)</label><input id="instance_type" value="mvm"></div><div><label>Layout <small>(automático: Single HVM)</small></label><select id="layout_id"><option value="">(automático)</option></select></div><div><label>Resource pool <small>(automático)</small></label><select id="resource_pool"><option value="">(automático)</option></select></div></div></details>
 <details id="sshbox"><summary><small>Subida directa por SSH al host HVM (los discos viajan una sola vez, sin pasar por la biblioteca)</small></summary>
 <div class="chk"><label><input type="checkbox" id="ssh_direct"> Copiar los discos por SSH directamente a la VM (crea la VM con una imagen vacía de 1 MB y sustituye sus discos)</label></div>
-<div class="row"><div><label>Host HVM <small>(cualquiera del clúster)</small></label><input id="ssh_host" placeholder="vme01.laboratorio3.local"></div><div><label>Usuario SSH</label><input id="ssh_user" placeholder="root"></div>
+<div class="row"><div><label>Hosts HVM <small>(todos, separados por comas)</small></label><input id="ssh_host" placeholder="192.168.40.21, 192.168.40.22"></div><div><label>Usuario SSH</label><input id="ssh_user" placeholder="root"></div>
 <div><label>Contraseña SSH</label><input id="ssh_password" type="password" autocomplete="off"></div><div><label>Clave privada <small>(opcional)</small></label><input id="ssh_key" placeholder="C:\Users\yo\.ssh\id_rsa"></div></div>
 <button class="sec" data-busy onclick="sshtest()">Probar SSH</button><div id="sshres"></div>
 <small>Con un almacén de datos compartido (NFS o GFS2) elegido arriba, los discos de datos van directamente del origen al almacén y se convierten en el host; solo el disco de arranque pasa por este equipo (para inyectar los drivers).<br>No es un método oficial de HPE: Morpheus no se entera de que el disco cambió (funciona porque la VM usa el fichero). Solo almacenes de ficheros (NFS, GFS2, directorio local). Si falla antes de tocar los discos, reintenta o desmarca la opción para usar la biblioteca.</small></details></fieldset>

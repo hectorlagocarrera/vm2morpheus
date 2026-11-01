@@ -146,8 +146,9 @@ def candidate_hosts(morpheus, instance_id: int, given: str) -> list[str]:
         if h and h not in found:
             found.append(h)
 
-    def addr(server: dict) -> str | None:
-        return server.get("sshHost") or server.get("internalIp") or server.get("externalIp") or server.get("name")
+    def add_server(server: dict) -> None:  # every address Morpheus knows: the first reachable one wins
+        for k in ("sshHost", "internalIp", "externalIp", "hostname", "name"):
+            add(server.get(k))
 
     try:
         inst = morpheus.get_instance(instance_id)
@@ -155,14 +156,15 @@ def candidate_hosts(morpheus, instance_id: int, given: str) -> list[str]:
             vm = morpheus._req("GET", f"/api/servers/{sid}").get("server", {})
             parent = (vm.get("parentServer") or {}).get("id")
             if parent:
-                add(addr(morpheus._req("GET", f"/api/servers/{parent}").get("server", {})))
+                add_server(morpheus._req("GET", f"/api/servers/{parent}").get("server", {}))
     except Exception:
         pass
-    add(given)
+    for h in (given or "").replace(";", ",").split(","):  # the user may list several hosts
+        add(h.strip())
     try:
         for s in morpheus._req("GET", "/api/servers", params={"max": 200}).get("servers", []):
             if (s.get("computeServerType") or {}).get("code") == "mvmHost":
-                add(addr(s))
+                add_server(s)
     except Exception:
         pass
     return found
@@ -227,32 +229,56 @@ def replace_disk(shell, local, target: str, log=print, progress=None, cancel=Non
     log(f"Disco {posixpath.basename(target)} sustituido por {label}")
 
 
+VIRSH = "virsh -c qemu:///system"  # explicit: a non-root SSH user would otherwise see only its own (empty) session
+
+
+def match_domain(names: list[str], vm_name: str) -> str | None:
+    """The libvirt domain of the VM among `names`: the exact name, else a single case-insensitive match."""
+    if vm_name in names:
+        return vm_name
+    close = [n for n in names if n.lower() == vm_name.lower()]
+    return close[0] if len(close) == 1 else None
+
+
 def find_domain(morpheus, instance_id: int, vm_name: str, ssh: dict, log=print, connect=None, timeout: float = 1800,
-                poll: float = 10, sleep=time.sleep, clock=time.monotonic):
-    """(shell, host, xml) of the host where the new VM's libvirt domain is defined, waiting until Morpheus has
-    defined it with all its disks. Other connections are closed."""
+                poll: float = 10, sleep=time.sleep, clock=time.monotonic, report_every: float = 60):
+    """(shell, host, domain name, xml) of the host where the new VM's libvirt domain is defined, waiting until
+    Morpheus has defined it. Says every minute which hosts were tried and what each answered."""
     connect = connect or HostShell
-    shells, errors = {}, {}
-    deadline = clock() + timeout
+    shells, status, failed = {}, {}, {}
+    start = clock()
+    deadline, next_report = start + timeout, start + report_every
     try:
         while True:
-            for host in candidate_hosts(morpheus, instance_id, ssh.get("host", "")):
+            hosts = candidate_hosts(morpheus, instance_id, ssh.get("host", ""))
+            for host in hosts:
                 if host not in shells:
+                    if clock() - failed.get(host, -1e9) < 120:  # unreachable a moment ago: do not wait 20 s again
+                        continue
                     try:
                         shells[host] = connect(host, ssh.get("user") or "root", ssh.get("password"), ssh.get("key_file"))
                     except DirectError as e:
-                        errors[host] = str(e)
+                        status[host], failed[host] = str(e), clock()
                         continue
-                xml = shells[host].run(f"virsh dumpxml {shlex.quote(vm_name)}", check=False)
-                if "<domain" in xml:
-                    found = shells.pop(host)
-                    return found, host, xml
-                errors[host] = f"{host}: la VM {vm_name!r} todavía no está definida"
-            if not shells:
-                raise DirectError("No se pudo conectar por SSH a ningún host: " + " · ".join(errors.values()))
-            if clock() > deadline:
+                out = shells[host].run(f"{VIRSH} list --all --name", check=False)
+                names = [n.strip() for n in out.splitlines() if n.strip()]
+                name = match_domain(names, vm_name)
+                if name:
+                    xml = shells[host].run(f"{VIRSH} dumpxml {shlex.quote(name)}", check=False)
+                    if "<domain" in xml:
+                        return shells.pop(host), host, name, xml
+                status[host] = (f"{host}: conectado, pero {vm_name!r} no está entre sus VMs "
+                                f"({', '.join(names[:8]) or 'ninguna'}{'…' if len(names) > 8 else ''})")
+            if not shells and len(failed) >= len(hosts):
+                raise DirectError("No se pudo conectar por SSH a ningún host: " + " · ".join(status.values()))
+            now = clock()
+            if now > deadline:
                 raise DirectError(f"La VM no apareció en ningún host en {timeout / 60:.0f} min: "
-                                  + " · ".join(errors.values()))
+                                  + " · ".join(status.values()))
+            if now >= next_report:
+                log(f"Todavía buscando la VM ({(now - start) / 60:.0f} min). Hosts probados: "
+                    + " · ".join(status.get(h, h) for h in hosts))
+                next_report = now + report_every
             sleep(poll)
     finally:
         for sh in shells.values():
@@ -260,7 +286,7 @@ def find_domain(morpheus, instance_id: int, vm_name: str, ssh: dict, log=print, 
 
 
 def domstate(shell, vm_name: str) -> str:
-    return shell.run(f"virsh domstate {shlex.quote(vm_name)}", check=False).strip().lower()
+    return shell.run(f"{VIRSH} domstate {shlex.quote(vm_name)}", check=False).strip().lower()
 
 
 def push_disks(morpheus, instance_id: int, vm_name: str, disks: list, ssh: dict, log=print,
@@ -271,19 +297,21 @@ def push_disks(morpheus, instance_id: int, vm_name: str, disks: list, ssh: dict,
     system boots and gets a network address, which never happens with the blank placeholder disk, so its API
     cannot be used to stop/start it at this point. Returns the host used."""
     log("Esperando a que la VM aparezca en el host (Morpheus la está creando) ...")
-    shell, host, xml = find_domain(morpheus, instance_id, vm_name, ssh, log, connect, sleep=sleep)
+    log("Hosts donde se buscará: " + ", ".join(candidate_hosts(morpheus, instance_id, ssh.get("host", ""))))
+    shell, host, vm_name, xml = find_domain(morpheus, instance_id, vm_name, ssh, log, connect, sleep=sleep)
+    log(f"VM encontrada en {host} (en libvirt se llama {vm_name!r})")
     q = shlex.quote(vm_name)
     try:
         if domstate(shell, vm_name) not in ("shut off", "apagado"):
             log(f"Apagando en {host} la VM recién creada (solo tiene el disco vacío de la plantilla) ...")
-            shell.run(f"virsh destroy {q}", check=False)
+            shell.run(f"{VIRSH} destroy {q}", check=False)
             for _ in range(30):
                 if domstate(shell, vm_name) in ("shut off", "apagado"):
                     break
                 sleep(2)
             else:
                 raise DirectError(f"La VM {vm_name!r} no se apagó en {host}: no se tocan sus discos")
-        xml = shell.run(f"virsh dumpxml {q}")  # again: the definition may have changed while it was booting
+        xml = shell.run(f"{VIRSH} dumpxml {q}")  # again: the definition may have changed while it was booting
         targets = domain_disks(xml)
         if len(targets) < len(disks):
             raise DirectError(f"La VM tiene {len(targets)} disco(s) en {host} y hay {len(disks)} para subir")
@@ -295,7 +323,7 @@ def push_disks(morpheus, instance_id: int, vm_name: str, disks: list, ssh: dict,
             raise DirectError(f"Alguien encendió la VM {vm_name!r} mientras se sustituían los discos; apágala, "
                               "reintenta la migración y no la arranques a mano hasta que termine")
         log("Arrancando la VM ...")
-        shell.run(f"virsh start {q}")
+        shell.run(f"{VIRSH} start {q}")
     finally:
         shell.close()
     log("VM arrancada. Morpheus la dará por creada cuando Windows arranque y obtenga una dirección de red "
