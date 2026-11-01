@@ -422,6 +422,12 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             want_sata = bool(opts.get("boot_sata", True))
 
             def build(boot_sata: bool) -> dict:
+                p = _build(boot_sata)
+                if direct:  # the migrated OS has no Morpheus agent: do not let "finalizing" wait for one
+                    p.setdefault("config", {})["noAgent"] = True
+                return p
+
+            def _build(boot_sata: bool) -> dict:
                 try:
                     return payload_from_reference(
                         ref, target, int(refcfg["image_id"]) if refcfg.get("image_id") else None,

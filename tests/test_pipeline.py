@@ -2998,7 +2998,7 @@ def test_pipeline_direct_mode_creates_the_vm_from_the_placeholder_and_pushes_the
     assert images[0]["virtualImage"]["vmToolsInstalled"] is False and images[0]["virtualImage"]["installAgent"] is False
     assert len(FakeMorpheus.uploads[7]) < 1024 * 1024
     sent = dict(FakeMorpheus.log)["instance"]
-    assert sent["config"]["imageId"] == 7 and sent["volumes"][0]["datastoreId"] == 5
+    assert sent["config"]["imageId"] == 7 and sent["volumes"][0]["datastoreId"] == 5 and sent["config"]["noAgent"] is True
     assert pushed == {"iid": 42, "name": "vm1", "disks": [True], "ssh": {"host": "vme02"}}
     assert res["images"] == [] and res["instance"]["id"] == 42
     assert not list((tmp_path / "wd" / "vm1").glob("*.qcow2"))   # converted disk removed after the push
