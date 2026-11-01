@@ -132,8 +132,11 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     if not vm.disks:
         problems.append("La VM no tiene discos")
     if windows_inject and not is_admin():
-        problems.append("La inyección de drivers necesita permisos de administrador: cierra el programa y ábrelo con "
-                        "clic derecho > Ejecutar como administrador (o desmarca la opción de drivers)")
+        problems.append("La inyección de drivers necesita permisos de administrador y este programa NO está elevado "
+                        "(aunque tu usuario sea administrador, Windows exige abrirlo con clic derecho > Ejecutar como "
+                        "administrador). Si ya lo hiciste, puede que estés viendo una instancia antigua sin permisos: "
+                        "cierra todas (botón 'Salir del programa' o Administrador de tareas) y ábrelo de nuevo. "
+                        "También puedes desmarcar la opción de drivers.")
     if vm.power_state == "on" and not opts.get("shutdown_source") and not use_hot:
         problems.append("La VM está encendida: marca 'Apagar la VM de origen' (--shutdown) para hacer una copia consistente"
                         + (", o 'Copia en caliente' para no apagarla" if source.supports_hot else ""))

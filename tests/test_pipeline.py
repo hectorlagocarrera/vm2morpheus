@@ -2585,3 +2585,82 @@ def test_other_smb_errors_are_not_disguised_as_sharing_violations(tmp_path, monk
     _fake_smbclient(monkeypatch, b"x", open_error=OSError("[NtStatus 0xc0000022] Access is denied"))
     with pytest.raises(OSError, match="0xc0000022"):
         _hv().fetch_disks(_frozen_vm(), tmp_path, lambda label: __import__("vm2morpheus.util", fromlist=["Progress"]).Progress(label))
+
+
+# ------------------------------------------ an elevated launch must not end up talking to an old unelevated instance
+def test_takeover_decision_table():
+    from vm2morpheus.gui import plan_takeover
+    idle = {"version": "1.0", "admin": False, "busy": False}
+    assert plan_takeover(idle, True, "1.0") == "replace"                       # I am admin, the old one is not
+    assert plan_takeover({**idle, "admin": True}, True, "1.0") == "reuse"      # same rights, same version
+    assert plan_takeover({**idle, "admin": True}, False, "1.0") == "reuse"     # never swap a stronger one for a weaker
+    assert plan_takeover(idle, False, "1.0") == "reuse"
+    assert plan_takeover(idle, False, "2.0") == "replace"                      # a stale version is replaced
+    assert plan_takeover({**idle, "busy": True}, True, "2.0") == "reuse"       # never interrupt a migration
+    assert plan_takeover(None, True, "1.0") == "reuse"                         # unknown (older build): do not guess
+
+
+def test_info_endpoint_reports_version_rights_and_whether_it_is_busy(monkeypatch):
+    import urllib.request
+    from vm2morpheus import gui
+    monkeypatch.setattr(gui, "is_admin", lambda: True)
+    srv = HTTPServer(("127.0.0.1", 0), gui.Handler)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        info = json.loads(urllib.request.urlopen(f"http://127.0.0.1:{srv.server_port}/info").read())
+        assert gui.fetch_info(srv.server_port) == info
+    finally:
+        srv.shutdown()
+    assert info["admin"] is True and info["busy"] is False and info["version"] == gui.__version__ and info["pid"] > 0
+
+
+def test_fetch_info_returns_none_for_an_instance_that_has_no_info_endpoint():
+    from http.server import BaseHTTPRequestHandler
+    from vm2morpheus import gui
+
+    class Old(BaseHTTPRequestHandler):                      # what a build older than /info answers
+        def do_GET(self):
+            self.send_response(404)
+            self.end_headers()
+
+        def log_message(self, *a):
+            pass
+
+    srv = HTTPServer(("127.0.0.1", 0), Old)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    try:
+        assert gui.fetch_info(srv.server_port) is None
+    finally:
+        srv.shutdown()
+
+
+def test_an_elevated_launch_replaces_the_idle_unelevated_instance_on_the_port(monkeypatch, capsys):
+    import socket
+    import time as _t
+    from vm2morpheus import gui
+    with socket.socket() as s:
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+    # the old instance answers from handler threads (not admin); the new launch runs on the main thread (admin)
+    monkeypatch.setattr(gui, "is_admin", lambda: threading.current_thread() is threading.main_thread())
+    old = threading.Thread(target=gui.serve, kwargs={"port": port, "open_browser": False}, daemon=True)
+    old.start()
+    for _ in range(40):
+        if gui.fetch_info(port):
+            break
+        _t.sleep(0.1)
+    assert gui.fetch_info(port)["admin"] is False
+    threading.Timer(4.0, lambda: gui.STATE["server"].shutdown()).start()      # end the new instance afterwards
+    gui.serve(port, open_browser=False)                                       # the elevated launch
+    out = capsys.readouterr().out
+    assert "no tenía permisos de administrador: se ha cerrado para abrir esta" in out
+    assert "Ya hay una instancia" not in out
+    old.join(timeout=5)
+    assert not old.is_alive()                                                  # the old one really exited
+
+
+def test_page_shows_the_elevation_status_and_the_preflight_explains_it():
+    from vm2morpheus import gui
+    page = gui.render_page()
+    for needle in ('id="adminbadge"', "Sin permisos de administrador", 'fetch("/info")'):
+        assert needle in page

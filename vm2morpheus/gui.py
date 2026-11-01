@@ -1,9 +1,11 @@
 """Local web GUI (stdlib only). Binds to 127.0.0.1; credentials are never written to disk."""
 import contextlib
 import json
+import os
 import shutil
 import time
 import urllib.parse
+import urllib.request
 import threading
 import uuid
 import webbrowser
@@ -12,6 +14,7 @@ from pathlib import Path
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import __version__, history, settings
+from .drivers_windows import is_admin
 from .icon_data import FAVICON_ICO, ICON_PNG
 from .logo import LOGO_PNG
 from .morpheus import MorpheusClient
@@ -251,6 +254,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Length", str(len(b)))
             self.end_headers()
             self.wfile.write(b)
+        elif self.path == "/info":
+            self._json(instance_info())
         elif self.path == "/ping":
             STATE["last_ping"] = time.monotonic()
             self._json({"ok": True})
@@ -382,14 +387,66 @@ class Handler(BaseHTTPRequestHandler):
         self._json({"error": "not found"}, 404)
 
 
+def instance_info() -> dict:
+    """Who is answering on the port: shown in the page header and used by a second launch to decide what to do."""
+    return {"version": __version__, "admin": is_admin(), "busy": RUN_LOCK.locked(), "pid": os.getpid()}
+
+
+def fetch_info(port: int) -> dict | None:
+    """Ask the instance already on the port who it is; None if it does not answer (or is an older version)."""
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/info", timeout=1.5) as r:
+            data = json.loads(r.read())
+        return data if isinstance(data, dict) and "version" in data else None
+    except Exception:
+        return None
+
+
+def ask_to_quit(port: int) -> bool:
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/shutdown", data=b"{}", method="POST")
+        urllib.request.urlopen(req, timeout=3).read()
+        return True
+    except Exception:
+        return False
+
+
+def plan_takeover(info: dict | None, i_am_admin: bool, version: str) -> str:
+    """'replace' when the instance already on the port is idle and has fewer rights, or is another version, than the
+    one being started (an elevated launch must not end up talking to an old unelevated one); else 'reuse'."""
+    if not info or info.get("busy"):
+        return "reuse"
+    if i_am_admin and not info.get("admin"):
+        return "replace"
+    return "replace" if info.get("version") != version else "reuse"
+
+
+def bind(port: int, retries: int = 1, wait: float = 0.5):
+    for attempt in range(retries):
+        try:
+            return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+        except OSError:
+            if attempt < retries - 1:
+                time.sleep(wait)
+    return None
+
+
 def serve(port: int = 8765, open_browser: bool = True, embedded: bool = False):
     """Run the GUI in the default browser (the app exits when the tab goes away). With embedded=True it opens its
     own window instead (needs pywebview + WebView2; not part of the packaged exe) and falls back to the browser."""
     url = f"http://127.0.0.1:{port}"
-    try:
-        srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    except OSError:  # a second launch: do not start another server
-        print(f"Ya hay una instancia en marcha en {url}: se abre en el navegador")
+    srv = bind(port)
+    if srv is None:  # a second launch: replace a weaker/older idle instance, otherwise reuse the running one
+        info = fetch_info(port)
+        if plan_takeover(info, is_admin(), __version__) == "replace" and ask_to_quit(port):
+            why = ("no tenía permisos de administrador" if is_admin() and not info.get("admin")
+                   else f"era la versión {info.get('version')}")
+            print(f"La instancia anterior {why}: se ha cerrado para abrir esta.")
+            srv = bind(port, retries=12)  # give the old process a moment to release the port
+    if srv is None:
+        extra = "" if fetch_info(port) else (" No he podido identificarla (puede ser una versión anterior): si no es "
+                                             "la que esperas, ciérrala con su botón 'Salir del programa'.")
+        print(f"Ya hay una instancia en marcha en {url}: se abre en el navegador.{extra}")
         if open_browser:
             if embedded:
                 from .launcher import show_info
@@ -407,6 +464,7 @@ def serve(port: int = 8765, open_browser: bool = True, embedded: bool = False):
         STATE["embedded"] = True  # tells the page to hide its own "Salir" button
         if open_window(url, RUN_LOCK.locked):
             srv.shutdown()
+            srv.server_close()
             return
         STATE["embedded"] = False
         print("No se pudo abrir la ventana integrada (falta WebView2 o pywebview): se usa el navegador")
@@ -426,6 +484,8 @@ def serve(port: int = 8765, open_browser: bool = True, embedded: bool = False):
             thread.join(0.5)
     except KeyboardInterrupt:
         srv.shutdown()
+    finally:
+        srv.server_close()  # release the port now, so a new launch can take it over at once
 
 
 def render_page() -> str:
@@ -440,7 +500,10 @@ PAGE = r"""<!doctype html><html lang="es"><meta charset="utf-8"><meta name="view
 <style>
 body{font:15px system-ui,sans-serif;margin:0;background:#f4f6f8;color:#1b2430}
 main{max-width:920px;margin:0 auto;padding:16px}
-.brand{padding:4px 0 10px;display:flex;justify-content:space-between;align-items:center} .brand .quit{margin:0} .brand img{height:56px;max-width:100%}
+.brand{padding:4px 0 10px;display:flex;justify-content:space-between;align-items:center} .brand .quit{margin:0}
+.adminbadge{margin-left:auto;margin-right:12px;font-size:12px;padding:3px 10px;border-radius:10px;display:none}
+.adminbadge.on{display:inline-block;background:#dcfce7;color:#166534}
+.adminbadge.off{display:inline-block;background:#fef3c7;color:#92400e} .brand img{height:56px;max-width:100%}
 h1{font-size:22px} fieldset{background:#fff;border:1px solid #d5dbe2;border-radius:8px;margin:0 0 14px;padding:12px 16px}
 legend{font-weight:600;padding:0 6px} label{display:block;margin:8px 0 2px;font-size:13px;color:#4a5665}
 input,select{width:100%;padding:7px;border:1px solid #b9c2cc;border-radius:5px;box-sizing:border-box}
@@ -507,7 +570,7 @@ button.sec{background:#e5e9ee;color:#1b2430} .logbar{display:flex;justify-conten
 #chartlegend i{display:inline-block;width:10px;height:10px;border-radius:2px;margin:0 4px 0 12px;vertical-align:middle}
 small{color:#5d6b7b}
 </style><main>
-<div class="brand"><img src="/logo.png" alt="Redes · 25 años innovando el futuro"><button class="sec quit" onclick="quit()">Salir del programa</button></div>
+<div class="brand"><img src="/logo.png" alt="Redes · 25 años innovando el futuro"><span id="adminbadge" class="adminbadge"></span><button class="sec quit" onclick="quit()">Salir del programa</button></div>
 <h1>vm2morpheus <small>Hyper-V / VMware → Morpheus (KVM) · v__VERSION__</small></h1>
 <div id="busywrap"><div id="busyline"></div><div id="busytxt"></div></div>
 <nav class="tabs"><button class="tab on" id="tabbtn-migrar" onclick="showTab('migrar')">Migrar</button><button class="tab" id="tabbtn-historico" onclick="showTab('historico')">Histórico</button></nav>
@@ -673,6 +736,9 @@ async function quit(){if(currentJob&&!confirm("Hay una migración en curso. ¿Sa
  try{await post("/shutdown",{})}catch(e){}
  document.body.innerHTML="<main><h1>Programa cerrado</h1><p>Ya puedes cerrar esta pestaña.</p></main>"}
 if(EMBEDDED){const q=document.querySelector(".quit");if(q)q.style.display="none"}
+fetch("/info").then(r=>r.json()).then(i=>{const b=document.getElementById("adminbadge");
+ b.className="adminbadge "+(i.admin?"on":"off");b.textContent=i.admin?"Administrador":"Sin permisos de administrador";
+ b.title=i.admin?"Este programa tiene permisos de administrador (necesarios para inyectar drivers).":"Para inyectar drivers hay que abrir el programa con clic derecho > Ejecutar como administrador. Si ya lo hiciste, cierra todas las ventanas y procesos vm2morpheus antiguos."}).catch(()=>{});
 setInterval(()=>fetch("/ping").catch(()=>{}),5000);fetch("/ping").catch(()=>{});
 async function refinfo(){try{show(JSON.stringify(await busy("Leyendo la instancia de referencia …",()=>post("/refinfo",form())),null,2))}catch(e){show("ERROR: "+e.message)}}
 async function lookups(){try{await persist();const j=await busy("Cargando datos de Morpheus …",()=>post("/lookups",form()));
