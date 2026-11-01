@@ -2951,6 +2951,7 @@ def test_pipeline_direct_mode_creates_the_vm_from_the_placeholder_and_pushes_the
         srv.shutdown()
     images = [b for k, b in FakeMorpheus.log if k == "image"]
     assert [i["virtualImage"]["name"] for i in images] == ["vm2morpheus-vacia-uefi"]   # FakeSource is UEFI; only the 1 MB placeholder
+    assert images[0]["virtualImage"]["vmToolsInstalled"] is False and images[0]["virtualImage"]["installAgent"] is False
     assert len(FakeMorpheus.uploads[7]) < 1024 * 1024
     sent = dict(FakeMorpheus.log)["instance"]
     assert sent["config"]["imageId"] == 7 and sent["volumes"][0]["datastoreId"] == 5
@@ -3142,3 +3143,18 @@ def test_candidate_hosts_tries_every_address_and_every_host_typed():
 
     assert candidate_hosts(M(), 42, "vme02.lab, 10.0.0.5") == [
         "192.168.40.21", "vme01", "vme02.lab", "10.0.0.5", "192.168.40.22", "vme02"]
+
+
+def test_an_old_placeholder_gets_vm_tools_unchecked_so_morpheus_does_not_wait_for_network(tmp_path):
+    from vm2morpheus.pipeline import ensure_placeholder
+    updates = []
+
+    class M:
+        def find_one(self, *a):
+            return {"id": 9, "status": "Active", "vmToolsInstalled": True, "installAgent": True}
+
+        def update_virtual_image(self, i, fields):
+            updates.append((i, fields))
+
+    assert ensure_placeholder(M(), tmp_path, False, lambda *_: None) == {"id": 9, "name": "vm2morpheus-vacia"}
+    assert updates == [(9, {"vmToolsInstalled": False, "installAgent": False, "isCloudInit": False})]

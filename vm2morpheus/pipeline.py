@@ -529,6 +529,11 @@ def stage_data_disks(source, vm, ssh: dict, staging: str, fetch_bar, log=print, 
         shell.close()
 
 
+# On the placeholder image: no VM tools and no agent, so Morpheus does not wait for the VM's network (an empty disk
+# never gets one) and marks the instance as provisioned as soon as it is running.
+PLACEHOLDER_FLAGS = {"vmToolsInstalled": False, "installAgent": False, "isCloudInit": False}
+
+
 def ensure_placeholder(morpheus, workdir: Path, uefi: bool, log=print) -> dict:
     """The tiny blank image the direct mode creates VMs from; uploaded once and reused afterwards."""
     name = PLACEHOLDER_NAME + ("-uefi" if uefi else "")
@@ -538,12 +543,18 @@ def ensure_placeholder(morpheus, workdir: Path, uefi: bool, log=print) -> dict:
         old = None
     if old and (old.get("status") or "Active").lower() in ("active", "available"):
         log(f"Se usa la imagen plantilla vacía {name!r} (id {old['id']}) para crear la VM")
+        if any(old.get(k) for k in PLACEHOLDER_FLAGS):  # made by an older version: Morpheus would wait for network
+            try:
+                morpheus.update_virtual_image(old["id"], PLACEHOLDER_FLAGS)
+            except MorpheusError as e:
+                log(f"Aviso: no se pudo desmarcar «VM Tools Installed?» en la plantilla ({e}); desmárcalo a mano en "
+                    "Library > Virtual Images o Morpheus esperará la red de la VM")
         return {"id": old["id"], "name": name}
     blank = workdir / f"{name}.qcow2"
     subprocess.run([find_tool("qemu-img") or "qemu-img", "create", "-f", "qcow2", str(blank), "1M"],
                    check=True, capture_output=True, **no_window())
     log(f"Subiendo la imagen plantilla vacía {name!r} (1 MB, solo la primera vez) ...")
-    img = morpheus.create_virtual_image(name, "qcow2", uefi=uefi)
+    img = morpheus.create_virtual_image(name, "qcow2", uefi=uefi, extra=PLACEHOLDER_FLAGS)
     morpheus.upload_image(img["id"], blank)
     morpheus.wait_image_ready(img["id"])
     blank.unlink(missing_ok=True)

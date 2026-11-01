@@ -77,6 +77,9 @@ class MorpheusClient:
         finally:
             reader.close()
 
+    def update_virtual_image(self, image_id: int, fields: dict) -> None:
+        self._req("PUT", f"/api/virtual-images/{image_id}", json={"virtualImage": fields})
+
     def delete_image(self, image_id: int) -> None:
         self._req("DELETE", f"/api/virtual-images/{image_id}")
 
