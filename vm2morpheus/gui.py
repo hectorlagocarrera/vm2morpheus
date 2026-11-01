@@ -102,9 +102,8 @@ def ssh_check(f: dict, connect=None) -> list[str]:
                             check=False).strip() == "ok"
                 lines.append(f"{'✔' if ok else '✖'} Almacén {ds['name']} montado y escribible en {ds['path']}")
         else:
-            lines.append("· No has elegido almacén de datos: elígelo en el bloque 3, desplegable «Almacén de datos» (si solo sale "
-                         "«automático», pulsa antes «Cargar nubes, grupos, planes y redes» en el bloque 2) y vuelve a "
-                         "probar para comprobar que está montado")
+            lines.append("· No has elegido almacén de datos: elígelo en el bloque 3 (desplegable «Almacén de datos», junto a "
+                         "«Red») y vuelve a probar para comprobar que está montado en el host")
     finally:
         sh.close()
     return lines
