@@ -91,7 +91,7 @@ def ssh_hosts(value: str) -> list[str]:
 def ssh_check(f: dict, connect=None) -> list[str]:
     """'Probar SSH' on every host typed: connection, the tools the direct upload needs and whether the chosen
     datastore is mounted there (the VM may land on any host of the cluster)."""
-    from .direct import DirectError, HostShell
+    from .direct import DirectError, HostShell, as_user_prefix
     cfg = ssh_cfg(f)
     ds = None
     if f.get("datastore_id") and f.get("morpheus_url"):
@@ -110,9 +110,12 @@ def ssh_check(f: dict, connect=None) -> list[str]:
                 out = sh.run(cmd, check=False).strip()
                 lines.append(f"   {'✔' if out else '✖'} {label}: {out or 'no encontrado'}")
             if ds and ds.get("path"):
-                ok = sh.run(f"test -d {shlex.quote(ds['path'])} && test -w {shlex.quote(ds['path'])} && echo ok",
-                            check=False).strip() == "ok"
-                lines.append(f"   {'✔' if ok else '✖'} Almacén {ds['name']} montado y escribible en {ds['path']}")
+                path = shlex.quote(ds["path"])
+                owner = sh.run(f"stat -c %U {path}", check=False).strip()
+                pre = as_user_prefix(cfg["user"], owner or None)
+                ok = sh.run(f"test -d {path} && {pre}test -w {path} && echo ok", check=False).strip() == "ok"
+                lines.append(f"   {'✔' if ok else '✖'} Almacén {ds['name']} montado y escribible en {ds['path']}"
+                             + (f" (como {owner})" if pre else ""))
         finally:
             sh.close()
     if not ds:

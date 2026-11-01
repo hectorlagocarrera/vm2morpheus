@@ -11,6 +11,7 @@ given the original's owner and permissions and only then moved over the original
 import json
 import posixpath
 import shlex
+import struct
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -23,6 +24,54 @@ CHUNK = 4 * 1024 * 1024
 
 class DirectError(RuntimeError):
     pass
+
+
+# Runs on the host (python3 ships with the Ubuntu of the HVM hosts): reads frames of 8-byte offset + 4-byte length +
+# data from stdin and writes them at that offset; a zero-length frame sets the final size and ends.
+RECEIVER = (
+    "import os,struct,sys\n"
+    "r=sys.stdin.buffer\n"
+    "fd=os.open(sys.argv[1],os.O_WRONLY|os.O_CREAT,0o644)\n"
+    "def rd(n):\n"
+    " b=b''\n"
+    " while len(b)<n:\n"
+    "  c=r.read(n-len(b))\n"
+    "  if not c: sys.exit('flujo cortado')\n"
+    "  b+=c\n"
+    " return b\n"
+    "while True:\n"
+    " off,n=struct.unpack('>QI',rd(12))\n"
+    " if n==0:\n"
+    "  os.ftruncate(fd,off); break\n"
+    " os.pwrite(fd,rd(n),off)\n"
+    "os.fsync(fd); os.close(fd); print('ok')\n"
+)
+
+
+def as_user_prefix(ssh_user: str, owner: str | None) -> str:
+    """Command prefix to act as `owner` (the owner of the datastore folder) instead of the SSH user."""
+    if not owner or owner == ssh_user:
+        return ""
+    q = shlex.quote(owner)
+    return f"runuser -u {q} -- " if ssh_user == "root" else f"sudo -n -u {q} -- "
+
+
+def _frames(src, start: int, total: int | None, progress=None, cancel=None, size_hint: int | None = None):
+    """(offset, data) chunks of a file/stream from `start`, zero chunks left out, then (final size, b"")."""
+    zero = bytes(CHUNK)
+    off = start
+    while True:
+        if cancel is not None and cancel.is_set():
+            raise CancelledError("cancelado")
+        buf = src.read(CHUNK)
+        if not buf:
+            break
+        if buf != zero[:len(buf)]:
+            yield off, buf
+        off += len(buf)
+        if progress:
+            progress(off, total or size_hint)
+    yield (total if total is not None else off), b""
 
 
 class HostShell:
@@ -42,7 +91,7 @@ class HostShell:
             raise DirectError(f"SSH a {host}: usuario o contraseña/clave incorrectos ({e})") from e
         except (OSError, paramiko.SSHException) as e:
             raise DirectError(f"No se pudo conectar por SSH a {host}: {e}") from e
-        self._sftp = None
+        self.user = user
 
     def run(self, cmd: str, check: bool = True, timeout: float = 3600) -> str:
         _, out, err = self.client.exec_command(cmd, timeout=timeout)
@@ -52,71 +101,63 @@ class HostShell:
             raise DirectError(f"En {self.host} falló «{cmd}» ({code}): {(etext or text).strip()[-500:]}")
         return text
 
-    @property
-    def sftp(self):
-        if self._sftp is None:
-            self._sftp = self.client.open_sftp()
-        return self._sftp
+    def as_user(self, owner: str | None) -> str:
+        return as_user_prefix(self.user, owner)
 
-    def remote_size(self, path: str) -> int | None:
+    def remote_size(self, path: str, owner: str | None = None) -> int | None:
+        out = self.run(f"{self.as_user(owner)}stat -c %s {shlex.quote(path)}", check=False).strip()
+        return int(out) if out.isdigit() else None
+
+    def send_frames(self, remote: str, frames, owner: str | None = None) -> None:
+        """Write (offset, bytes) frames into `remote` through a tiny receiver run as `owner` on the host.
+
+        Not SFTP: on an NFS datastore exported with root_squash, root may not write into the VM folders, which
+        belong to libvirt-qemu; the receiver runs as the folder's owner instead. The last frame (offset, b"")
+        sets the final size, so skipped zero runs stay as holes."""
+        cmd = f"{self.as_user(owner)}python3 -c {shlex.quote(RECEIVER)} {shlex.quote(remote)}"
+        chan = self.client.get_transport().open_session()
+        chan.exec_command(cmd)
         try:
-            return self.sftp.stat(path).st_size
+            for off, data in frames:
+                chan.sendall(struct.pack(">QI", off, len(data)) + data)
+                if not data:
+                    break
+            chan.shutdown_write()
         except OSError:
-            return None
+            pass  # the receiver died: its message is read below
+        out = chan.makefile("rb").read().decode("utf-8", "replace")
+        err = chan.makefile_stderr("rb").read().decode("utf-8", "replace")
+        code = chan.recv_exit_status()
+        if code != 0 or "ok" not in out:
+            raise DirectError(f"En {self.host} no se pudo escribir {remote}" + (f" como {owner}" if owner else "")
+                              + f" ({code}): {(err or out).strip()[-400:]}")
 
-    def upload(self, local: Path, remote: str, progress=None, cancel=None) -> None:
+    def upload(self, local: Path, remote: str, progress=None, cancel=None, owner: str | None = None) -> None:
         """Copy local -> remote, resuming after what a previous attempt already wrote."""
         total = local.stat().st_size
-        start = self.remote_size(remote) or 0
+        start = self.remote_size(remote, owner) or 0
         if start > total:
             start = 0
-        with open(local, "rb") as src, self.sftp.open(remote, "r+b" if start else "wb") as dst:
-            dst.set_pipelined(True)
+        with open(local, "rb") as src:
             src.seek(start)
-            dst.seek(start)
-            done = start
-            while True:
-                if cancel is not None and cancel.is_set():
-                    raise CancelledError("cancelado")
-                buf = src.read(CHUNK)
-                if not buf:
-                    break
-                dst.write(buf)
-                done += len(buf)
-                if progress:
-                    progress(done, total)
+            self.send_frames(remote, _frames(src, start, total, progress, cancel), owner)
 
-    def write_stream(self, reader, remote: str, size: int, progress=None, cancel=None) -> None:
-        """Write a stream to a remote file. Runs of zeros are skipped (left as holes), so an empty or thin disk
-        costs network but not datastore writes; the file is then truncated to its full size."""
-        zero = bytes(CHUNK)
-        done = 0
-        with self.sftp.open(remote, "wb") as dst:
-            dst.set_pipelined(True)
-            while True:
-                if cancel is not None and cancel.is_set():
-                    raise CancelledError("cancelado")
-                buf = reader.read(CHUNK)
-                if not buf:
-                    break
-                if buf == zero[:len(buf)]:
-                    dst.seek(done + len(buf))
-                else:
-                    dst.seek(done)
-                    dst.write(buf)
-                done += len(buf)
-                if progress:
-                    progress(done, size)
-            dst.truncate(max(done, 0))
-        if size and done < size:
-            raise DirectError(f"El origen dejó de enviar el disco a los {done} de {size} bytes")
+    def write_stream(self, reader, remote: str, size: int, progress=None, cancel=None, owner: str | None = None) -> None:
+        """Write a stream to a remote file. Runs of zeros are not sent (left as holes), so an empty or thin disk
+        costs reading but not network to the host nor datastore writes."""
+        done = {"n": 0}
+
+        def frames():
+            for off, data in _frames(reader, 0, None, progress, cancel, size):
+                done["n"] = off if not data else off + len(data)
+                yield off, data
+
+        self.send_frames(remote, frames(), owner)
+        if size and done["n"] < size:
+            raise DirectError(f"El origen dejó de enviar el disco a los {done['n']} de {size} bytes")
 
     def close(self):
-        try:
-            if self._sftp is not None:
-                self._sftp.close()
-        finally:
-            self.client.close()
+        self.client.close()
 
 
 def domain_disks(xml_text: str) -> list[str]:
@@ -191,41 +232,54 @@ def stage_disk(shell, reader, fmt: str, size: int, staging: str, name: str, log=
     q = shlex.quote
     out = posixpath.join(staging, name + ".qcow2")
     src = posixpath.join(staging, name + "." + fmt + ".src")
-    shell.run(f"mkdir -p {q(staging)}")
+    owner = None
+    for who in (shell.run(f"stat -c %U {q(posixpath.dirname(posixpath.dirname(staging)))}", check=False).strip() or None,
+                "libvirt-qemu"):
+        if shell.run(f"{shell.as_user(who)}mkdir -p {q(staging)} && echo ok", check=False).strip() == "ok":
+            owner = who
+            break
+    else:
+        raise DirectError(f"No se pudo crear {staging} en el almacén de datos (permisos)")
+    pre = shell.as_user(owner)
     if shell.run(f"test -f {q(out)} && echo yes", check=False).strip() == "yes":
         log(f"{name}: ya estaba copiado y convertido en el host, se reutiliza")
         return out
     try:
-        shell.write_stream(reader, src, size, progress, cancel)
+        shell.write_stream(reader, src, size, progress, cancel, owner)
     finally:
         reader.close()
     log(f"Convirtiendo {name} a qcow2 en el host ...")
-    shell.run(f"qemu-img convert -f {q(fmt)} -O qcow2 {q(src)} {q(out + '.part')} && mv -f {q(out + '.part')} {q(out)} "
-              f"&& rm -f {q(src)}")
+    shell.run(f"{pre}qemu-img convert -f {q(fmt)} -O qcow2 {q(src)} {q(out + '.part')} && {pre}mv -f {q(out + '.part')} "
+              f"{q(out)} && {pre}rm -f {q(src)}")
     return out
 
 
 def replace_disk(shell, local, target: str, log=print, progress=None, cancel=None) -> None:
     """Swap the disk file `target` on the host for `local`: a local qcow2 that is uploaded first, or (str) the
-    path of a qcow2 already prepared on the same datastore by stage_disk."""
+    path of a qcow2 already prepared on the same datastore by stage_disk. Everything is done as the owner of the
+    VM folder (libvirt-qemu), which also works on NFS exports with root_squash."""
     q = shlex.quote
-    info = json.loads(shell.run(f"qemu-img info --output=json {q(target)}"))
+    owner = shell.run(f"stat -c %U {q(posixpath.dirname(target))}", check=False).strip() or None
+    pre = shell.as_user(owner)
+    info = json.loads(shell.run(f"{pre}qemu-img info --output=json {q(target)}"))
     want = int(info["virtual-size"])
     if isinstance(local, str):  # already on the host
         part, label = local, posixpath.basename(local)
     else:
         part, label = posixpath.join(posixpath.dirname(target), "." + posixpath.basename(target) + ".vm2m-part"), local.name
-        shell.upload(local, part, progress, cancel)
-    got = int(json.loads(shell.run(f"qemu-img info --output=json {q(part)}"))["virtual-size"])
+        shell.upload(local, part, progress, cancel, owner)
+    got = int(json.loads(shell.run(f"{pre}qemu-img info --output=json {q(part)}"))["virtual-size"])
     if got > want:
         raise DirectError(f"El disco migrado ({got} bytes) es mayor que el volumen que creó Morpheus ({want} bytes)")
     if got < want:
-        shell.run(f"qemu-img resize -f qcow2 {q(part)} {want}")
-    shell.run(f"qemu-img check -q {q(part)}")
-    shell.run(f"chown --reference={q(target)} {q(part)} && chmod --reference={q(target)} {q(part)}")
-    shell.run(f"mv -f {q(part)} {q(target)}")
+        shell.run(f"{pre}qemu-img resize -f qcow2 {q(part)} {want}")
+    shell.run(f"{pre}qemu-img check -q {q(part)}")
+    shell.run(f"{pre}chmod --reference={q(target)} {q(part)}")
+    if not pre:  # acting as root on a local folder: give the file the owner libvirt expects
+        shell.run(f"chown --reference={q(target)} {q(part)}", check=False)
+    shell.run(f"{pre}mv -f {q(part)} {q(target)}")
     if isinstance(local, str):  # the staging folder is empty once its last disk has moved
-        shell.run(f"rmdir {q(posixpath.dirname(local))} 2>/dev/null", check=False)
+        shell.run(f"{pre}rmdir {q(posixpath.dirname(local))}", check=False)
     log(f"Disco {posixpath.basename(target)} sustituido por {label}")
 
 

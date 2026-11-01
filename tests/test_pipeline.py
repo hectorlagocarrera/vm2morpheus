@@ -2767,6 +2767,12 @@ class LocalShell:
 
     def __init__(self, host, user, password=None, key_file=None, xml=None, state="shut off", stuck=False):
         self.host, self.xml, self.state, self.cmds, self.stuck = host, xml, state, [], stuck
+        import getpass
+        self.user = getpass.getuser()
+
+    def as_user(self, owner):
+        from vm2morpheus.direct import as_user_prefix
+        return as_user_prefix(self.user, owner)
 
     def run(self, cmd, check=True, timeout=3600):
         cmd = cmd.replace("virsh -c qemu:///system ", "virsh ")
@@ -2792,14 +2798,14 @@ class LocalShell:
     def remote_size(self, path):
         return os.path.getsize(path) if os.path.exists(path) else None
 
-    def write_stream(self, reader, remote, size, progress=None, cancel=None):
+    def write_stream(self, reader, remote, size, progress=None, cancel=None, owner=None):
         with open(remote, "wb") as d:
             while buf := reader.read(1 << 20):
                 d.write(buf)
         if progress:
             progress(size, size)
 
-    def upload(self, local, remote, progress=None, cancel=None):
+    def upload(self, local, remote, progress=None, cancel=None, owner=None):
         start = self.remote_size(remote) or 0
         with open(local, "rb") as s, open(remote, "r+b" if start else "wb") as d:
             s.seek(start)
@@ -2960,42 +2966,48 @@ def test_pipeline_direct_mode_creates_the_vm_from_the_placeholder_and_pushes_the
     assert not list((tmp_path / "wd" / "vm1").glob("*.qcow2"))   # converted disk removed after the push
 
 
-def test_ssh_upload_resumes_after_what_was_already_written(tmp_path):
-    from vm2morpheus.direct import HostShell
-
-    class F:  # local file with the SFTPFile methods the upload uses
-        def __init__(self, path, mode):
-            self.f = open(path, mode)
-
-        def set_pipelined(self, on):
-            pass
-
-        def __getattr__(self, name):
-            return getattr(self.f, name)
-
-        def __enter__(self):
-            return self
-
-        def __exit__(self, *a):
-            self.f.close()
-
-    class Sftp:
-        def stat(self, p):
-            return os.stat(p)
-
-        def open(self, p, mode):
-            return F(p, mode)
-
+def _receiver_shell():
+    """A HostShell whose remote side is this machine: the receiver script runs locally with python3."""
+    from vm2morpheus.direct import RECEIVER, HostShell, DirectError
+    import struct as _st
     sh = HostShell.__new__(HostShell)
-    sh._sftp = Sftp()
+    sh.user, sh.host, sh.sent = "root", "local", []
+
+    def run(cmd, check=True, timeout=3600):
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+        return r.stdout
+
+    def send_frames(remote, frames, owner=None):
+        payload = b""
+        for off, data in frames:
+            sh.sent.append((off, len(data)))
+            payload += _st.pack(">QI", off, len(data)) + data
+            if not data:
+                break
+        r = subprocess.run(["python3", "-c", RECEIVER, remote], input=payload, capture_output=True)
+        if r.returncode or b"ok" not in r.stdout:
+            raise DirectError(r.stderr.decode())
+
+    sh.run, sh.send_frames = run, send_frames
+    return sh
+
+
+def test_ssh_upload_resumes_after_what_was_already_written(tmp_path):
+    sh = _receiver_shell()
     local, remote = tmp_path / "d.qcow2", tmp_path / "remote.part"
     data = os.urandom(9 * 1024 * 1024 + 123)
     local.write_bytes(data)
     remote.write_bytes(data[:5 * 1024 * 1024])          # an earlier attempt stopped here
     seen = []
     sh.upload(local, str(remote), lambda done, total: seen.append(done))
-    assert remote.read_bytes() == data and seen[0] > 5 * 1024 * 1024 and seen[-1] == len(data)
+    assert remote.read_bytes() == data and sh.sent[0][0] == 5 * 1024 * 1024 and seen[-1] == len(data)
 
+
+def test_receiver_writes_as_the_folder_owner_prefix():
+    from vm2morpheus.direct import as_user_prefix
+    assert as_user_prefix("root", "libvirt-qemu") == "runuser -u libvirt-qemu -- "
+    assert as_user_prefix("admin", "libvirt-qemu") == "sudo -n -u libvirt-qemu -- "
+    assert as_user_prefix("root", "root") == "" and as_user_prefix("root", None) == ""
 
 def test_ssh_check_reports_tools_and_datastore_mount():
     from vm2morpheus import gui
@@ -3038,40 +3050,13 @@ def test_data_disk_is_staged_on_the_host_converted_there_and_swapped_in(tmp_path
 
 def test_write_stream_skips_zero_runs_and_keeps_the_full_size(tmp_path):
     import io
-    from vm2morpheus.direct import CHUNK, HostShell
-
-    class F:
-        def __init__(self, path):
-            self.f, self.writes = open(path, "wb"), 0
-
-        def set_pipelined(self, on): pass
-
-        def seek(self, n): self.f.seek(n)
-
-        def write(self, b):
-            self.writes += 1
-            self.f.write(b)
-
-        def truncate(self, n): self.f.truncate(n)
-
-        def __enter__(self): return self
-
-        def __exit__(self, *a): self.f.close()
-
-    files = []
-
-    class Sftp:
-        def open(self, p, mode):
-            files.append(F(p))
-            return files[-1]
-
-    sh = HostShell.__new__(HostShell)
-    sh._sftp = Sftp()
+    from vm2morpheus.direct import CHUNK
+    sh = _receiver_shell()
     data = b"\x01" * CHUNK + bytes(3 * CHUNK) + b"\x02" * 10
     out = tmp_path / "r.raw"
     sh.write_stream(io.BytesIO(data), str(out), len(data))
-    assert out.read_bytes() == data and files[0].writes == 2   # the three zero chunks were never sent to disk
-
+    assert out.read_bytes() == data
+    assert [n for _, n in sh.sent] == [CHUNK, 10, 0]   # the three zero chunks were never sent
 
 class StreamSource(FakeSource):
     supports_stream = True
