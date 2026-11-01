@@ -2999,7 +2999,7 @@ def test_ssh_check_reports_tools_and_datastore_mount():
     lines = gui.ssh_check({"ssh_host": "vme02", "ssh_password": "x"}, connect=Sh)
     assert lines[0] == "✔ Conectado por SSH a vme02 como root"
     assert "✔ qemu-img: qemu-img version 8.2.2" in lines and "✔ virsh: 10.0.0" in lines
-    assert lines[-1].startswith("· Elige un almacén de datos")
+    assert lines[-1].startswith("· No has elegido almacén de datos")
 
 
 def test_data_disk_is_staged_on_the_host_converted_there_and_swapped_in(tmp_path):
