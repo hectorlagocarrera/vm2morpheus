@@ -186,7 +186,9 @@ $cv = $null; [gc]::Collect(); reg unload HKLM\\VM2M_SOFT | Out-Null
 
 def _dismount_script(image: str, iso: str) -> str:
     return (f"$ErrorActionPreference='SilentlyContinue'; Dismount-DiskImage -ImagePath {ps_quote(image)} | Out-Null; "
-            f"Dismount-DiskImage -ImagePath {ps_quote(iso)} | Out-Null")
+            f"Dismount-DiskImage -ImagePath {ps_quote(iso)} | Out-Null; "
+            f"if ((Get-DiskImage -ImagePath {ps_quote(image)}).Attached) {{ Start-Sleep 2; "
+            f"Dismount-DiskImage -ImagePath {ps_quote(image)} | Out-Null }}")
 
 
 # Boot-critical storage drivers. DISM /Add-Driver only stages them in the driver store; Windows decides at boot which
@@ -204,14 +206,26 @@ BOOT_DRIVERS = {
 
 
 def _boot_script(win: str, names: list[str]) -> str:
-    """PowerShell that makes the given storage drivers load at boot in the offline Windows at `win`."""
+    """PowerShell that makes the given storage drivers load at boot in the offline Windows at `win`, then unloads the
+    hive (retrying: a handle left open makes the unload fail and the changes may never reach the disk), loads it
+    again and reads the values back to prove they were persisted."""
     ids = "@{" + "; ".join(
         f"{ps_quote(n)}=@({', '.join(ps_quote(i) for i in BOOT_DRIVERS[n])})" for n in names) + "}"
     return f"""
 $ErrorActionPreference='Stop'
 $win = {ps_quote(win)}
 $map = {ids}
-reg load HKLM\\VM2M_SYS ($win + 'Windows\\System32\\config\\SYSTEM') | Out-Null
+$hive = $win + 'Windows\\System32\\config\\SYSTEM'
+function Unload-Hive {{
+  for ($i = 0; $i -lt 20; $i++) {{
+    [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+    cmd /c 'reg unload HKLM\\VM2M_SYS >nul 2>&1'
+    if ($LASTEXITCODE -eq 0) {{ return }}
+    Start-Sleep -Milliseconds 500
+  }}
+  throw 'no se pudo cerrar el registro del disco (SYSTEM): los cambios podrian perderse'
+}}
+reg load HKLM\\VM2M_SYS $hive | Out-Null
 try {{
   $roots = @('ControlSet001')
   $cur = (Get-ItemProperty 'HKLM:\\VM2M_SYS\\Select').Current
@@ -239,11 +253,20 @@ try {{
       }}
     }}
   }}
-  $out = foreach ($name in $map.Keys) {{ $name + ' Start=' + (Get-ItemProperty ('HKLM:\\VM2M_SYS\\ControlSet001\\Services\\' + $name)).Start }}
+}} finally {{
+  Unload-Hive
+}}
+reg load HKLM\\VM2M_SYS $hive | Out-Null
+try {{
+  $out = foreach ($name in $map.Keys) {{
+    $start = (Get-ItemProperty ('HKLM:\\VM2M_SYS\\ControlSet001\\Services\\' + $name)).Start
+    $n = @(Get-ChildItem 'HKLM:\\VM2M_SYS\\ControlSet001\\Control\\CriticalDeviceDatabase' | Where-Object {{ (Get-ItemProperty $_.PSPath).Service -eq $name }}).Count
+    if ($start -ne 0 -or $n -lt 1) {{ throw ($name + ': el registro no se guardo en el disco') }}
+    $name + ' Start=' + $start + ' (' + $n + ' ids PCI)'
+  }}
   $out -join ', '
 }} finally {{
-  [gc]::Collect(); [gc]::WaitForPendingFinalizers()
-  reg unload HKLM\\VM2M_SYS | Out-Null
+  Unload-Hive
 }}
 """
 
