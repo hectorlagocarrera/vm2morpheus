@@ -189,6 +189,65 @@ def _dismount_script(image: str, iso: str) -> str:
             f"Dismount-DiskImage -ImagePath {ps_quote(iso)} | Out-Null")
 
 
+# Boot-critical storage drivers. DISM /Add-Driver only stages them in the driver store; Windows decides at boot which
+# storage driver to load from the CriticalDeviceDatabase and from the service being "boot start". Without those
+# entries the guest stops with INACCESSIBLE_BOOT_DEVICE (0x7B) as soon as the disk is a virtio one, which is exactly
+# what virt-v2v writes by hand. PCI ids: 1af4:1001/1042 = virtio-blk (viostor), 1af4:1004/1048 = virtio-scsi (vioscsi).
+BOOT_DRIVERS = {
+    "viostor": ["pci#ven_1af4&dev_1001&subsys_00021af4&rev_00", "pci#ven_1af4&dev_1001&subsys_00021af4",
+                "pci#ven_1af4&dev_1001", "pci#ven_1af4&dev_1042&subsys_11001af4&rev_01",
+                "pci#ven_1af4&dev_1042&subsys_11001af4", "pci#ven_1af4&dev_1042"],
+    "vioscsi": ["pci#ven_1af4&dev_1004&subsys_00081af4&rev_00", "pci#ven_1af4&dev_1004&subsys_00081af4",
+                "pci#ven_1af4&dev_1004", "pci#ven_1af4&dev_1048&subsys_11001af4&rev_01",
+                "pci#ven_1af4&dev_1048&subsys_11001af4", "pci#ven_1af4&dev_1048"],
+}
+
+
+def _boot_script(win: str, names: list[str]) -> str:
+    """PowerShell that makes the given storage drivers load at boot in the offline Windows at `win`."""
+    ids = "@{" + "; ".join(
+        f"{ps_quote(n)}=@({', '.join(ps_quote(i) for i in BOOT_DRIVERS[n])})" for n in names) + "}"
+    return f"""
+$ErrorActionPreference='Stop'
+$win = {ps_quote(win)}
+$map = {ids}
+reg load HKLM\\VM2M_SYS ($win + 'Windows\\System32\\config\\SYSTEM') | Out-Null
+try {{
+  $roots = @('ControlSet001')
+  $cur = (Get-ItemProperty 'HKLM:\\VM2M_SYS\\Select').Current
+  if ($cur -and $cur -ne 1) {{ $roots += ('ControlSet{{0:d3}}' -f [int]$cur) }}
+  foreach ($name in $map.Keys) {{
+    $sys = $win + 'Windows\\System32\\drivers\\' + $name + '.sys'
+    if (-not (Test-Path $sys)) {{
+      $src = Get-ChildItem ($win + 'Windows\\System32\\DriverStore\\FileRepository') -Recurse -Filter ($name + '.sys') -ErrorAction SilentlyContinue | Select-Object -First 1
+      if (-not $src) {{ throw ('no se encuentra ' + $name + '.sys en el almacen de drivers del disco') }}
+      Copy-Item $src.FullName $sys
+    }}
+    foreach ($r in $roots) {{
+      $svc = 'HKLM:\\VM2M_SYS\\' + $r + '\\Services\\' + $name
+      New-Item -Path $svc -Force | Out-Null
+      Set-ItemProperty $svc -Name Type -Value 1 -Type DWord
+      Set-ItemProperty $svc -Name Start -Value 0 -Type DWord
+      Set-ItemProperty $svc -Name ErrorControl -Value 1 -Type DWord
+      Set-ItemProperty $svc -Name Group -Value 'SCSI miniport' -Type String
+      Set-ItemProperty $svc -Name ImagePath -Value ('system32\\drivers\\' + $name + '.sys') -Type ExpandString
+      foreach ($id in $map[$name]) {{
+        $k = 'HKLM:\\VM2M_SYS\\' + $r + '\\Control\\CriticalDeviceDatabase\\' + $id
+        New-Item -Path $k -Force | Out-Null
+        Set-ItemProperty $k -Name Service -Value $name -Type String
+        Set-ItemProperty $k -Name ClassGUID -Value '{{4D36E97B-E325-11CE-B511-BE2BFDC27B6E}}' -Type String
+      }}
+    }}
+  }}
+  $out = foreach ($name in $map.Keys) {{ $name + ' Start=' + (Get-ItemProperty ('HKLM:\\VM2M_SYS\\ControlSet001\\Services\\' + $name)).Start }}
+  $out -join ', '
+}} finally {{
+  [gc]::Collect(); [gc]::WaitForPendingFinalizers()
+  reg unload HKLM\\VM2M_SYS | Out-Null
+}}
+"""
+
+
 def ensure_virtio_iso(path: str | None, progress=None) -> str:
     """Use the given ISO, or download the stable virtio-win ISO once and cache it."""
     if path:
@@ -236,6 +295,9 @@ def inject_virtio_windows(disk: Path, iso: str, log=print, ps=run_powershell, di
                 added.append(name)
         if "viostor" not in added:
             raise RuntimeError(f"No se encuentra el driver viostor en el ISO para {folder}: ISO de virtio-win incorrecto o incompleto")
+        boot = [n for n in BOOT_DRIVERS if n in added]
+        log("Registrando los drivers de disco como arranque del sistema (para que Windows vea el disco VirtIO) ...")
+        log("Drivers de arranque: " + ps(_boot_script(info["win"], boot)))
         return added
     finally:
         ps(_dismount_script(image, iso))

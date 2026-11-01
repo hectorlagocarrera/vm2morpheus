@@ -403,7 +403,9 @@ def test_inject_runs_dism_per_driver_and_always_dismounts(tmp_path):
         return json.dumps({"win": "E:\\", "iso": iso_root, "build": 14393, "type": "Server"}) if len(calls) == 1 else ""
 
     added = inject_virtio_windows(tmp_path / "d.vhdx", "x.iso", log=lambda *_: None, ps=ps, dism=dism_calls.append)
-    assert added == ["viostor", "NetKVM"] and len(dism_calls) == 2 and len(calls) == 2  # mount + dismount
+    assert added == ["viostor", "NetKVM"] and len(dism_calls) == 2 and len(calls) == 3  # mount + boot registry + dismount
+    assert "CriticalDeviceDatabase" in calls[1] and "'viostor'" in calls[1] and "vioscsi" not in calls[1]
+    assert "pci#ven_1af4&dev_1001" in calls[1] and "-Value 0 -Type DWord" in calls[1]
     assert dism_calls[0][:2] == ["/Image:E:\\", "/Add-Driver"]
 
 
@@ -981,6 +983,8 @@ def _mount_ps(fail_mounts: int, iso_root=""):
         if "Dismount" in script:
             state["dismounts"] += 1
             return ""
+        if "CriticalDeviceDatabase" in script:  # the boot-driver registry step, not a mount
+            return "viostor Start=0"
         state["mounts"] += 1
         if state["mounts"] <= fail_mounts:
             raise RuntimeError("Falló PowerShell: HRESULT 0xc03a001a,Mount-DiskImage")
