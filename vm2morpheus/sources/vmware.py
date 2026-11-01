@@ -81,7 +81,10 @@ def download_to(url: str, local: Path, cookie: str | None, verify: bool, cb, tic
     has arrived; a stalled connection raises after READ_TIMEOUT instead of waiting forever."""
     done, tail = 0, b""
     kw = {"auth": auth} if auth is not None else {}
-    watchdog = StallWatchdog(f"la descarga de {local.name}", min_rate=128 * 1024).start()
+    hint = ("Es normal en la exportación de ESXi: cuando llega a la parte vacía del disco no hay nada que enviar y "
+            "ESXi la recorre sin mandar casi nada; la descarga sigue. Si se para del todo, el programa pasa solo a "
+            "descargar el disco plano.") if end_marker else ""
+    watchdog = StallWatchdog(f"la descarga de {local.name}", min_rate=128 * 1024, hint=hint).start()
     try:
         with getter(url, stream=True, verify=verify, headers={"Cookie": cookie} if cookie else {},
                     timeout=(15, READ_TIMEOUT), **kw) as r:

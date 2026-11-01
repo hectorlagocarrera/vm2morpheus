@@ -45,6 +45,20 @@ def resolve_secret(value):
     return value
 
 
+def describe_wait(frame) -> str:
+    """What the watched thread is doing, in words for the user (instead of a Python stack trace)."""
+    if frame is None:
+        return "no se pudo saber en qué está esperando el programa"
+    stack = traceback.extract_stack(frame)
+    names = {(Path(f.filename).name, f.name) for f in stack[-6:]}
+    if any(fn in ("socket.py", "ssl.py") or name in ("recv_into", "readinto", "recv") for fn, name in names):
+        return "el programa está esperando a que el origen envíe más datos por la red (la conexión sigue abierta)"
+    if any(name in ("write", "flush") for _, name in names):
+        return "el programa está escribiendo en la carpeta de trabajo (disco local lento u ocupado)"
+    last = stack[-1]
+    return f"el programa está en {last.name} ({Path(last.filename).name}:{last.lineno})"
+
+
 class StallWatchdog:
     """Reports where a worker thread is waiting when its progress counter stops moving.
 
@@ -52,8 +66,10 @@ class StallWatchdog:
     a SOAP call...) tells which of them it is. Reports are written to stderr, so they reach the GUI log."""
 
     def __init__(self, label: str, after: float = 45.0, repeat: float = 60.0, poll: float = 5.0, stream=None,
-                 clock=time.monotonic, frames=sys._current_frames, min_rate: float = 0.0, slow_window: float = 30.0):
+                 clock=time.monotonic, frames=sys._current_frames, min_rate: float = 0.0, slow_window: float = 30.0,
+                 hint: str = ""):
         self.label, self.after, self.repeat, self.poll = label, after, repeat, poll
+        self.hint = hint  # one sentence for the user explaining the usual cause of a pause in this transfer
         self.min_rate, self.slow_window = min_rate, slow_window  # min_rate in units/s; 0 disables the crawl warning
         self._samples: list[tuple[float, float]] = []
         self.stream, self.clock, self.frames = stream, clock, frames
@@ -94,13 +110,13 @@ class StallWatchdog:
             return False
         self.reported = now
         frame = self.frames().get(self.tid)
-        where = "".join(traceback.format_stack(frame)[-3:]).rstrip() if frame is not None else "(no se pudo leer)"
+        where = describe_wait(frame)
         if stalled:
             why = f"{self.label} lleva {now - self.changed:.0f} s sin recibir datos"
         else:
             why = (f"{self.label} va muy lenta: {human(crawl)}/s en los últimos {self.slow_window:.0f} s "
                    f"({human(self.value)} recibidos)")
-        print(f"Aviso: {why}. El programa está esperando en:\n{where}", file=self.stream or sys.stderr)
+        print(f"Aviso: {why}; {where}." + (f" {self.hint}" if self.hint else ""), file=self.stream or sys.stderr)
         return True
 
     def _run(self) -> None:

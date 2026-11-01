@@ -1483,8 +1483,8 @@ def test_stall_watchdog_reports_where_the_frozen_thread_is_waiting():
     t["now"] = 50.0
     assert wd.check() is True
     text = out.getvalue()
-    assert "la descarga de x.vmdk lleva 50 s sin recibir datos" in text and "esperando en" in text
-    assert "frozen_worker" in text or "release.wait" in text   # the stack names the blocked call site
+    assert "la descarga de x.vmdk lleva 50 s sin recibir datos" in text and "esperando a que el origen" not in text and "File \"" not in text
+    assert "el programa está en " in text                      # plain words, no Python stack trace
     t["now"] = 80.0
     assert wd.check() is False                                 # not repeated before `repeat` seconds
     t["now"] = 115.0
@@ -2669,3 +2669,28 @@ def test_page_shows_the_elevation_status_and_the_preflight_explains_it():
     page = gui.render_page()
     for needle in ('id="adminbadge"', "Sin permisos de administrador", 'fetch("/info")'):
         assert needle in page
+
+
+def test_watchdog_explains_a_network_wait_in_plain_words_with_the_hint():
+    import io
+    from vm2morpheus.util import StallWatchdog
+    release, ready = threading.Event(), threading.Event()
+
+    def readinto():  # same name as the socket read the real download blocks in
+        ready.set()
+        release.wait()
+
+    th = threading.Thread(target=readinto, daemon=True)
+    th.start()
+    ready.wait()
+    t = {"now": 0.0}
+    out = io.StringIO()
+    wd = StallWatchdog("la descarga de x.vmdk", after=45, stream=out, clock=lambda: t["now"], hint="Es normal en ESXi.")
+    wd.tid = th.ident
+    wd.beat(1)
+    t["now"] = 50.0
+    assert wd.check() is True
+    text = out.getvalue()
+    assert "esperando a que el origen envíe más datos" in text and text.rstrip().endswith("Es normal en ESXi.")
+    assert "File \"" not in text and "\n" not in text.rstrip()
+    release.set()
