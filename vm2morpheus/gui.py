@@ -804,7 +804,7 @@ function showDoneDialog(jobId,d){const imgs=d.images.map(i=>esc(i.name)+" (id "+
  document.getElementById("dialog").innerHTML=`<h2>✔ Migración terminada: prueba la VM</h2>
  <p>La VM <b>${esc(d.instance.name||d.vm)}</b> ya está creada en Morpheus. <b>Antes de limpiar nada, compruébala:</b></p>
  <ul><li>Arranca y puedes entrar con tu usuario (usa la consola de Morpheus).</li><li>Tiene red y sus servicios responden.</li><li>Los discos y los datos están completos.</li></ul>
- <p style="font-size:13px;color:#4a5665">Cuando funcione, puedes borrar de la biblioteca de Morpheus la imagen que se subió solo para crearla (${imgs}). <b>El borrado no se puede deshacer.</b> Si Morpheus la considera en uso, te enseñaré lo que conteste.</p>
+ <p style="font-size:13px;color:#4a5665">Cuando compruebes que la máquina funciona, puedes eliminar de la biblioteca de Morpheus la imagen que se subió únicamente para crearla (${imgs}). <b>El borrado no se puede deshacer.</b> Si Morpheus indica que la imagen está en uso, se mostrará aquí su respuesta.</p>
  ${d.hot?`<p style="background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:8px 12px;font-size:13px"><b>Copia en caliente:</b> la VM de origen sigue encendida y la copia no incluye lo que cambió después del checkpoint. <b>Apaga el origen antes de arrancar la VM de Morpheus</b> para no tener dos máquinas iguales en la red (nombre, IP, dominio).</p>`:""}
  <label class="inl"><input type="checkbox" id="dlgwork" checked> Borrar también la carpeta de trabajo de esta VM (solo guarda el progreso)</label>
  <div id="dlgres"></div>
