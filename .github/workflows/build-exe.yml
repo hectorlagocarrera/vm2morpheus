@@ -21,7 +21,7 @@ jobs:
       - run: >
           pyinstaller --name vm2morpheus --icon assets/vm2morpheus.ico --version-file build/version.txt
           --collect-all pyVmomi --collect-all smbprotocol --collect-all winrm
-          --hidden-import smbclient exe_entry.py
+          --collect-all paramiko --hidden-import smbclient exe_entry.py
       - name: Check the exe icon is the Redes globe (fails the build if it is the generic one)
         shell: pwsh
         run: |

@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 import shutil
 import subprocess
@@ -1117,9 +1118,9 @@ def test_progress_shows_the_transfer_speed(monkeypatch):
 def test_slow_actions_show_a_busy_indicator():
     from vm2morpheus import gui
     page = gui.render_page()
-    assert 'id="busywrap"' in page and page.count("data-busy onclick") == 5
+    assert 'id="busywrap"' in page and page.count("data-busy onclick") == 6
     for call in ('busy("Conectando con el origen', 'busy("Analizando la VM', 'busy("Cargando datos de Morpheus',
-                 'busy("Leyendo la instancia de referencia'):
+                 'busy("Leyendo la instancia de referencia', 'busy("Probando la conexión SSH'):
         assert call in page
 
 
@@ -2744,3 +2745,195 @@ def test_a_datastore_without_room_stops_the_migration_before_downloading(tmp_pat
                   {"image_type": "qcow2", "datastore_id": 1}, log=msgs.append, dry_run=True)
     assert any("No caben los discos en el almacén de datos local" in m for m in msgs)
     assert not any(c.startswith("fetch") for c in src.calls)
+
+
+# ---- direct upload over SSH to the HVM host -------------------------------------------------------------------
+
+DOMAIN_XML = """<domain type='kvm'><name>w2k16</name><devices>
+  <disk type='file' device='cdrom'><source file='/mnt/ds/w2k16/hvm_47-sda'/><target dev='sda' bus='sata'/></disk>
+  <disk type='file' device='disk'><source file='/mnt/ds/w2k16/hvm_47-disk-1-aa'/><target dev='vdb' bus='virtio'/></disk>
+  <disk type='file' device='disk'><source file='/mnt/ds/w2k16/hvm_47-disk-0-bed12f3'/><target dev='vda' bus='virtio'/>
+    <boot order='1'/></disk>
+</devices></domain>"""
+
+
+def test_domain_disks_puts_the_boot_disk_first_and_skips_cdroms():
+    from vm2morpheus.direct import domain_disks
+    assert domain_disks(DOMAIN_XML) == ["/mnt/ds/w2k16/hvm_47-disk-0-bed12f3", "/mnt/ds/w2k16/hvm_47-disk-1-aa"]
+
+
+class LocalShell:
+    """Stands in for the SSH session: commands run locally, the 'remote' paths are local files."""
+
+    def __init__(self, host, user, password=None, key_file=None, xml=None, state="shut off"):
+        self.host, self.xml, self.state, self.cmds = host, xml, state, []
+
+    def run(self, cmd, check=True, timeout=3600):
+        self.cmds.append(cmd)
+        if cmd.startswith("virsh dumpxml"):
+            return self.xml or ""
+        if cmd.startswith("virsh domstate"):
+            return self.state + "\n"
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
+        if check and r.returncode:
+            from vm2morpheus.direct import DirectError
+            raise DirectError(r.stderr)
+        return r.stdout
+
+    def remote_size(self, path):
+        return os.path.getsize(path) if os.path.exists(path) else None
+
+    def upload(self, local, remote, progress=None, cancel=None):
+        start = self.remote_size(remote) or 0
+        with open(local, "rb") as s, open(remote, "r+b" if start else "wb") as d:
+            s.seek(start)
+            d.seek(start)
+            d.write(s.read())
+        if progress:
+            progress(os.path.getsize(local), os.path.getsize(local))
+
+    def close(self):
+        pass
+
+
+def _qcow(path, size, data=None):
+    subprocess.run(["qemu-img", "create", "-f", "qcow2", str(path), size], check=True, capture_output=True)
+    if data:
+        subprocess.run(["qemu-io", "-c", f"write -P {data} 0 64k", str(path)], check=True, capture_output=True)
+
+
+def test_replace_disk_grows_to_the_volume_size_keeps_owner_and_swaps_in_place(tmp_path):
+    from vm2morpheus.direct import replace_disk
+    target, local = tmp_path / "hvm_1-disk-0", tmp_path / "migrated.qcow2"
+    _qcow(target, "2M")
+    os.chmod(target, 0o644)
+    _qcow(local, "1M", data="0x5a")
+    replace_disk(LocalShell("h", "root"), local, str(target), log=lambda *_: None)
+    info = json.loads(subprocess.run(["qemu-img", "info", "--output=json", str(target)], capture_output=True,
+                                     text=True).stdout)
+    assert info["virtual-size"] == 2 * 1024 * 1024 and oct(os.stat(target).st_mode & 0o777) == "0o644"
+    read = subprocess.run(["qemu-io", "-c", "read -P 0x5a 0 64k", str(target)], capture_output=True, text=True)
+    assert "Pattern verification failed" not in read.stdout and read.returncode == 0
+    assert not list(tmp_path.glob(".*vm2m-part"))
+
+
+def test_replace_disk_refuses_a_disk_bigger_than_the_volume(tmp_path):
+    from vm2morpheus.direct import DirectError, replace_disk
+    target, local = tmp_path / "t", tmp_path / "big.qcow2"
+    _qcow(target, "1M")
+    _qcow(local, "4M")
+    with pytest.raises(DirectError, match="mayor que el volumen"):
+        replace_disk(LocalShell("h", "root"), local, str(target), log=lambda *_: None)
+    assert json.loads(subprocess.run(["qemu-img", "info", "--output=json", str(target)], capture_output=True,
+                                     text=True).stdout)["virtual-size"] == 1024 * 1024  # original untouched
+
+
+class _InstMorpheus:
+    def __init__(self):
+        self.status, self.actions = "running", []
+
+    def get_instance(self, iid):
+        return {"id": iid, "status": self.status, "servers": []}
+
+    def instance_action(self, iid, action):
+        self.actions.append(action)
+        self.status = {"stop": "stopped", "start": "running"}[action]
+
+    def _req(self, *a, **k):
+        raise RuntimeError("no API in this fake")
+
+
+def test_push_disks_stops_replaces_every_disk_then_starts(tmp_path):
+    from vm2morpheus.direct import push_disks
+    d0, d1 = tmp_path / "hvm_47-disk-0-bed12f3", tmp_path / "hvm_47-disk-1-aa"
+    _qcow(d0, "2M")
+    _qcow(d1, "1M")
+    l0, l1 = tmp_path / "w-sda.qcow2", tmp_path / "w-sdb.qcow2"
+    _qcow(l0, "2M", data="0x11")
+    _qcow(l1, "1M", data="0x22")
+    xml = DOMAIN_XML.replace("/mnt/ds/w2k16", str(tmp_path))
+    m, msgs = _InstMorpheus(), []
+    host = push_disks(m, 42, "w2k16", [l0, l1], {"host": "vme02"}, msgs.append,
+                      connect=lambda *a: LocalShell(*a, xml=xml))
+    assert host == "vme02" and m.actions == ["stop", "start"]
+    for disk, pat in ((d0, "0x11"), (d1, "0x22")):
+        r = subprocess.run(["qemu-io", "-c", f"read -P {pat} 0 64k", str(disk)], capture_output=True, text=True)
+        assert "Pattern verification failed" not in r.stdout
+    assert any("Subida directa por SSH a vme02: 2 disco(s)" in x for x in msgs)
+
+
+def test_push_disks_never_touches_a_running_domain(tmp_path):
+    from vm2morpheus.direct import DirectError, push_disks
+    m = _InstMorpheus()
+    with pytest.raises(DirectError, match="sigue encendida"):
+        push_disks(m, 42, "w2k16", [tmp_path / "x"], {"host": "vme02"}, lambda *_: None,
+                   connect=lambda *a: LocalShell(*a, xml=DOMAIN_XML, state="running"))
+    assert "start" not in m.actions
+
+
+def test_pipeline_direct_mode_creates_the_vm_from_the_placeholder_and_pushes_the_disks(tmp_path, monkeypatch):
+    from vm2morpheus import pipeline
+    from vm2morpheus.gui import synthetic_reference
+    disk = tmp_path / "src.vmdk"
+    subprocess.run(["qemu-img", "create", "-f", "vmdk", str(disk), "8M"], check=True, capture_output=True)
+    pushed = {}
+    monkeypatch.setattr(pipeline, "push_disks", lambda m, iid, name, disks, ssh, log, pf, cancel: pushed.update(
+        iid=iid, name=name, disks=[d.exists() for d in disks], ssh=ssh))
+    FakeMorpheus.log.clear()
+    FakeMorpheus.uploads.clear()
+    srv = HTTPServer(("127.0.0.1", 0), FakeMorpheus)
+    threading.Thread(target=srv.serve_forever, daemon=True).start()
+    ref = synthetic_reference({"cloud_id": "1", "group_id": "1", "plan_id": "23", "network_id": "3",
+                               "datastore_id": "5"})
+    msgs = []
+    try:
+        res = migrate(FakeSource(disk), _client(srv), "vm1",
+                      {"workdir": str(tmp_path / "wd"), "shutdown_source": True, "ssh": {"host": "vme02"}},
+                      {"image_type": "qcow2", "reference_instance": {"synthetic": ref}}, log=msgs.append)
+    finally:
+        srv.shutdown()
+    images = [b for k, b in FakeMorpheus.log if k == "image"]
+    assert [i["virtualImage"]["name"] for i in images] == ["vm2morpheus-vacia-uefi"]   # FakeSource is UEFI; only the 1 MB placeholder
+    assert len(FakeMorpheus.uploads[7]) < 1024 * 1024
+    sent = dict(FakeMorpheus.log)["instance"]
+    assert sent["config"]["imageId"] == 7 and sent["volumes"][0]["datastoreId"] == 5
+    assert pushed == {"iid": 42, "name": "vm1", "disks": [True], "ssh": {"host": "vme02"}}
+    assert res["images"] == [] and res["instance"]["id"] == 42
+    assert not list((tmp_path / "wd" / "vm1").glob("*.qcow2"))   # converted disk removed after the push
+
+
+def test_ssh_upload_resumes_after_what_was_already_written(tmp_path):
+    from vm2morpheus.direct import HostShell
+
+    class F:  # local file with the SFTPFile methods the upload uses
+        def __init__(self, path, mode):
+            self.f = open(path, mode)
+
+        def set_pipelined(self, on):
+            pass
+
+        def __getattr__(self, name):
+            return getattr(self.f, name)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            self.f.close()
+
+    class Sftp:
+        def stat(self, p):
+            return os.stat(p)
+
+        def open(self, p, mode):
+            return F(p, mode)
+
+    sh = HostShell.__new__(HostShell)
+    sh._sftp = Sftp()
+    local, remote = tmp_path / "d.qcow2", tmp_path / "remote.part"
+    data = os.urandom(9 * 1024 * 1024 + 123)
+    local.write_bytes(data)
+    remote.write_bytes(data[:5 * 1024 * 1024])          # an earlier attempt stopped here
+    seen = []
+    sh.upload(local, str(remote), lambda done, total: seen.append(done))
+    assert remote.read_bytes() == data and seen[0] > 5 * 1024 * 1024 and seen[-1] == len(data)

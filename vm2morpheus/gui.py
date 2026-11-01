@@ -1,6 +1,7 @@
 """Local web GUI (stdlib only). Binds to 127.0.0.1; credentials are never written to disk."""
 import contextlib
 import json
+import shlex
 import os
 import shutil
 import time
@@ -77,6 +78,34 @@ def synthetic_reference(f: dict) -> dict:
     }
 
 
+def ssh_cfg(f: dict) -> dict:
+    _need(f, "ssh_host", "el host HVM para la subida por SSH")
+    return {"host": f["ssh_host"], "user": (f.get("ssh_user") or "").strip() or "root",
+            "password": f.get("ssh_password") or None, "key_file": (f.get("ssh_key") or "").strip() or None}
+
+
+def ssh_check(f: dict, connect=None) -> list[str]:
+    """'Probar SSH': connect, show the tools the direct upload needs and whether the chosen datastore is mounted."""
+    from .direct import HostShell
+    cfg = ssh_cfg(f)
+    sh = (connect or HostShell)(cfg["host"], cfg["user"], cfg["password"], cfg["key_file"])
+    lines = [f"✔ Conectado por SSH a {cfg['host']} como {cfg['user']}"]
+    try:
+        for cmd, label in (("qemu-img --version | head -1", "qemu-img"), ("virsh --version", "virsh")):
+            out = sh.run(cmd, check=False).strip()
+            lines.append(f"{'✔' if out else '✖'} {label}: {out or 'no encontrado'}")
+        if f.get("datastore_id") and f.get("morpheus_url"):
+            ds = MorpheusClient(f["morpheus_url"], f["morpheus_token"], verify=bool(f.get("verify_ssl"))).datastore(
+                int(f["datastore_id"]))
+            if ds and ds.get("path"):
+                ok = sh.run(f"test -d {shlex.quote(ds['path'])} && test -w {shlex.quote(ds['path'])} && echo ok",
+                            check=False).strip() == "ok"
+                lines.append(f"{'✔' if ok else '✖'} Almacén {ds['name']} montado y escribible en {ds['path']}")
+    finally:
+        sh.close()
+    return lines
+
+
 def datastore_label(d: dict) -> str:
     gib = lambda b: f"{b / 1024 ** 3:.0f} GiB" if b else "?"  # noqa: E731
     kind = d["type"].replace(" Datastore", "").replace("Directory (Local)", "local")
@@ -121,7 +150,8 @@ def make_cfgs(f: dict):
             "recreate_instance": bool(f.get("recreate_instance")),
             "disk_indexes": [int(i) for i in f["disk_indexes"]] if f.get("disk_indexes") is not None else None,
             "new_name": (f.get("new_vm_name") or "").strip() or None,
-            "compress_image": bool(f.get("compress_image")), "hot_copy": bool(f.get("hot_copy"))}
+            "compress_image": bool(f.get("compress_image")), "hot_copy": bool(f.get("hot_copy")),
+            "ssh": ssh_cfg(f) if f.get("ssh_direct") else None}
     return src, m, opts
 
 
@@ -146,7 +176,7 @@ def done_info(job: dict) -> dict | None:
     if not c or job.get("status") != "done":
         return None
     result = c["result"] or {}
-    if result.get("dry_run") or not result.get("instance") or not result.get("images"):
+    if result.get("dry_run") or not result.get("instance"):
         return None
     return {"instance": result["instance"], "images": result["images"], "vm": c["vm"], "hot": bool(result.get("hot")),
             "morpheus_url": c["morpheus"]["url"].rstrip("/"), "history_id": job.get("history_id")}
@@ -168,12 +198,12 @@ def cleanup(f: dict) -> dict:
             outcome.append({"id": img["id"], "name": img["name"], "ok": True})
         except Exception as e:  # Morpheus may refuse (image in use): pass its message on
             outcome.append({"id": img["id"], "name": img["name"], "ok": False, "error": str(e)})
-    deleted = bool(outcome) and all(o["ok"] for o in outcome)
+    deleted = all(o["ok"] for o in outcome)  # nothing to delete (direct SSH upload) counts as done
     removed = False
     if f.get("delete_workdir") and deleted:
         removed = safe_remove_workdir(job["cleanup"]["workdir"], job["cleanup"]["vm"])
     if info.get("history_id"):
-        history.update(info["history_id"], image_deleted=deleted, workdir_removed=removed)
+        history.update(info["history_id"], image_deleted=deleted and bool(outcome), workdir_removed=removed)
     return {"images": outcome, "image_deleted": deleted, "workdir_removed": removed}
 
 
@@ -337,6 +367,8 @@ class Handler(BaseHTTPRequestHandler):
                     "networks": [(n["id"], n["name"]) for n in c._req("GET", "/api/networks", params={"max": 200}).get("networks", [])],
                     "datastores": [(d["id"], datastore_label(d)) for d in c.datastores(int(zone) if zone else None)],
                 })
+            if self.path == "/sshtest":
+                return self._json({"lines": ssh_check(f)})
             if self.path == "/refinfo":
                 c = MorpheusClient(f["morpheus_url"], f["morpheus_token"], verify=bool(f.get("verify_ssl")))
                 if not f.get("ref_instance_id"):
@@ -614,7 +646,13 @@ small{color:#5d6b7b}
 <details open><summary><small>Sin instancia de referencia: crear desde cero (rellena nube, grupo, plan, red y layout)</small></summary>
 <div class="row"><div><label>Nube</label><select id="cloud_id"></select></div><div><label>Grupo</label><select id="group_id"></select></div>
 <div><label>Plan <small id="planhint"></small></label><select id="plan_id" onchange="planTouched=true"></select></div><div><label>Red <small>(obligatoria)</small></label><select id="network_id"></select></div><div><label>Almacén de datos</label><select id="datastore_id"><option value="">(automático: lo elige Morpheus)</option></select></div>
-<div><label>Instance type (código)</label><input id="instance_type" value="mvm"></div><div><label>Layout <small>(automático: Single HVM)</small></label><select id="layout_id"><option value="">(automático)</option></select></div><div><label>Resource pool <small>(automático)</small></label><select id="resource_pool"><option value="">(automático)</option></select></div></div></details></fieldset>
+<div><label>Instance type (código)</label><input id="instance_type" value="mvm"></div><div><label>Layout <small>(automático: Single HVM)</small></label><select id="layout_id"><option value="">(automático)</option></select></div><div><label>Resource pool <small>(automático)</small></label><select id="resource_pool"><option value="">(automático)</option></select></div></div></details>
+<details id="sshbox"><summary><small>Subida directa por SSH al host HVM (los discos viajan una sola vez, sin pasar por la biblioteca)</small></summary>
+<div class="chk"><label><input type="checkbox" id="ssh_direct"> Copiar los discos por SSH directamente a la VM (crea la VM con una imagen vacía de 1 MB y sustituye sus discos)</label></div>
+<div class="row"><div><label>Host HVM <small>(cualquiera del clúster)</small></label><input id="ssh_host" placeholder="vme01.laboratorio3.local"></div><div><label>Usuario SSH</label><input id="ssh_user" placeholder="root"></div>
+<div><label>Contraseña SSH</label><input id="ssh_password" type="password" autocomplete="off"></div><div><label>Clave privada <small>(opcional)</small></label><input id="ssh_key" placeholder="C:\Users\yo\.ssh\id_rsa"></div></div>
+<button class="sec" data-busy onclick="sshtest()">Probar SSH</button>
+<small>No es un método oficial de HPE: Morpheus no se entera de que el disco cambió (funciona porque la VM usa el fichero). Solo almacenes de ficheros (NFS, GFS2, directorio local). Si falla antes de tocar los discos, reintenta o desmarca la opción para usar la biblioteca.</small></details></fieldset>
 <fieldset><legend>4. Opciones</legend><div class="chk">
 <label><input type="checkbox" id="shutdown"> Apagar la VM de origen</label>
 <label><input type="checkbox" id="multi_disk_bundle" checked> Varios discos en una sola imagen (zip + metadata.json)</label>
@@ -649,8 +687,8 @@ small{color:#5d6b7b}
 <div id="modal" style="display:none"><div class="dialog" id="dialog"></div></div>
 </main>
 <script>
-const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","datastore_id","instance_type","layout_id","resource_pool","virtio_iso","vmware_method","new_vm_name","ref_instance_id","ref_image_id","workdir"];
-const chks=["verify_ssl","verify_source","compress_image","hot_copy","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
+const ids=["source_type","source_host","source_user","source_password","vm","os_family","morpheus_url","morpheus_token","image_type","cloud_id","group_id","plan_id","network_id","datastore_id","ssh_host","ssh_user","ssh_password","ssh_key","instance_type","layout_id","resource_pool","virtio_iso","vmware_method","new_vm_name","ref_instance_id","ref_image_id","workdir"];
+const chks=["ssh_direct","verify_ssl","verify_source","compress_image","hot_copy","remember_secrets","shutdown","direct_read","multi_disk_bundle","recreate_instance","inject_drivers","boot_sata"];
 const EMBEDDED=__EMBEDDED__;
 let analyzedVm=null;
 const form=()=>{const o={};ids.forEach(i=>o[i]=document.getElementById(i).value);chks.forEach(i=>o[i]=document.getElementById(i).checked);if(analyzedVm&&analyzedVm===document.getElementById("vm").value.trim()&&document.querySelector(".diskchk"))o.disk_indexes=[...document.querySelectorAll(".diskchk")].filter(c=>c.checked).map(c=>Number(c.value));else o.disk_indexes=null;return o};
@@ -755,6 +793,7 @@ fetch("/info").then(r=>r.json()).then(i=>{const b=document.getElementById("admin
  b.title=i.admin?"Este programa tiene permisos de administrador (necesarios para inyectar drivers).":"Para inyectar drivers hay que abrir el programa con clic derecho > Ejecutar como administrador. Si ya lo hiciste, cierra todas las ventanas y procesos vm2morpheus antiguos."}).catch(()=>{});
 setInterval(()=>fetch("/ping").catch(()=>{}),5000);fetch("/ping").catch(()=>{});
 async function refinfo(){try{show(JSON.stringify(await busy("Leyendo la instancia de referencia …",()=>post("/refinfo",form())),null,2))}catch(e){show("ERROR: "+e.message)}}
+async function sshtest(){try{await persist();const j=await busy("Probando la conexión SSH …",()=>post("/sshtest",form()));show(j.lines.join("\n"))}catch(e){show("ERROR: "+e.message)}}
 async function lookups(){try{await persist();const j=await busy("Cargando datos de Morpheus …",()=>post("/lookups",form()));
  for(const [k,id] of [["clouds","cloud_id"],["groups","group_id"],["plans","plan_id"],["networks","network_id"],["instances","ref_instance_id"]]){
   const s=document.getElementById(id);s.innerHTML=(id=="ref_instance_id"?'<option value="">(ninguna)</option>':id=="network_id"?'<option value="">(elige una red)</option>':'')+j[k].map(([v,n,c,m])=>`<option value="${v}"${c?` data-cores="${c}" data-mem="${m}"`:""}>${n}</option>`).join("");if(saved[id])s.value=saved[id];else if(id=="network_id"&&j[k].length===1)s.value=j[k][0][0]}
@@ -819,13 +858,13 @@ function showDoneDialog(jobId,d){const imgs=d.images.map(i=>esc(i.name)+" (id "+
  document.getElementById("dialog").innerHTML=`<button class="xclose" title="Cerrar" aria-label="Cerrar" onclick="closeDialog()">×</button><h2>✔ Migración terminada: prueba la VM</h2>
  <p>La VM <b>${esc(d.instance.name||d.vm)}</b> ya está creada en Morpheus. <b>Antes de limpiar nada, compruébala:</b></p>
  <ul><li>Arranca y puedes entrar con tu usuario (usa la consola de Morpheus).</li><li>Tiene red y sus servicios responden.</li><li>Los discos y los datos están completos.</li></ul>
- <p style="font-size:13px;color:#4a5665">Cuando compruebes que la máquina funciona, puedes eliminar de la biblioteca de Morpheus la imagen que se subió únicamente para crearla (${imgs}). <b>El borrado no se puede deshacer.</b> Si Morpheus indica que la imagen está en uso, se mostrará aquí su respuesta.</p>
+ ${d.images.length?`<p style="font-size:13px;color:#4a5665">Cuando compruebes que la máquina funciona, puedes eliminar de la biblioteca de Morpheus la imagen que se subió únicamente para crearla (${imgs}). <b>El borrado no se puede deshacer.</b> Si Morpheus indica que la imagen está en uso, se mostrará aquí su respuesta.</p>`:`<p style="font-size:13px;color:#4a5665">Los discos se copiaron directamente al host por SSH: no queda ninguna imagen en la biblioteca que borrar. Cuando compruebes que la máquina funciona, puedes borrar la carpeta de trabajo.</p>`}
  ${d.hot?`<p style="background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:8px 12px;font-size:13px"><b>Copia en caliente:</b> la VM de origen sigue encendida y la copia no incluye lo que cambió después del checkpoint. <b>Apaga el origen antes de arrancar la VM de Morpheus</b> para no tener dos máquinas iguales en la red (nombre, IP, dominio).</p>`:""}
  <label class="inl"><input type="checkbox" id="dlgwork" checked> Borrar también la carpeta de trabajo de esta VM (solo guarda el progreso)</label>
  <div id="dlgres"></div>
  <div class="actions"><a class="btnlink" href="${link}" target="_blank" rel="noopener">Abrir la instancia en Morpheus</a>
- <button class="danger" id="dlgdel" onclick="confirmDelete('${esc(jobId)}')">La VM funciona: borrar la imagen</button>
- <button class="sec" id="dlgkeep" onclick="closeDialog()">Todavía no, mantener la imagen</button></div>`;
+ <button class="danger" id="dlgdel" onclick="confirmDelete('${esc(jobId)}')">${d.images.length?"La VM funciona: borrar la imagen":"La VM funciona: borrar la carpeta de trabajo"}</button>
+ <button class="sec" id="dlgkeep" onclick="closeDialog()">${d.images.length?"Todavía no, mantener la imagen":"Todavía no"}</button></div>`;
  delArmed=false;document.getElementById("modal").style.display="flex"}
 async function confirmDelete(jobId){const b=document.getElementById("dlgdel");
  if(!delArmed){delArmed=true;b.textContent="Pulsa otra vez para confirmar el borrado";return}

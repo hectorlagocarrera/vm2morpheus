@@ -2,14 +2,16 @@ import itertools
 import json
 import os
 import shutil
+import subprocess
 from pathlib import Path
 
 from .bundle import build_bundle, disk_file_name
-from .convert import convert_disk, inject_drivers
+from .convert import convert_disk, find_tool, inject_drivers
+from .direct import PLACEHOLDER_NAME, push_disks
 from .drivers_windows import ensure_virtio_iso, inject_virtio_windows, is_admin
 from .morpheus import MorpheusClient, MorpheusError, payload_from_reference, render_template
 from .sources.base import Source
-from .util import CancelledError, Progress, human, redact
+from .util import CancelledError, Progress, human, no_window, redact
 
 def plan_shortfall(plan: dict | None, cpu: int, memory_mb: int) -> str | None:
     """Warning text if the service plan gives fewer cores or less memory than the source VM has, else None."""
@@ -199,7 +201,11 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
         log(f"Para migrarla otra vez desde cero, borra {st.path}; para recrear solo la VM, marca "
             "'Recrear solo la instancia'.")
 
-    bundle = bool(opts.get("multi_disk_bundle", True)) and len(vm.disks) > 1
+    ssh = opts.get("ssh") or None  # direct upload to the HVM host: the disks replace those of a VM made from a blank image
+    direct = bool(ssh) and bool(mcfg.get("reference_instance"))
+    if ssh and not direct:
+        log("Aviso: la subida directa por SSH necesita crear la VM (bloque 3); se sube la imagen a la biblioteca")
+    bundle = bool(opts.get("multi_disk_bundle", True)) and len(vm.disks) > 1 and not direct
     target = (opts.get("new_name") or "").strip() or vm.name  # name shown in Morpheus (image and VM)
     if target != vm.name:
         log(f"Nombre en Morpheus: {target!r} (en el origen es {vm.name!r})")
@@ -297,6 +303,11 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     tracker.finish("drivers")
 
     check()
+    if direct and not st.done("upload"):
+        tracker.begin("upload")
+        ph = ensure_placeholder(morpheus, workdir, vm.firmware == "uefi", log)
+        st.mark("upload", images=[], placeholder=ph, bundle=False)
+        tracker.finish("upload")
     if not st.done("upload"):
         tracker.begin("upload")
 
@@ -380,7 +391,7 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                 try:
                     return payload_from_reference(
                         ref, target, int(refcfg["image_id"]) if refcfg.get("image_id") else None,
-                        st.d["images"][0]["id"], root_gb, extra_gb, uefi=vm.firmware == "uefi",
+                        (st.d.get("placeholder") or st.d["images"][0])["id"], root_gb, extra_gb, uefi=vm.firmware == "uefi",
                         extra_name="data" if in_bundle else None, boot_sata=boot_sata)
                 except MorpheusError:
                     dump = workdir / "reference-instance.json"
@@ -388,7 +399,9 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
                     log(f"Instancia de referencia guardada (credenciales ocultas) en {dump}")
                     raise
 
-            if extra_gb and not in_bundle:
+            if extra_gb and direct:
+                log(f"Se crean {len(extra_gb)} volumen(es) de datos; sus discos se copiarán por SSH")
+            elif extra_gb and not in_bundle:
                 log(f"Nota: {len(extra_gb)} disco(s) extra se añaden como volúmenes EN BLANCO; sus datos se subieron "
                     "como imágenes aparte, pero no están conectados")
             elif extra_gb:
@@ -421,11 +434,57 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
             log("No hay plantilla de instancia configurada: se termina tras subir la imagen")
             st.mark("instance")
         tracker.finish("instance")
+    if direct and st.d.get("instance") and not st.d.get("pushed"):
+        check()
+        tracker.begin("instance")
+        converted = [Path(p) for p in st.d["converted"]]
+        sizes = [f.stat().st_size for f in converted]
+        bars = {}
+
+        def progress_for(i):
+            bar = bars[i] = Progress(f"subir por SSH {converted[i].name}", cancel=cancel)
+            before, total = sum(sizes[:i]), sum(sizes) or 1
+
+            def cb(done, size):
+                bar(done, size)
+                tracker.update("instance", (before + done) / total, f"subiendo {converted[i].name} por SSH")
+            return cb
+
+        push_disks(morpheus, st.d["instance"]["id"], st.d["instance"].get("name") or target, converted, ssh, log,
+                   progress_for, cancel)
+        for b in bars.values():
+            b.finish()
+        st.set(pushed=True)
+        if not opts.get("keep_files"):
+            for f in converted:
+                f.unlink(missing_ok=True)
+        tracker.finish("instance")
     result["instance"] = st.d.get("instance")
     tracker.complete()
     timings.record(tracker.durations, gib, source.timing_kind)  # only steps run now: resumed ones have no duration
     log("Terminado.")
     return result
+
+
+def ensure_placeholder(morpheus, workdir: Path, uefi: bool, log=print) -> dict:
+    """The tiny blank image the direct mode creates VMs from; uploaded once and reused afterwards."""
+    name = PLACEHOLDER_NAME + ("-uefi" if uefi else "")
+    try:
+        old = morpheus.find_one("virtual-images", "virtualImages", name)
+    except MorpheusError:
+        old = None
+    if old and (old.get("status") or "Active").lower() in ("active", "available"):
+        log(f"Se usa la imagen plantilla vacía {name!r} (id {old['id']}) para crear la VM")
+        return {"id": old["id"], "name": name}
+    blank = workdir / f"{name}.qcow2"
+    subprocess.run([find_tool("qemu-img") or "qemu-img", "create", "-f", "qcow2", str(blank), "1M"],
+                   check=True, capture_output=True, **no_window())
+    log(f"Subiendo la imagen plantilla vacía {name!r} (1 MB, solo la primera vez) ...")
+    img = morpheus.create_virtual_image(name, "qcow2", uefi=uefi)
+    morpheus.upload_image(img["id"], blank)
+    morpheus.wait_image_ready(img["id"])
+    blank.unlink(missing_ok=True)
+    return {"id": img["id"], "name": name}
 
 
 def _inside(path: Path, folder: Path) -> bool:

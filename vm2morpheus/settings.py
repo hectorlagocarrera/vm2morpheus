@@ -3,7 +3,7 @@ import json
 import os
 from pathlib import Path
 
-SECRET_KEYS = ("source_password", "morpheus_token")
+SECRET_KEYS = ("source_password", "morpheus_token", "ssh_password")
 PATH = Path.home() / ".vm2morpheus" / "settings.json"
 
 

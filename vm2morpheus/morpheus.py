@@ -186,6 +186,10 @@ class MorpheusClient:
     def get_instance(self, instance_id: int) -> dict:
         return self._req("GET", f"/api/instances/{instance_id}")["instance"]
 
+    def instance_action(self, instance_id: int, action: str) -> None:
+        """start / stop / restart an instance."""
+        self._req("PUT", f"/api/instances/{instance_id}/{action}", json={})
+
     def create_instance(self, payload: dict) -> dict:
         return self._req("POST", "/api/instances", json=payload)["instance"]
 
