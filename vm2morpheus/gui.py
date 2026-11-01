@@ -535,8 +535,10 @@ table#histtable{width:100%;border-collapse:collapse;background:#fff;border:1px s
 .legend em::before{content:"";display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;background:var(--c)}
 #histdetail canvas{width:100%;height:170px;border:1px solid #e5e9ee;border-radius:8px;display:block}
 .errbox{background:#2a1215;color:#fca5a5;border-radius:8px;padding:8px 12px;font:12px Consolas,monospace;white-space:pre-wrap;margin:8px 0}
+.xclose{position:absolute;top:10px;right:12px;width:32px;height:32px;border:0;border-radius:8px;background:transparent;color:#4a5665;font-size:22px;line-height:1;cursor:pointer;padding:0}
+.xclose:hover{background:#eef1f5;color:#111}
 #modal{position:fixed;inset:0;background:rgba(15,23,42,.55);z-index:20;display:none;align-items:center;justify-content:center;padding:16px}
-.dialog{background:#fff;border-radius:14px;max-width:560px;width:100%;padding:22px 24px;box-shadow:0 20px 50px rgba(0,0,0,.35);max-height:90vh;overflow:auto}
+.dialog{position:relative;background:#fff;border-radius:14px;max-width:560px;width:100%;padding:22px 24px;box-shadow:0 20px 50px rgba(0,0,0,.35);max-height:90vh;overflow:auto}
 .dialog h2{margin:0 0 8px;font-size:19px} .dialog ul{margin:8px 0 12px 18px;padding:0;line-height:1.55;font-size:14px}
 .dialog .res{font-size:13px;margin:8px 0} .dialog .res.err{color:#b91c1c} .dialog .res.ok{color:#166534}
 .dialog .actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px} .dialog .actions button,.dialog .actions a{margin:0}
@@ -801,7 +803,7 @@ async function clearHistory(){if(!confirm("¿Borrar TODO el histórico? No se pu
 // ---- after a migration that created a VM: test it, then (only if the user says so) delete the library image
 const doneShown=new Set();let delArmed=false;
 function showDoneDialog(jobId,d){const imgs=d.images.map(i=>esc(i.name)+" (id "+i.id+")").join(", "),link=esc(d.morpheus_url+"/provisioning/instances/"+d.instance.id);
- document.getElementById("dialog").innerHTML=`<h2>✔ Migración terminada: prueba la VM</h2>
+ document.getElementById("dialog").innerHTML=`<button class="xclose" title="Cerrar" aria-label="Cerrar" onclick="closeDialog()">×</button><h2>✔ Migración terminada: prueba la VM</h2>
  <p>La VM <b>${esc(d.instance.name||d.vm)}</b> ya está creada en Morpheus. <b>Antes de limpiar nada, compruébala:</b></p>
  <ul><li>Arranca y puedes entrar con tu usuario (usa la consola de Morpheus).</li><li>Tiene red y sus servicios responden.</li><li>Los discos y los datos están completos.</li></ul>
  <p style="font-size:13px;color:#4a5665">Cuando compruebes que la máquina funciona, puedes eliminar de la biblioteca de Morpheus la imagen que se subió únicamente para crearla (${imgs}). <b>El borrado no se puede deshacer.</b> Si Morpheus indica que la imagen está en uso, se mostrará aquí su respuesta.</p>
@@ -810,16 +812,17 @@ function showDoneDialog(jobId,d){const imgs=d.images.map(i=>esc(i.name)+" (id "+
  <div id="dlgres"></div>
  <div class="actions"><a class="btnlink" href="${link}" target="_blank" rel="noopener">Abrir la instancia en Morpheus</a>
  <button class="danger" id="dlgdel" onclick="confirmDelete('${esc(jobId)}')">La VM funciona: borrar la imagen</button>
- <button class="sec" onclick="closeDialog()">Todavía no, mantener la imagen</button></div>`;
+ <button class="sec" id="dlgkeep" onclick="closeDialog()">Todavía no, mantener la imagen</button></div>`;
  delArmed=false;document.getElementById("modal").style.display="flex"}
 async function confirmDelete(jobId){const b=document.getElementById("dlgdel");
  if(!delArmed){delArmed=true;b.textContent="Pulsa otra vez para confirmar el borrado";return}
  b.disabled=true;
  try{const r=await post("/cleanup",{job:jobId,delete_workdir:document.getElementById("dlgwork").checked});
   document.getElementById("dlgres").innerHTML=r.images.map(i=>i.ok?`<div class="res ok">✔ Imagen ${esc(i.name)} (id ${i.id}) borrada de la biblioteca.</div>`:`<div class="res err">✖ No se pudo borrar ${esc(i.name)} (id ${i.id}): ${esc(i.error)}</div>`).join("")+(r.workdir_removed?`<div class="res ok">✔ Carpeta de trabajo borrada.</div>`:"");
-  delArmed=false;if(r.image_deleted)b.style.display="none";else{b.disabled=false;b.textContent="Reintentar el borrado"}}
+  delArmed=false;if(r.image_deleted){b.style.display="none";document.getElementById("dlgkeep").textContent="Cerrar"}else{b.disabled=false;b.textContent="Reintentar el borrado"}}
  catch(e){document.getElementById("dlgres").innerHTML=`<div class="res err">${esc(e.message)}</div>`;b.disabled=false;delArmed=false}}
 function closeDialog(){document.getElementById("modal").style.display="none";delArmed=false}
+document.addEventListener("keydown",e=>{if(e.key==="Escape"&&document.getElementById("modal").style.display==="flex")closeDialog()});
 let currentJob=null;
 function drawBar(r){const w=document.getElementById("barwrap"),b=document.getElementById("bar"),l=document.getElementById("barlabel");
  const p=r.progress;if(!p&&r.status==="running"){return}w.style.display="block";
