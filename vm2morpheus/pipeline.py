@@ -197,7 +197,10 @@ def migrate(source: Source, morpheus: MorpheusClient, vm_name: str, opts: dict, 
     steps = relevant_steps(opts, mcfg, bool(st.d.get("injected")))
     done = [x for x in steps if st.done(x)]
     pending = [x for x in steps if not st.done(x)]
-    if done and pending:
+    if st.d.get("placeholder") and st.d.get("instance") and not st.d.get("pushed"):
+        log("Se continúa una migración anterior: la VM ya está creada en Morpheus; falta copiar sus discos por SSH.")
+        log(f"(Progreso guardado en {st.path})")
+    elif done and pending:
         log(f"Se continúa una migración anterior. Ya hecho: {labels(done)}. Falta: {labels(pending)}.")
         log(f"(Progreso guardado en {st.path})")
     elif done:

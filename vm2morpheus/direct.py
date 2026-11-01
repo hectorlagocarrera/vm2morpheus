@@ -227,43 +227,77 @@ def replace_disk(shell, local, target: str, log=print, progress=None, cancel=Non
     log(f"Disco {posixpath.basename(target)} sustituido por {label}")
 
 
+def find_domain(morpheus, instance_id: int, vm_name: str, ssh: dict, log=print, connect=None, timeout: float = 1800,
+                poll: float = 10, sleep=time.sleep, clock=time.monotonic):
+    """(shell, host, xml) of the host where the new VM's libvirt domain is defined, waiting until Morpheus has
+    defined it with all its disks. Other connections are closed."""
+    connect = connect or HostShell
+    shells, errors = {}, {}
+    deadline = clock() + timeout
+    try:
+        while True:
+            for host in candidate_hosts(morpheus, instance_id, ssh.get("host", "")):
+                if host not in shells:
+                    try:
+                        shells[host] = connect(host, ssh.get("user") or "root", ssh.get("password"), ssh.get("key_file"))
+                    except DirectError as e:
+                        errors[host] = str(e)
+                        continue
+                xml = shells[host].run(f"virsh dumpxml {shlex.quote(vm_name)}", check=False)
+                if "<domain" in xml:
+                    found = shells.pop(host)
+                    return found, host, xml
+                errors[host] = f"{host}: la VM {vm_name!r} todavía no está definida"
+            if not shells:
+                raise DirectError("No se pudo conectar por SSH a ningún host: " + " · ".join(errors.values()))
+            if clock() > deadline:
+                raise DirectError(f"La VM no apareció en ningún host en {timeout / 60:.0f} min: "
+                                  + " · ".join(errors.values()))
+            sleep(poll)
+    finally:
+        for sh in shells.values():
+            sh.close()
+
+
+def domstate(shell, vm_name: str) -> str:
+    return shell.run(f"virsh domstate {shlex.quote(vm_name)}", check=False).strip().lower()
+
+
 def push_disks(morpheus, instance_id: int, vm_name: str, disks: list, ssh: dict, log=print,
-               progress_for=None, cancel=None, connect=HostShell) -> str:
-    """Stop the new VM, replace its disk files with `disks` (boot disk first) and start it again.
-    Returns the host used."""
-    log("Esperando a que Morpheus termine de crear la VM ...")
-    status = wait_instance(morpheus, instance_id, {"running", "stopped", "suspended", "warning", "unknown"})
-    if status != "stopped":
-        log("Apagando la VM recién creada (todavía tiene el disco vacío de la plantilla) ...")
-        morpheus.instance_action(instance_id, "stop")
-        wait_instance(morpheus, instance_id, {"stopped"}, timeout=600)
-    errors = []
-    for host in candidate_hosts(morpheus, instance_id, ssh.get("host", "")):
-        try:
-            shell = connect(host, ssh.get("user") or "root", ssh.get("password"), ssh.get("key_file"))
-        except DirectError as e:
-            errors.append(str(e))
-            continue
-        try:
-            xml = shell.run(f"virsh dumpxml {shlex.quote(vm_name)}", check=False)
-            if "<domain" not in xml:
-                errors.append(f"{host}: la VM {vm_name!r} no está definida en este host")
-                continue
-            state = shell.run(f"virsh domstate {shlex.quote(vm_name)}", check=False).strip().lower()
-            if state and state not in ("shut off", "apagado"):
-                raise DirectError(f"La VM {vm_name!r} sigue encendida en {host} ({state}): no se tocan sus discos")
-            targets = domain_disks(xml)
-            if len(targets) < len(disks):
-                raise DirectError(f"La VM tiene {len(targets)} disco(s) en {host} y hay {len(disks)} para subir")
-            log(f"Subida directa por SSH a {host}: {len(disks)} disco(s)")
-            for i, (local, target) in enumerate(zip(disks, targets)):
-                pf = progress_for(i) if progress_for and not isinstance(local, str) else None
-                replace_disk(shell, local, target, log, pf, cancel)
-            break
-        finally:
-            shell.close()
-    else:
-        raise DirectError("No se encontró la VM en ningún host por SSH: " + " · ".join(errors))
-    log("Arrancando la VM ...")
-    morpheus.instance_action(instance_id, "start")
+               progress_for=None, cancel=None, connect=HostShell, sleep=time.sleep) -> str:
+    """Power off the new VM on its host, replace its disk files with `disks` (boot disk first) and start it.
+
+    Everything happens with virsh on the host: Morpheus keeps the instance in "provisioning" until an operating
+    system boots and gets a network address, which never happens with the blank placeholder disk, so its API
+    cannot be used to stop/start it at this point. Returns the host used."""
+    log("Esperando a que la VM aparezca en el host (Morpheus la está creando) ...")
+    shell, host, xml = find_domain(morpheus, instance_id, vm_name, ssh, log, connect, sleep=sleep)
+    q = shlex.quote(vm_name)
+    try:
+        if domstate(shell, vm_name) not in ("shut off", "apagado"):
+            log(f"Apagando en {host} la VM recién creada (solo tiene el disco vacío de la plantilla) ...")
+            shell.run(f"virsh destroy {q}", check=False)
+            for _ in range(30):
+                if domstate(shell, vm_name) in ("shut off", "apagado"):
+                    break
+                sleep(2)
+            else:
+                raise DirectError(f"La VM {vm_name!r} no se apagó en {host}: no se tocan sus discos")
+        xml = shell.run(f"virsh dumpxml {q}")  # again: the definition may have changed while it was booting
+        targets = domain_disks(xml)
+        if len(targets) < len(disks):
+            raise DirectError(f"La VM tiene {len(targets)} disco(s) en {host} y hay {len(disks)} para subir")
+        log(f"Subida directa por SSH a {host}: {len(disks)} disco(s)")
+        for i, (local, target) in enumerate(zip(disks, targets)):
+            pf = progress_for(i) if progress_for and not isinstance(local, str) else None
+            replace_disk(shell, local, target, log, pf, cancel)
+        if domstate(shell, vm_name) not in ("shut off", "apagado"):
+            raise DirectError(f"Alguien encendió la VM {vm_name!r} mientras se sustituían los discos; apágala, "
+                              "reintenta la migración y no la arranques a mano hasta que termine")
+        log("Arrancando la VM ...")
+        shell.run(f"virsh start {q}")
+    finally:
+        shell.close()
+    log("VM arrancada. Morpheus la dará por creada cuando Windows arranque y obtenga una dirección de red "
+        "(puede tardar unos minutos; el estado 'provisioning' hasta entonces es normal).")
     return host

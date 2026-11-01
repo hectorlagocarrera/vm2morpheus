@@ -2765,8 +2765,8 @@ def test_domain_disks_puts_the_boot_disk_first_and_skips_cdroms():
 class LocalShell:
     """Stands in for the SSH session: commands run locally, the 'remote' paths are local files."""
 
-    def __init__(self, host, user, password=None, key_file=None, xml=None, state="shut off"):
-        self.host, self.xml, self.state, self.cmds = host, xml, state, []
+    def __init__(self, host, user, password=None, key_file=None, xml=None, state="shut off", stuck=False):
+        self.host, self.xml, self.state, self.cmds, self.stuck = host, xml, state, [], stuck
 
     def run(self, cmd, check=True, timeout=3600):
         self.cmds.append(cmd)
@@ -2774,6 +2774,12 @@ class LocalShell:
             return self.xml or ""
         if cmd.startswith("virsh domstate"):
             return self.state + "\n"
+        if cmd.startswith("virsh destroy"):
+            self.state = self.state if self.stuck else "shut off"
+            return ""
+        if cmd.startswith("virsh start"):
+            self.state = "running"
+            return ""
         r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True)
         if check and r.returncode:
             from vm2morpheus.direct import DirectError
@@ -2850,7 +2856,7 @@ class _InstMorpheus:
         raise RuntimeError("no API in this fake")
 
 
-def test_push_disks_stops_replaces_every_disk_then_starts(tmp_path):
+def test_push_disks_powers_off_on_the_host_replaces_every_disk_then_starts(tmp_path):
     from vm2morpheus.direct import push_disks
     d0, d1 = tmp_path / "hvm_47-disk-0-bed12f3", tmp_path / "hvm_47-disk-1-aa"
     _qcow(d0, "2M")
@@ -2859,23 +2865,54 @@ def test_push_disks_stops_replaces_every_disk_then_starts(tmp_path):
     _qcow(l0, "2M", data="0x11")
     _qcow(l1, "1M", data="0x22")
     xml = DOMAIN_XML.replace("/mnt/ds/w2k16", str(tmp_path))
-    m, msgs = _InstMorpheus(), []
-    host = push_disks(m, 42, "w2k16", [l0, l1], {"host": "vme02"}, msgs.append,
-                      connect=lambda *a: LocalShell(*a, xml=xml))
-    assert host == "vme02" and m.actions == ["stop", "start"]
+    m, msgs, shells = _InstMorpheus(), [], []
+
+    def connect(*a):
+        shells.append(LocalShell(*a, xml=xml, state="running"))   # Morpheus booted the blank placeholder
+        return shells[-1]
+
+    m.status = "provisioning"   # stays so: Morpheus waits for an OS that the blank disk does not have
+    host = push_disks(m, 42, "w2k16", [l0, l1], {"host": "vme02"}, msgs.append, connect=connect,
+                      sleep=lambda s: None)
+    sh = shells[0]
+    assert host == "vme02" and m.actions == []                  # no Morpheus API calls: all through virsh
+    order = [c.split()[1] for c in sh.cmds if c.startswith("virsh ") and c.split()[1] in ("destroy", "start")]
+    assert order == ["destroy", "start"] and sh.state == "running"
     for disk, pat in ((d0, "0x11"), (d1, "0x22")):
         r = subprocess.run(["qemu-io", "-c", f"read -P {pat} 0 64k", str(disk)], capture_output=True, text=True)
         assert "Pattern verification failed" not in r.stdout
     assert any("Subida directa por SSH a vme02: 2 disco(s)" in x for x in msgs)
 
 
-def test_push_disks_never_touches_a_running_domain(tmp_path):
+def test_push_disks_never_touches_a_domain_that_does_not_power_off(tmp_path):
     from vm2morpheus.direct import DirectError, push_disks
     m = _InstMorpheus()
-    with pytest.raises(DirectError, match="sigue encendida"):
-        push_disks(m, 42, "w2k16", [tmp_path / "x"], {"host": "vme02"}, lambda *_: None,
-                   connect=lambda *a: LocalShell(*a, xml=DOMAIN_XML, state="running"))
-    assert "start" not in m.actions
+    shells = []
+
+    def connect(*a):
+        shells.append(LocalShell(*a, xml=DOMAIN_XML, state="running", stuck=True))
+        return shells[-1]
+
+    with pytest.raises(DirectError, match="no se apagó"):
+        push_disks(m, 42, "w2k16", [tmp_path / "x"], {"host": "vme02"}, lambda *_: None, connect=connect,
+                   sleep=lambda s: None)
+    assert not any(c.startswith("qemu-img") or c.startswith("virsh start") for c in shells[0].cmds)
+
+
+def test_find_domain_waits_until_morpheus_has_defined_the_vm():
+    from vm2morpheus.direct import find_domain
+    calls = {"n": 0}
+
+    class Sh(LocalShell):
+        def run(self, cmd, check=True, timeout=3600):
+            if cmd.startswith("virsh dumpxml"):
+                calls["n"] += 1
+                return DOMAIN_XML if calls["n"] >= 3 else "error: failed to get domain"
+            return ""
+
+    sh, host, xml = find_domain(_InstMorpheus(), 42, "w2k16", {"host": "vme01"}, connect=lambda *a: Sh(*a),
+                                sleep=lambda s: None)
+    assert host == "vme01" and "<domain" in xml and calls["n"] == 3
 
 
 def test_pipeline_direct_mode_creates_the_vm_from_the_placeholder_and_pushes_the_disks(tmp_path, monkeypatch):
