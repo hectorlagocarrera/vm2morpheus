@@ -2174,7 +2174,7 @@ def test_page_has_the_history_tab_and_the_two_step_delete_dialog():
     from vm2morpheus import gui
     page = gui.render_page()
     for needle in ('id="tab-historico"', 'id="tabbtn-historico"', "function loadHistory", "function showDetail",
-                   "function showDoneDialog", "Pulsa otra vez para confirmar el borrado", "Reintentar el borrado",
+                   "function showDoneDialog", "¿Seguro? Pulsa otra vez", 'b.textContent="Reintentar"',
                    "El borrado no se puede deshacer", 'href="/history.csv"', "function drawSeriesChart"):
         assert needle in page
 
@@ -2390,7 +2390,7 @@ def test_gui_passes_the_hot_copy_option_and_warns_about_the_running_source():
     assert gui.make_cfgs(dict(base))[2]["hot_copy"] is False
     page = gui.render_page()
     for needle in ('id="hot_copy"', 'id="hotlbl"', "Copia en caliente (sin apagar",
-                   "Apaga el origen antes de arrancar la VM de Morpheus"):
+                   "Apaga el origen antes de arrancar la VM en Morpheus"):
         assert needle in page
     job = {"status": "done", "cleanup": {"morpheus": {"url": "https://m"}, "vm": "w", "workdir": "x",
            "result": {"instance": {"id": 1}, "images": [{"id": 2, "name": "n"}], "hot": True}}}

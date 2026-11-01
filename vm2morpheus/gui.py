@@ -614,8 +614,12 @@ table#histtable{width:100%;border-collapse:collapse;background:#fff;border:1px s
 #sshres.ok{display:block;background:#dcfce7;border:1px solid #86efac;color:#166534}
 #sshres.bad{display:block;background:#fee2e2;border:1px solid #fca5a5;color:#991b1b}
 .dialog .res{font-size:13px;margin:8px 0} .dialog .res.err{color:#b91c1c} .dialog .res.ok{color:#166534}
-.dialog .actions{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px} .dialog .actions button,.dialog .actions a{margin:0}
-.dialog label.inl{display:flex;gap:8px;align-items:center;font-size:13px;color:#1b2430;margin:6px 0} .dialog label.inl input{width:auto}
+.dialog .actions{display:flex;flex-wrap:wrap;align-items:center;gap:8px;margin-top:16px} .dialog .actions button{margin:0}
+.dialog .actions .grow{flex:1} .dialog h2{font-size:19px;margin:0 0 10px} .dialog p,.dialog li{font-size:14px;line-height:1.5}
+.dialog ul{margin:6px 0 10px;padding-left:20px} .dialog .note{font-size:13px;color:#4a5665}
+.dialog .warn{background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:8px 12px;font-size:13px}
+.dialog label.inl{display:flex;align-items:center;gap:8px;font-size:14px;color:#1b2430;margin:8px 0}
+.dialog label.inl input{width:auto}
 #busywrap{display:none;margin:0 0 10px;position:sticky;top:0;z-index:5;background:#f4f6f8;padding:8px 0}
 #busyline{height:8px;background:#dfe5ec;border-radius:6px;overflow:hidden;position:relative}
 #busyline::before{content:"";position:absolute;top:0;bottom:0;width:40%;background:#2563eb;border-radius:6px;animation:slide 1.1s infinite ease-in-out}
@@ -918,25 +922,26 @@ async function deleteEntry(id){if(!confirm("¿Eliminar este registro del histór
 async function clearHistory(){if(!confirm("¿Borrar TODO el histórico? No se puede deshacer."))return;await post("/history/clear",{});loadHistory()}
 // ---- after a migration that created a VM: test it, then (only if the user says so) delete the library image
 const doneShown=new Set();let delArmed=false;
-function showDoneDialog(jobId,d){const imgs=d.images.map(i=>esc(i.name)+" (id "+i.id+")").join(", "),link=esc(d.morpheus_url+"/provisioning/instances/"+d.instance.id);
- document.getElementById("dialog").innerHTML=`<button class="xclose" title="Cerrar" aria-label="Cerrar" onclick="closeDialog()">×</button><h2>✔ Migración terminada: prueba la VM</h2>
- <p>La VM <b>${esc(d.instance.name||d.vm)}</b> ya está creada en Morpheus. <b>Antes de limpiar nada, compruébala:</b></p>
- <ul><li>Arranca y puedes entrar con tu usuario (usa la consola de Morpheus).</li><li>Tiene red y sus servicios responden.</li><li>Los discos y los datos están completos.</li></ul>
- ${d.images.length?`<p style="font-size:13px;color:#4a5665">Cuando compruebes que la máquina funciona, puedes eliminar de la biblioteca de Morpheus la imagen que se subió únicamente para crearla (${imgs}). <b>El borrado no se puede deshacer.</b> Si Morpheus indica que la imagen está en uso, se mostrará aquí su respuesta.</p>`:`<p style="font-size:13px;color:#4a5665">Los discos se copiaron directamente al host por SSH: no queda ninguna imagen en la biblioteca que borrar. Cuando compruebes que la máquina funciona, puedes borrar la carpeta de trabajo.</p>`}
- ${d.hot?`<p style="background:#fef3c7;border:1px solid #f59e0b;border-radius:8px;padding:8px 12px;font-size:13px"><b>Copia en caliente:</b> la VM de origen sigue encendida y la copia no incluye lo que cambió después del checkpoint. <b>Apaga el origen antes de arrancar la VM de Morpheus</b> para no tener dos máquinas iguales en la red (nombre, IP, dominio).</p>`:""}
- <label class="inl"><input type="checkbox" id="dlgwork" checked> Borrar también la carpeta de trabajo de esta VM (solo guarda el progreso)</label>
+function showDoneDialog(jobId,d){const lib=d.images.length>0,imgs=d.images.map(i=>esc(i.name)+" (id "+i.id+")").join(", "),link=d.morpheus_url+"/provisioning/instances/"+d.instance.id;
+ document.getElementById("dialog").innerHTML=`<button class="xclose" title="Cerrar" aria-label="Cerrar" onclick="closeDialog()">×</button><h2>✔ Migración terminada</h2>
+ <p>La VM <b>${esc(d.instance.name||d.vm)}</b> ya está creada en Morpheus. Antes de borrar nada, comprueba que:</p>
+ <ul><li>arranca y puedes iniciar sesión (desde la consola de Morpheus),</li><li>tiene red y sus servicios responden,</li><li>los discos y los datos están completos.</li></ul>
+ ${d.hot?`<p class="warn"><b>Copia en caliente:</b> la VM de origen sigue encendida y la copia no incluye lo que cambió después del checkpoint. Apaga el origen antes de arrancar la VM en Morpheus para no tener dos máquinas iguales en la red.</p>`:""}
+ ${lib?`<p class="note">Cuando la VM funcione, puedes borrar de la biblioteca de Morpheus la imagen que se subió para crearla (${imgs}). El borrado no se puede deshacer.</p>
+ <label class="inl"><input type="checkbox" id="dlgwork" checked> Borrar también la carpeta de trabajo de este equipo</label>`
+ :`<p class="note">Los discos se copiaron directamente al almacén de datos, así que no queda ninguna imagen en la biblioteca. Cuando la VM funcione, puedes borrar la carpeta de trabajo de este equipo, que solo guarda el progreso de la migración.</p>`}
  <div id="dlgres"></div>
- <div class="actions"><a class="btnlink" href="${link}" target="_blank" rel="noopener">Abrir la instancia en Morpheus</a>
- <button class="danger" id="dlgdel" onclick="confirmDelete('${esc(jobId)}')">${d.images.length?"La VM funciona: borrar la imagen":"La VM funciona: borrar la carpeta de trabajo"}</button>
- <button class="sec" id="dlgkeep" onclick="closeDialog()">${d.images.length?"Todavía no, mantener la imagen":"Todavía no"}</button></div>`;
+ <div class="actions"><button class="sec" onclick="window.open('${esc(link)}','_blank','noopener')">Abrir en Morpheus</button><span class="grow"></span>
+ <button class="sec" id="dlgkeep" onclick="closeDialog()">Cerrar</button>
+ <button class="danger" id="dlgdel" data-label="${lib?"Borrar la imagen":"Borrar la carpeta de trabajo"}" onclick="confirmDelete('${esc(jobId)}')">${lib?"Borrar la imagen":"Borrar la carpeta de trabajo"}</button></div>`;
  delArmed=false;document.getElementById("modal").style.display="flex"}
 async function confirmDelete(jobId){const b=document.getElementById("dlgdel");
- if(!delArmed){delArmed=true;b.textContent="Pulsa otra vez para confirmar el borrado";return}
- b.disabled=true;
- try{const r=await post("/cleanup",{job:jobId,delete_workdir:document.getElementById("dlgwork").checked});
-  document.getElementById("dlgres").innerHTML=r.images.map(i=>i.ok?`<div class="res ok">✔ Imagen ${esc(i.name)} (id ${i.id}) borrada de la biblioteca.</div>`:`<div class="res err">✖ No se pudo borrar ${esc(i.name)} (id ${i.id}): ${esc(i.error)}</div>`).join("")+(r.workdir_removed?`<div class="res ok">✔ Carpeta de trabajo borrada.</div>`:"");
-  delArmed=false;if(r.image_deleted){b.style.display="none";document.getElementById("dlgkeep").textContent="Cerrar"}else{b.disabled=false;b.textContent="Reintentar el borrado"}}
- catch(e){document.getElementById("dlgres").innerHTML=`<div class="res err">${esc(e.message)}</div>`;b.disabled=false;delArmed=false}}
+ if(!delArmed){delArmed=true;b.textContent="¿Seguro? Pulsa otra vez";return}
+ b.disabled=true;const chk=document.getElementById("dlgwork");
+ try{const r=await post("/cleanup",{job:jobId,delete_workdir:chk?chk.checked:true});
+  document.getElementById("dlgres").innerHTML=r.images.map(i=>i.ok?`<div class="res ok">✔ Imagen ${esc(i.name)} (id ${i.id}) borrada de la biblioteca.</div>`:`<div class="res err">✖ No se pudo borrar ${esc(i.name)} (id ${i.id}): ${esc(i.error)}</div>`).join("")+(r.workdir_removed?`<div class="res ok">✔ Carpeta de trabajo borrada.</div>`:(!chk||chk.checked)&&r.image_deleted?`<div class="res err">No se pudo borrar la carpeta de trabajo (puede que ya no exista).</div>`:"");
+  delArmed=false;if(r.image_deleted){b.style.display="none";if(chk)chk.disabled=true}else{b.disabled=false;b.textContent="Reintentar"}}
+ catch(e){document.getElementById("dlgres").innerHTML=`<div class="res err">${esc(e.message)}</div>`;b.disabled=false;delArmed=false;b.textContent=b.dataset.label}}
 function closeDialog(){document.getElementById("modal").style.display="none";delArmed=false}
 document.addEventListener("keydown",e=>{if(e.key==="Escape"&&document.getElementById("modal").style.display==="flex")closeDialog()});
 let currentJob=null;
