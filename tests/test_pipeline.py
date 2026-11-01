@@ -406,6 +406,7 @@ def test_inject_runs_dism_per_driver_and_always_dismounts(tmp_path):
     assert added == ["viostor", "NetKVM"] and len(dism_calls) == 2 and len(calls) == 3  # mount + boot registry + dismount
     assert "CriticalDeviceDatabase" in calls[1] and "'viostor'" in calls[1] and "vioscsi" not in calls[1]
     assert "pci#ven_1af4&dev_1001" in calls[1] and "-Value 0 -Type DWord" in calls[1]
+    assert "{4D36E97B-E325-11CE-BFC1-08002BE10318}" in calls[1] and "B511-BE2BFDC27B6E" not in calls[1]  # SCSIAdapter class
     assert dism_calls[0][:2] == ["/Image:E:\\", "/Add-Driver"]
 
 

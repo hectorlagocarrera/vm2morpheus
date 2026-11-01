@@ -249,7 +249,8 @@ try {{
         $k = 'HKLM:\\VM2M_SYS\\' + $r + '\\Control\\CriticalDeviceDatabase\\' + $id
         New-Item -Path $k -Force | Out-Null
         Set-ItemProperty $k -Name Service -Value $name -Type String
-        Set-ItemProperty $k -Name ClassGUID -Value '{{4D36E97B-E325-11CE-B511-BE2BFDC27B6E}}' -Type String
+        Set-ItemProperty $k -Name ClassGUID -Value '{{4D36E97B-E325-11CE-BFC1-08002BE10318}}' -Type String
+        Set-ItemProperty $k -Name Class -Value 'SCSIAdapter' -Type String
       }}
     }}
   }}
