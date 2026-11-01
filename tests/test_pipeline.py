@@ -1760,7 +1760,7 @@ def test_page_follows_the_source_name_until_the_user_types_their_own():
     from vm2morpheus.gui import render_page
     page = render_page()
     for needle in ('id="new_vm_name"', "function syncNewName", "newNameTouched=true", "(elige una red)",
-                   "Red <small>(obligatoria)</small>"):
+                   "<label>Red</label>"):
         assert needle in page
 
 
@@ -2389,7 +2389,7 @@ def test_gui_passes_the_hot_copy_option_and_warns_about_the_running_source():
     assert gui.make_cfgs({**base, "hot_copy": True})[2]["hot_copy"] is True
     assert gui.make_cfgs(dict(base))[2]["hot_copy"] is False
     page = gui.render_page()
-    for needle in ('id="hot_copy"', 'id="hotlbl"', "Copia en caliente: no apagar la VM de origen",
+    for needle in ('id="hot_copy"', 'id="hotlbl"', "Copia en caliente (sin apagar",
                    "Apaga el origen antes de arrancar la VM de Morpheus"):
         assert needle in page
     job = {"status": "done", "cleanup": {"morpheus": {"url": "https://m"}, "vm": "w", "workdir": "x",
@@ -2402,7 +2402,7 @@ def test_form_fields_line_up_whatever_the_label_length():
     page = render_page()
     assert "align-items:end" in page.split(".row{", 1)[1].split("}", 1)[0]          # inputs share a baseline per row
     assert "input:not([type=checkbox]),select{height:34px}" in page                 # a select is as tall as an input
-    assert "<label>Nombre de la VM en Morpheus</label>" in page                    # no wrapping hint under the label
+    assert "<label>Nombre</label>" in page                    # no wrapping hint under the label
 
 
 # ------------------------------------------------------------------ parallel flat-disk download

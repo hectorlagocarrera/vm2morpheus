@@ -368,11 +368,12 @@ def _is_off(shell, vm_name: str) -> bool:
 
 
 def power_off(morpheus, instance_id: int, shell, vm_name: str, log=print, sleep=time.sleep) -> None:
-    """Stop the VM through Morpheus first (so it knows the VM is meant to be off: clusters with "auto recover power
-    state" switch on any VM that is powered off behind their back), and with virsh if that does not work."""
+    """Stop the VM through Morpheus (so it knows the VM is meant to be off: clusters with "auto recover power state"
+    switch on any VM that is powered off behind their back), then force it off with virsh destroy after a few
+    seconds: the VM only has the blank placeholder disk, so there is nothing to shut down cleanly."""
     try:
-        morpheus.instance_action(instance_id, "stop")
-        for _ in range(45):
+        morpheus.instance_action(instance_id, "stop")  # mainly so Morpheus knows it is meant to be off
+        for _ in range(5):  # Morpheus asks for a clean (ACPI) shutdown, which a blank disk never answers
             if _is_off(shell, vm_name):
                 return
             sleep(2)

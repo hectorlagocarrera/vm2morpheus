@@ -572,6 +572,14 @@ input,select{width:100%;padding:7px;border:1px solid #b9c2cc;border-radius:5px;b
 input:not([type=checkbox]),select{height:34px}
 .row{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:0 14px;align-items:end}
 .chk label{display:inline-block;margin-right:16px;color:#1b2430;font-size:14px} .chk input{width:auto}
+.btns{margin-top:10px} .help{font-size:12.5px;color:#5b6675;margin:6px 0 0;line-height:1.45}
+details.adv{margin-top:10px} details.adv summary{cursor:pointer;font-size:13px;color:#2563eb}
+.modes{display:grid;grid-template-columns:repeat(auto-fit,minmax(260px,1fr));gap:10px;margin:4px 0 8px}
+.mode{display:block;border:1px solid #d5dbe2;border-radius:8px;padding:10px 12px 10px 34px;position:relative;cursor:pointer;margin:0;color:#1b2430}
+.mode input{position:absolute;left:12px;top:12px;width:auto} .mode b{display:block;font-size:14px}
+.mode span{display:block;font-size:12.5px;color:#5b6675;margin-top:3px;line-height:1.4}
+.mode.on{border-color:#2563eb;background:#eff6ff}
+#sshopts{display:none;border-left:3px solid #2563eb;padding-left:12px;margin:6px 0 4px}
 button{padding:9px 16px;margin:4px 8px 4px 0;border:0;border-radius:6px;background:#2563eb;color:#fff;cursor:pointer;font-size:14px}
 input.diskchk{width:auto;margin:0 8px 0 0;vertical-align:middle}
 #picker{display:none;background:#fff;border:1px solid #b9c2cc;border-radius:8px;padding:10px;margin-top:8px}
@@ -648,48 +656,71 @@ small{color:#5d6b7b}
 <div><label>Usuario</label><input id="source_user" placeholder="Administrador"></div>
 <div><label>Contraseña</label><input id="source_password" type="password"></div>
 <div><label>Nombre de la VM</label><input id="vm" onchange="analyze()"></div>
-<div><label>VM del origen <small>(pulsa "Listar VMs")</small></label><select id="vm_select" onchange="if(this.value){document.getElementById('vm').value=this.value;analyze()}"><option value="">(sin listar)</option></select></div>
-<div><label>Sistema operativo (Hyper-V)</label><select id="os_family"><option value="windows">Windows</option><option value="linux">Linux</option><option value="other">Otro</option></select></div>
-</div><button class="sec" data-busy onclick="listvms()">Listar VMs del origen</button><button class="sec" data-busy onclick="inspect_()">Analizar VM</button><button class="sec" data-busy onclick="speedtest()">Probar velocidad de descarga</button>
-<div id="diskpanel" style="display:none;margin-top:8px"><div id="diskinfo"></div><div id="disklist" style="margin:6px 0"></div><small id="diskhint"></small></div></fieldset>
-<fieldset><legend>2. Destino Morpheus</legend><div class="row">
-<div><label>URL (https://ip)</label><input id="morpheus_url"></div>
-<div><label>Nombre de la VM en Morpheus</label><input id="new_vm_name" oninput="newNameTouched=true" placeholder="igual que la original"></div>
-<div><label>Token API</label><input id="morpheus_token" type="password"></div>
-<div><label>imageType <small>(qcow2 por defecto, verifícalo)</small></label><input id="image_type" value="qcow2"></div>
-</div><div class="chk"><label><input type="checkbox" id="verify_ssl"> Verificar certificado TLS</label></div>
-<button class="sec" data-busy onclick="lookups()">Cargar nubes, grupos, planes y redes</button></fieldset>
-<fieldset><legend>3. Crear la VM en Morpheus (opcional)</legend>
-<small>Crea antes a mano UNA instancia HPE HVM con cualquier imagen (Provisioning → Instances → Add). Elígela en el desplegable: el programa la clona cambiando solo la imagen. Vacío = solo se sube la imagen.</small>
-<div class="row"><div><label>Instancia de referencia (pulsa "Cargar" arriba)</label><select id="ref_instance_id"><option value="">(ninguna: solo subir la imagen)</option></select></div>
-<div><label>ID de su imagen <small>(opcional; se detecta sola)</small></label><input id="ref_image_id"></div></div>
-<button class="sec" data-busy onclick="refinfo()">Ver instancia de referencia (JSON)</button>
-<details open><summary><small>Sin instancia de referencia: crear desde cero (rellena nube, grupo, plan, red y layout)</small></summary>
-<div class="row"><div><label>Nube</label><select id="cloud_id"></select></div><div><label>Grupo</label><select id="group_id"></select></div>
-<div><label>Plan <small id="planhint"></small></label><select id="plan_id" onchange="planTouched=true"></select></div><div><label>Red <small>(obligatoria)</small></label><select id="network_id"></select></div><div><label>Almacén de datos</label><select id="datastore_id"><option value="">(automático: lo elige Morpheus)</option></select></div>
-<div><label>Instance type (código)</label><input id="instance_type" value="mvm"></div><div><label>Layout <small>(automático: Single HVM)</small></label><select id="layout_id"><option value="">(automático)</option></select></div><div><label>Resource pool <small>(automático)</small></label><select id="resource_pool"><option value="">(automático)</option></select></div></div></details>
-<details id="sshbox"><summary><small>Subida directa por SSH al host HVM (los discos viajan una sola vez, sin pasar por la biblioteca)</small></summary>
-<div class="chk"><label><input type="checkbox" id="ssh_direct"> Copiar los discos por SSH directamente a la VM (crea la VM con una imagen vacía de 1 MB y sustituye sus discos)</label></div>
-<div class="row"><div><label>Hosts HVM <small>(todos, separados por comas)</small></label><input id="ssh_host" placeholder="192.168.40.21, 192.168.40.22"></div><div><label>Usuario SSH</label><input id="ssh_user" placeholder="root"></div>
-<div><label>Contraseña SSH</label><input id="ssh_password" type="password" autocomplete="off"></div><div><label>Clave privada <small>(opcional)</small></label><input id="ssh_key" placeholder="C:\Users\yo\.ssh\id_rsa"></div></div>
-<button class="sec" data-busy onclick="sshtest()">Probar SSH</button><div id="sshres"></div>
-<small>Con un almacén de datos compartido (NFS o GFS2) elegido arriba, los discos de datos van directamente del origen al almacén y se convierten en el host; solo el disco de arranque pasa por este equipo (para inyectar los drivers).<br>No es un método oficial de HPE: Morpheus no se entera de que el disco cambió (funciona porque la VM usa el fichero). Solo almacenes de ficheros (NFS, GFS2, directorio local). Si falla antes de tocar los discos, reintenta o desmarca la opción para usar la biblioteca.</small></details></fieldset>
-<fieldset><legend>4. Opciones</legend><div class="chk">
-<label><input type="checkbox" id="shutdown"> Apagar la VM de origen</label>
-<label><input type="checkbox" id="multi_disk_bundle" checked> Varios discos en una sola imagen (zip + metadata.json)</label>
-<label><input type="checkbox" id="recreate_instance"> Recrear solo la instancia (borra antes la anterior en Morpheus)</label>
-<label><input type="checkbox" id="verify_source"> Verificar el certificado del origen (VMware; déjalo apagado si es autofirmado)</label>
-<label id="hotlbl"><input type="checkbox" id="hot_copy" onchange="if(this.checked)document.getElementById('shutdown').checked=false"> Copia en caliente: no apagar la VM de origen (solo Hyper-V; crea un checkpoint temporal y copia el disco base)</label>
-<label><input type="checkbox" id="compress_image"> Comprimir el disco convertido (se sube y se copia más rápido; la VM puede leer algo más lento)</label>
-<label><input type="checkbox" id="remember_secrets"> Recordar contraseñas y token (se guardan en texto plano en este equipo)</label>
-<label><input type="checkbox" id="direct_read"> Conversión directa, sin copiar el disco antes (Hyper-V, solo Windows)</label>
-<label><input type="checkbox" id="inject_drivers"> Inyectar drivers VirtIO en el disco de Windows (solo Windows; ejecuta el programa como administrador)</label>
-<label><input type="checkbox" id="boot_sata" checked> Disco de arranque en SATA (Windows sin drivers VirtIO)</label></div>
-<label>ISO de virtio-win <small>(vacío = se descarga sola, ~700 MB, y se guarda en caché)</small></label><input id="virtio_iso" placeholder="C:\ISOs\virtio-win.iso">
-<label>Descarga desde VMware <small>(Automático: exportación comprimida y, si se para, disco plano)</small></label><select id="vmware_method"><option value="auto">Automático</option><option value="export">Solo exportación (comprimida, más rápida)</option><option value="flat">Disco plano (sin comprimir, más lenta pero fiable)</option><option value="flat_parallel">Disco plano en paralelo (experimental, 4 conexiones; mide antes con "Probar velocidad")</option></select>
-<label>Carpeta de trabajo <small>(necesita ~2× el tamaño real de los discos; vacío = automática)</small></label><div style="display:flex;gap:8px"><input id="workdir" placeholder="vacío = automático (disco local con más espacio libre)"><button class="sec" style="margin:0;white-space:nowrap" onclick="openPicker(document.getElementById('workdir').value.trim())">Examinar…</button></div>
+<div><label>VM del origen</label><select id="vm_select" onchange="if(this.value){document.getElementById('vm').value=this.value;analyze()}"><option value="">(pulsa «Listar VMs»)</option></select></div>
+<div><label>Sistema operativo</label><select id="os_family"><option value="windows">Windows</option><option value="linux">Linux</option><option value="other">Otro</option></select></div>
+</div><div class="btns"><button class="sec" data-busy onclick="listvms()">Listar VMs</button><button class="sec" data-busy onclick="inspect_()">Analizar VM</button><button class="sec" data-busy onclick="speedtest()">Probar velocidad</button></div>
+<div id="diskpanel" style="display:none;margin-top:8px"><div id="diskinfo"></div><div id="disklist" style="margin:6px 0"></div><small id="diskhint"></small></div>
+<div class="chk"><label><input type="checkbox" id="shutdown"> Apagar la VM de origen antes de copiar</label>
+<label id="hotlbl"><input type="checkbox" id="hot_copy" onchange="if(this.checked)document.getElementById('shutdown').checked=false"> Copia en caliente (sin apagar; crea un checkpoint temporal)</label>
+<label id="verifysrclbl"><input type="checkbox" id="verify_source"> Verificar el certificado del origen</label></div>
+<div id="vmwaremethod"><label>Método de descarga desde VMware</label><select id="vmware_method"><option value="auto">Automático (exportación y, si se detiene, disco plano)</option><option value="export">Exportación comprimida</option><option value="flat">Disco plano</option><option value="flat_parallel">Disco plano en paralelo (4 conexiones)</option></select></div>
+</fieldset>
+
+<fieldset><legend>2. Morpheus</legend><div class="row">
+<div><label>URL</label><input id="morpheus_url" placeholder="https://morpheus.empresa.local"></div>
+<div><label>Token de API</label><input id="morpheus_token" type="password"></div>
+</div><div class="chk"><label><input type="checkbox" id="verify_ssl"> Verificar el certificado de Morpheus</label></div>
+<div class="btns"><button class="sec" data-busy onclick="lookups()">Cargar datos de Morpheus</button></div>
+<p class="help">Carga nubes, grupos, planes, redes y almacenes de datos. Se hace solo al abrir el programa si la URL y el token están guardados.</p></fieldset>
+
+<fieldset><legend>3. VM nueva en Morpheus</legend><div class="row">
+<div><label>Nombre</label><input id="new_vm_name" oninput="newNameTouched=true" placeholder="igual que en el origen"></div>
+<div><label>Nube</label><select id="cloud_id"></select></div><div><label>Grupo</label><select id="group_id"></select></div>
+<div><label>Plan <small id="planhint"></small></label><select id="plan_id" onchange="planTouched=true"></select></div>
+<div><label>Red</label><select id="network_id"></select></div>
+<div><label>Almacén de datos</label><select id="datastore_id"><option value="">Automático (lo elige Morpheus)</option></select></div></div>
+<details class="adv"><summary>Opciones avanzadas</summary><div class="row">
+<div><label>Formato de imagen</label><input id="image_type" value="qcow2"></div>
+<div><label>Tipo de instancia (código)</label><input id="instance_type" value="mvm"></div>
+<div><label>Layout</label><select id="layout_id"><option value="">Automático (Single HVM)</option></select></div>
+<div><label>Resource pool</label><select id="resource_pool"><option value="">Automático</option></select></div>
+<div><label>Instancia de referencia</label><select id="ref_instance_id"><option value="">Ninguna (crear con los datos de arriba)</option></select></div>
+<div><label>Imagen de la referencia</label><input id="ref_image_id" placeholder="se detecta sola"></div></div>
+<div class="btns"><button class="sec" data-busy onclick="refinfo()">Ver la instancia de referencia</button></div>
+<p class="help">Con una instancia de referencia, la VM nueva copia su configuración (plan, red, volúmenes) y solo cambia la imagen.</p>
+<div class="chk"><label><input type="checkbox" id="recreate_instance"> Recrear solo la VM (si ya se migró; borra antes la anterior en Morpheus)</label></div></details>
+</fieldset>
+
+<fieldset><legend>4. Subida de los discos</legend>
+<div class="modes">
+<label class="mode" id="mode-lib"><input type="radio" name="upload_mode" value="lib" onchange="uploadMode()"><b>Biblioteca de imágenes de Morpheus</b><span>El disco se sube como imagen y Morpheus crea la VM a partir de ella. No necesita nada más.</span></label>
+<label class="mode" id="mode-ssh"><input type="radio" name="upload_mode" value="ssh" onchange="uploadMode()"><b>Directa al almacén de datos (SSH)</b><span>Más rápida: cada disco viaja una sola vez, directamente al almacén de la VM. Necesita acceso SSH a los hosts HVM.</span></label>
+</div>
+<input type="checkbox" id="ssh_direct" hidden>
+<div id="libopts" class="chk"><label><input type="checkbox" id="multi_disk_bundle" checked> Varios discos en una sola imagen</label></div>
+<div id="sshopts"><div class="row">
+<div><label>Hosts HVM</label><input id="ssh_host" placeholder="vme01.empresa.local, vme02.empresa.local"></div>
+<div><label>Usuario</label><input id="ssh_user" placeholder="root"></div>
+<div><label>Contraseña</label><input id="ssh_password" type="password" autocomplete="off"></div>
+<div><label>Clave privada <small>(opcional)</small></label><input id="ssh_key" placeholder="C:\Users\usuario\.ssh\id_rsa"></div></div>
+<div class="btns"><button class="sec" data-busy onclick="sshtest()">Probar conexión</button></div><div id="sshres"></div>
+<p class="help">Indica todos los hosts del clúster, separados por comas: la VM se crea en el que elija Morpheus. Si el usuario no es root, se usa sudo con la misma contraseña. Con un almacén compartido (NFS o GFS2), los discos de datos se copian directamente desde el origen sin pasar por este equipo.</p></div>
+<div class="chk"><label><input type="checkbox" id="compress_image"> Comprimir los discos (menos datos que subir; la VM puede leer algo más lento)</label></div>
+</fieldset>
+
+<fieldset><legend>5. Windows</legend><div class="chk">
+<label><input type="checkbox" id="inject_drivers"> Instalar los drivers VirtIO en el disco (necesita ejecutar el programa como administrador)</label>
+<label><input type="checkbox" id="boot_sata" checked> Arrancar desde SATA (para Windows sin drivers VirtIO)</label></div>
+<label>ISO de virtio-win</label><input id="virtio_iso" placeholder="vacío = se descarga automáticamente (unos 700 MB, una sola vez)">
+</fieldset>
+
+<fieldset><legend>6. Este equipo</legend>
+<label>Carpeta de trabajo <small>(necesita unas 2 veces lo que ocupan los datos de los discos)</small></label><div style="display:flex;gap:8px"><input id="workdir" placeholder="vacío = automática (el disco local con más espacio libre)"><button class="sec" style="margin:0;white-space:nowrap" onclick="openPicker(document.getElementById('workdir').value.trim())">Examinar…</button></div>
 <div id="picker"><div id="pickerhead"></div><div id="pickerlist"></div>
-<button class="sec" onclick="pickerUp()">Subir</button><button onclick="pickerUse()">Usar esta carpeta</button><button class="sec" onclick="closePicker()">Cerrar</button></div></fieldset>
+<button class="sec" onclick="pickerUp()">Subir</button><button onclick="pickerUse()">Usar esta carpeta</button><button class="sec" onclick="closePicker()">Cerrar</button></div>
+<div class="chk"><label id="directlbl"><input type="checkbox" id="direct_read"> Leer el disco directamente del origen, sin copiarlo antes (Hyper-V)</label>
+<label><input type="checkbox" id="remember_secrets"> Recordar contraseñas y token en este equipo (se guardan sin cifrar)</label></div>
+</fieldset>
 <button onclick="run('/dryrun')" class="sec">Simulación</button><button onclick="run('/migrate')">Migrar</button><button id="cancelbtn" class="danger" style="display:none" onclick="cancelJob()">Cancelar migración</button>
 <div id="barwrap"><div id="barline"><div id="bar"></div></div><div id="barlabel"></div></div>
 <div id="chartwrap"><div class="head"><b>Transferencia en directo</b><span id="chartinfo"></span></div>
@@ -827,7 +858,15 @@ async function lookups(){try{await persist();const j=await busy("Cargando datos 
   for(const [k,id] of [["layouts","layout_id"],["pools","resource_pool"]]){const s=document.getElementById(id);s.innerHTML='<option value="">(automático)</option>'+j[k].map(([v,n])=>`<option value="${v}">${n}</option>`).join("");if(saved[id])s.value=saved[id]}
  show("Datos cargados.")}catch(e){show("ERROR: "+e.message)}}
 const SEP=String.fromCharCode(92);
+function uploadMode(){const r=document.querySelector('input[name=upload_mode]:checked');const ssh=!!r&&r.value==="ssh";
+ document.getElementById("ssh_direct").checked=ssh;document.getElementById("sshopts").style.display=ssh?"block":"none";
+ document.getElementById("libopts").style.display=ssh?"none":"";
+ document.getElementById("mode-ssh").classList.toggle("on",ssh);document.getElementById("mode-lib").classList.toggle("on",!ssh)}
+function setUploadMode(){document.querySelector(`input[name=upload_mode][value=${document.getElementById("ssh_direct").checked?"ssh":"lib"}]`).checked=true;uploadMode()}
 function srcHint(){const t=document.getElementById("source_type").value;
+ document.getElementById("vmwaremethod").style.display=t==="hyperv"?"none":"";
+ document.getElementById("verifysrclbl").style.display=t==="hyperv"?"none":"";
+ document.getElementById("directlbl").style.display=t==="hyperv"?"":"none";
  document.getElementById("source_user").placeholder={hyperv:"Administrador",vmware:"usuario@vsphere.local",esxi:"root"}[t]||"";
  document.getElementById("os_family").closest("div").style.display=t==="hyperv"?"":"none";
  const hot=document.getElementById("hotlbl");hot.style.display=t==="hyperv"?"":"none";if(t!=="hyperv")document.getElementById("hot_copy").checked=false}
@@ -918,6 +957,7 @@ srcHint();
  ids.forEach(i=>{if(saved[i]!==undefined&&document.getElementById(i).tagName==="INPUT"||saved[i]!==undefined&&["source_type","os_family","vmware_method"].includes(i))document.getElementById(i).value=saved[i]});
  newNameTouched=!!(saved.new_vm_name&&saved.new_vm_name!==saved.vm); // a name typed earlier is kept
  chks.forEach(i=>{if(saved[i]!==undefined)document.getElementById(i).checked=!!saved[i]});
+ setUploadMode();
  srcHint();
  if(saved.morpheus_url&&saved.morpheus_token)lookups()}catch(e){}})();
 </script></html>"""
