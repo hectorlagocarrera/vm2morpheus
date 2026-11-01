@@ -195,7 +195,18 @@ if ($s.Count -gt 0) {{ $s | Remove-VMSnapshot }}
             total = smbclient.stat(unc).st_size
             cb: ProgressCb = progress(f"descargar {disk.name}")
             done = 0
-            with smbclient.open_file(unc, mode="rb") as src, open(local, "wb") as dst:
+            try:
+                # share_access="rwd": smbclient's default is exclusive, which fails (0xc0000043) on a disk another
+                # process already has open. The base disk of a checkpoint is held open by the running VM.
+                src = smbclient.open_file(unc, mode="rb", share_access="rwd")
+            except OSError as e:
+                if "0xc0000043" in str(e).lower():
+                    raise RuntimeError(
+                        f"{disk.name} está abierto por otro proceso sin permitir lecturas ({e}). En una copia en "
+                        "caliente se lee el disco base del checkpoint; si Hyper-V no lo permite, apaga la VM y "
+                        "migra en frío.") from e
+                raise
+            with src, open(local, "wb") as dst:
                 while chunk := src.read(CHUNK):
                     dst.write(chunk)
                     done += len(chunk)

@@ -2536,3 +2536,52 @@ def test_flat_parallel_is_routed_and_offered(tmp_path):
     assert 'value="flat_parallel"' in render_page()
     base = {"source_type": "esxi", "source_host": "h", "source_user": "u", "source_password": "p"}
     assert source_cfg({**base, "vmware_method": "flat_parallel"})["download_method"] == "flat_parallel"
+
+
+# ------------------------------------------- Hyper-V SMB copy of a disk that a running VM holds open
+def _fake_smbclient(monkeypatch, data, open_error=None):
+    import io
+    import sys
+    import types
+    calls = []
+
+    def open_file(path, mode="r", **kw):
+        calls.append((path, mode, kw))
+        if open_error:
+            raise open_error
+        return io.BytesIO(data)
+
+    fake = types.SimpleNamespace(register_session=lambda host, username, password: None,
+                                 stat=lambda p: types.SimpleNamespace(st_size=len(data)), open_file=open_file)
+    monkeypatch.setitem(sys.modules, "smbclient", fake)
+    return calls
+
+
+def _frozen_vm():
+    return VMInfo("w2k16", 1, 4024, "bios", "windows", "on",
+                  [DiskInfo("w2k16.vhdx", 80 << 30, r"E:\VMs\w2k16\Virtual Hard Disks\w2k16.vhdx", index=0)])
+
+
+def test_the_disk_is_opened_with_sharing_allowed_so_a_running_vm_holding_it_does_not_block_the_copy(tmp_path, monkeypatch):
+    data = b"vhdx-bytes" * 5000
+    calls = _fake_smbclient(monkeypatch, data)
+    src = _hv()
+    out = src.fetch_disks(_frozen_vm(), tmp_path, lambda label: __import__("vm2morpheus.util", fromlist=["Progress"]).Progress(label))
+    path, mode, kw = calls[0]
+    assert path == "\\\\h\\E$\\VMs\\w2k16\\Virtual Hard Disks\\w2k16.vhdx" and mode == "rb"
+    assert kw["share_access"] == "rwd"                       # read, write and delete sharing: nobody is locked out
+    assert out[0].read_bytes() == data
+
+
+def test_a_sharing_violation_that_remains_is_explained_in_spanish(tmp_path, monkeypatch):
+    err = OSError("[Error 1] [NtStatus 0xc0000043] The process cannot access the file because it is being used by "
+                  "another process")
+    _fake_smbclient(monkeypatch, b"x", open_error=err)
+    with pytest.raises(RuntimeError, match=r"w2k16\.vhdx está abierto por otro proceso.*apaga la VM y migra en frío"):
+        _hv().fetch_disks(_frozen_vm(), tmp_path, lambda label: __import__("vm2morpheus.util", fromlist=["Progress"]).Progress(label))
+
+
+def test_other_smb_errors_are_not_disguised_as_sharing_violations(tmp_path, monkeypatch):
+    _fake_smbclient(monkeypatch, b"x", open_error=OSError("[NtStatus 0xc0000022] Access is denied"))
+    with pytest.raises(OSError, match="0xc0000022"):
+        _hv().fetch_disks(_frozen_vm(), tmp_path, lambda label: __import__("vm2morpheus.util", fromlist=["Progress"]).Progress(label))
